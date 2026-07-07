@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "description": "Canonical labels for project memory clustering. Labels use prefix:kebab-case. Reuse existing labels whenever possible; add a new label only for a durable retrieval class that existing labels cannot express. Recommended prefixes: 'kind:' for the type of lesson, 'context:' for the situation it applies to, 'area:' for project subsystems (add your own), 'signal:' for recurring symptoms (add your own).",
+  "labels": {
+    "context:build": {
+      "description": "Build, compile, packaging, or release pipeline behavior."
+    },
+    "context:deployment": {
+      "description": "Deployment, hosting, infrastructure, or environment configuration."
+    },
+    "context:runtime": {
+      "description": "Behavior at application runtime rather than build or authoring time."
+    },
+    "context:testing": {
+      "description": "Test suites, fixtures, flaky tests, or test infrastructure."
+    },
+    "context:tooling": {
+      "description": "Editors, IDEs, coding agents, MCP servers, scripts, or developer tooling."
+    },
+    "kind:architecture": {
+      "description": "A reusable structural relationship, subsystem map, ownership rule, or design decision."
+    },
+    "kind:bug": {
+      "description": "A recurring failure mode, misleading symptom, or diagnosed defect pattern."
+    },
+    "kind:convention": {
+      "description": "A project convention, naming rule, or agreement that is easy to violate accidentally."
+    },
+    "kind:workflow": {
+      "description": "A practical workflow, sequence, workaround, or operational procedure."
+    }
+  }
+}
