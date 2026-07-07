@@ -32,13 +32,19 @@ build quirks — so future sessions don't re-derive them from scratch.
 
 ## Installation
 
+Not yet on PyPI — install straight from GitHub:
+
 ```bash
-pip install project-memory-mcp        # or: pipx install / uv tool install
+pip install git+https://github.com/1101AlexZab1011/project-memory-mcp
+# or: pipx install git+https://github.com/1101AlexZab1011/project-memory-mcp
+# or: uv tool install git+https://github.com/1101AlexZab1011/project-memory-mcp
 ```
 
-Or run straight from a clone (no install needed):
+Or clone and run without installing:
 
 ```bash
+git clone https://github.com/1101AlexZab1011/project-memory-mcp
+cd project-memory-mcp
 python -m project_memory_mcp --help
 ```
 
@@ -201,7 +207,7 @@ is plain text committed to your repository).
 ## Development
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/1101AlexZab1011/project-memory-mcp
 cd project-memory-mcp
 python -m unittest discover -s tests -v
 ```
