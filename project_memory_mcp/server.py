@@ -48,6 +48,45 @@ TOOLS = [
             "limit": {"type": ["integer", "null"], "minimum": 1},
         },
     ),
+    _tool(
+        "recall",
+        "Ranked retrieval in ONE call - prefer this over search_memories + repeated get_memory. "
+        "Scores every memory by text relevance, personalized-PageRank proximity in the relationship "
+        "graph, and label overlap, then returns the best matches with the top few inlined in full. "
+        "Omit query and label_query to get the most central memories as an overview of the store.",
+        {
+            "query": {
+                "type": ["string", "null"],
+                "description": "Free-text description of the task or symptom. Code identifiers are matched on case boundaries, so 'replicated' finds bReplicates.",
+            },
+            "label_query": {
+                "description": "Optional label filter: an object with all/any/not arrays or a string expression using AND, OR, NOT, and parentheses.",
+                "type": ["object", "string", "null"],
+                "additionalProperties": True,
+            },
+            "related_to": {
+                "type": ["string", "null"],
+                "description": "Anchor the walk at this memory id to rank the store by degree of relatedness to it - authored links first, then memories reachable through the graph. Combines with query to bias toward one part of its neighbourhood.",
+            },
+            "status_filter": {
+                "description": "A status string, array of statuses, 'all', or omitted for active+stale.",
+                "type": ["array", "string", "null"],
+                "items": {"type": "string"},
+            },
+            "limit": {"type": ["integer", "null"], "minimum": 1, "default": 8},
+            "full_count": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "default": 3,
+                "description": "How many top results to inline in full. The rest come back as lightweight records.",
+            },
+            "include_derived": {
+                "type": ["boolean", "null"],
+                "default": True,
+                "description": "Also walk low-weight edges derived from label/file overlap, not just authored links.",
+            },
+        },
+    ),
     _tool("get_memory", "Return the full JSON for a memory id.", {"id": {"type": "string"}}, ["id"]),
     _tool(
         "get_memory_neighborhood",
@@ -137,6 +176,18 @@ class McpServer:
                     status_filter=args.get("status_filter"),
                     text_query=args.get("text_query"),
                     limit=args.get("limit"),
+                )
+            elif name == "recall":
+                payload = self.store.recall(
+                    query=args.get("query") or "",
+                    label_query=args.get("label_query"),
+                    related_to=args.get("related_to"),
+                    status_filter=args.get("status_filter"),
+                    limit=args.get("limit") if args.get("limit") is not None else 8,
+                    full_count=args.get("full_count") if args.get("full_count") is not None else 3,
+                    include_derived=(
+                        True if args.get("include_derived") is None else bool(args["include_derived"])
+                    ),
                 )
             elif name == "get_memory":
                 payload = self.store.get_memory(args["id"])
