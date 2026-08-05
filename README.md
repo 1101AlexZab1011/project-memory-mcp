@@ -121,6 +121,7 @@ Re-run `install-skills` after upgrading the package to refresh the copies.
 
 | Tool | Description |
 | --- | --- |
+| `recall` | **Ranked retrieval in one call.** Scores every memory by text relevance, graph proximity, and label overlap; returns the best matches with the top few inlined in full. |
 | `list_labels` | Canonical labels grouped by prefix. |
 | `search_memories` | Search the lightweight index by label query, status, and optional text. |
 | `get_memory` | Full JSON for one memory id. |
@@ -133,6 +134,38 @@ Re-run `install-skills` after upgrading the package to refresh the copies.
 Label queries accept either structured form —
 `{"all": ["area:auth"], "any": ["kind:bug", "kind:workflow"], "not": ["context:testing"]}` —
 or an expression string: `area:auth AND (kind:bug OR kind:workflow) AND NOT context:testing`.
+
+### Ranked recall
+
+`recall` collapses the usual `search_memories` → several `get_memory` sequence into a single
+call, and orders the result instead of returning a flat cluster. Three signals combine:
+
+- **Text** — BM25 over every field, weighted by importance. Code identifiers are split on case
+  boundaries as well as kept whole, so a query for `replicated` matches a memory tagged
+  `bReplicates`, and an exact identifier still scores highest.
+- **Graph** — personalized PageRank over the relationship graph, restarted at the query's best
+  matches. Authored `related` links carry full weight; extra low-weight edges are derived from
+  label and file overlap so near-neighbours that were never explicitly linked stay reachable.
+  These derived edges are computed in memory and never written to the store.
+- **Labels** — overlap with an explicit label filter.
+
+Lifecycle status scales the final score, so `stale` and `wrong` memories still surface — they
+are kept deliberately as warnings — but rank below current ones.
+
+Three ways to call it:
+
+```jsonc
+{"query": "packaging fails when the editor is open"}  // symptom lookup
+{"related_to": "cache-invalidation-race"}             // what to read alongside this
+{}                                                    // most central memories: orient me
+```
+
+`related_to` anchors the walk at one memory, turning "is related" into a *degree* of
+relatedness: authored links rank first, then memories reachable through the graph. With no
+query and no anchor the restart is uniform, which is ordinary PageRank over the store.
+
+Ranking is pure standard library and holds its BM25 index and adjacency for as long as no
+memory file changes, so repeat calls in a live server skip the rebuild entirely.
 
 ## CLI
 

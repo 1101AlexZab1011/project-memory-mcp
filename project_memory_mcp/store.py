@@ -15,6 +15,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
+from .ranking import RankingContext, rank_memories
+
 STORE_DIR_NAME = ".project-memory"
 
 VALID_STATUSES = {"active", "stale", "superseded", "wrong"}
@@ -203,6 +205,9 @@ class MemoryStore:
         self.active_root = self.memory_root / "active"
         self.index_path = self.memory_root / "INDEX.json"
         self.labels_path = self.memory_root / "labels.json"
+        self._cache_signature: tuple[tuple[str, int, int], ...] | None = None
+        self._cache_records: dict[str, dict[str, Any]] | None = None
+        self._cache_contexts: dict[bool, RankingContext] = {}
 
     # ------------------------------------------------------------------ reads
 
@@ -295,6 +300,93 @@ class MemoryStore:
                 if target_id not in nodes and len(nodes) + len(queue) < max_nodes:
                     queue.append((target_id, current_depth + 1))
         return {"root": memory_id, "depth": depth, "nodes": list(nodes.values()), "edges": edges}
+
+    def recall(
+        self,
+        query: str = "",
+        label_query: Any = None,
+        related_to: str | None = None,
+        status_filter: list[str] | str | None = None,
+        limit: int = 8,
+        full_count: int = 3,
+        include_derived: bool = True,
+    ) -> dict[str, Any]:
+        """Ranked retrieval in one call.
+
+        Scores every memory by BM25 text relevance, personalized-PageRank
+        proximity to the query's best matches, and label overlap, then returns
+        the best ``limit`` of them - with the top ``full_count`` inlined in
+        full so the caller does not need follow-up ``get_memory`` calls.
+
+        ``related_to`` anchors the walk at one memory instead, ranking the rest
+        of the store by how strongly it relates to that one - authored links
+        first, then memories reachable through the graph.
+
+        With no query, no labels and no anchor the restart distribution is
+        uniform, which makes this ordinary PageRank: the most structurally
+        central memories, i.e. a reasonable "orient me in this store" answer.
+        """
+        if limit < 1:
+            raise StoreError("limit must be >= 1.")
+        if full_count < 0:
+            raise StoreError("full_count must be >= 0.")
+        if related_to is not None:
+            self._find_memory_path(related_to)  # raises on unknown id
+        known = set(self.list_labels()["labels"].keys())
+        expression = LabelExpression(label_query, known)
+        statuses = self._normalize_status_filter(status_filter)
+        records = self.load_memories()
+        if not records:
+            return {"query": query, "considered": 0, "count": 0, "memories": []}
+
+        context = self.ranking_context(include_derived=include_derived)
+        memories = context.memories
+        # Rank across the whole graph and filter afterwards: a memory that is
+        # excluded from the results can still be the link between two that are
+        # not, so removing it before the walk would distort proximity.
+        ranked = rank_memories(
+            memories,
+            query=query,
+            query_labels=expression.used_labels,
+            related_to=related_to,
+            include_derived=include_derived,
+            context=context,
+        )
+
+        results: list[dict[str, Any]] = []
+        for entry in ranked:
+            memory_id = entry["id"]
+            memory = memories[memory_id]
+            if statuses is not None and memory.get("status") not in statuses:
+                continue
+            if not expression.matches(memory.get("labels") or []):
+                continue
+            if entry["score"] <= 0.0:
+                continue
+            result = self._light_record(memory_id, records[memory_id]["path"], memory)
+            result["score"] = entry["score"]
+            result["why"] = {
+                "text": entry["text_score"],
+                "graph": entry["graph_score"],
+                "label": entry["label_score"],
+                "status_factor": entry["status_factor"],
+            }
+            if len(results) < full_count:
+                result["memory"] = memory
+            results.append(result)
+            if len(results) >= limit:
+                break
+
+        payload: dict[str, Any] = {
+            "query": query,
+            "label_query_labels": sorted(expression.used_labels),
+            "considered": len(memories),
+            "count": len(results),
+            "memories": results,
+        }
+        if related_to:
+            payload["related_to"] = related_to
+        return payload
 
     # -------------------------------------------------------------- mutations
 
@@ -600,6 +692,49 @@ class MemoryStore:
                 memory = self._read_json(path)
                 records[memory["id"]] = {"path": path, "memory": memory}
         return records
+
+    def _store_signature(self) -> tuple[tuple[str, int, int], ...]:
+        if not self.active_root.exists():
+            return ()
+        return tuple(
+            (path.name, path.stat().st_mtime_ns, path.stat().st_size)
+            for path in sorted(self.active_root.glob("*.json"))
+        )
+
+    def load_memories(self) -> dict[str, dict[str, Any]]:
+        """Parsed memories, cached until any memory file changes.
+
+        Ranking touches every memory on every call, so re-parsing the whole
+        store per request is the dominant cost in a long-lived server process.
+        The cache key is the name, size and mtime of each memory file, so an
+        edit made outside this process still invalidates it.
+        """
+        signature = self._store_signature()
+        if self._cache_records is not None and self._cache_signature == signature:
+            return self._cache_records
+        records = self._load_all_memories()
+        self._cache_signature = signature
+        self._cache_records = records
+        self._cache_contexts.clear()
+        return records
+
+    def ranking_context(self, include_derived: bool = True) -> RankingContext:
+        """Prebuilt BM25 index and adjacency for the current store revision.
+
+        Building these costs ~10x what answering a query does, so they are
+        cached alongside the parsed memories and dropped together with them
+        whenever a file changes.
+        """
+        records = self.load_memories()
+        cached = self._cache_contexts.get(include_derived)
+        if cached is not None:
+            return cached
+        context = RankingContext(
+            {memory_id: record["memory"] for memory_id, record in records.items()},
+            include_derived=include_derived,
+        )
+        self._cache_contexts[include_derived] = context
+        return context
 
     def _outgoing_edges(self, memory: dict[str, Any]) -> list[dict[str, Any]]:
         edges: list[dict[str, Any]] = []
