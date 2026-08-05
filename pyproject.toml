@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "project-memory-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "File-based, git-friendly project memory for coding agents: a JSON memory store with a label graph, served over MCP, with matching agent skills."
 readme = "README.md"
 license = { text = "MIT" }
