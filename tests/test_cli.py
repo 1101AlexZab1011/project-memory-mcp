@@ -26,6 +26,21 @@ class CliTests(unittest.TestCase):
         self.assertTrue((store_dir / "active").is_dir())
         self.assertEqual([], MemoryStore(self.root).validate_store())
 
+    def test_init_keeps_the_empty_active_dir_trackable_by_git(self):
+        # Git does not track empty directories. Without a placeholder, a store
+        # committed before its first memory arrives at the next clone with no
+        # active/ at all, and validation fails on the missing directory.
+        main(["init", "--root", str(self.root)])
+
+        self.assertTrue((self.root / ".project-memory" / "active" / ".gitkeep").is_file())
+
+    def test_placeholder_is_not_mistaken_for_a_memory(self):
+        main(["init", "--root", str(self.root)])
+        store = MemoryStore(self.root)
+
+        self.assertEqual([], store.validate_store())
+        self.assertEqual(0, store.recall()["considered"])
+
     def test_init_keeps_existing_files_without_force(self):
         main(["init", "--root", str(self.root)])
         labels_path = self.root / ".project-memory" / "labels.json"

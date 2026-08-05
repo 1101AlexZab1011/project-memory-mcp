@@ -47,7 +47,14 @@ def _resolve_root(root_arg: str | None, require_store: bool) -> Path | None:
 def cmd_init(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve() if args.root else Path.cwd()
     store_dir = root / STORE_DIR_NAME
-    (store_dir / "active").mkdir(parents=True, exist_ok=True)
+    active_dir = store_dir / "active"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    # Git does not track empty directories, so a store committed before its
+    # first memory is written would arrive at the next clone without active/
+    # and fail validation. Keep the directory alive with a placeholder.
+    gitkeep = active_dir / ".gitkeep"
+    if not gitkeep.exists():
+        gitkeep.write_text("", encoding="utf-8")
 
     for template_name, target_name in STORE_TEMPLATES.items():
         target = store_dir / target_name
