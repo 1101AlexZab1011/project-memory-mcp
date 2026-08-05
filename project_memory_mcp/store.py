@@ -523,7 +523,14 @@ class MemoryStore:
         if not isinstance(memory["description"], str) or len(memory["description"]) < 20:
             errors.append(f"{where}: description must be a string of at least 20 characters.")
 
-        self._check_string_array(errors, where, memory, "tags", unique=True, item_re=ID_RE)
+        # Tags are free-text search keys, deliberately not slugs. Code
+        # identifiers make excellent tags - `bReplicates` is exactly what
+        # someone searching for that behavior types, and the tokenizer splits
+        # it on case boundaries while keeping it whole, so it matches
+        # "replicates" and the exact identifier. Slug discipline is enforced
+        # where it is load-bearing instead: `id` becomes a filename, and
+        # `labels` are keys into the registry.
+        self._check_string_array(errors, where, memory, "tags", unique=True)
         self._check_string_array(errors, where, memory, "labels", unique=True, min_items=1, item_re=LABEL_RE)
         self._check_string_array(errors, where, memory, "triggers", unique=True, min_items=1)
         self._check_string_array(errors, where, memory, "remembered_facts", min_items=1)

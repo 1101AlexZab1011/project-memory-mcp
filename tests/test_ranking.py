@@ -163,6 +163,34 @@ class RankMemoriesTests(unittest.TestCase):
         self.assertTrue(all(entry["graph_score"] > 0 for entry in ranked))
 
 
+class TagFormatTests(unittest.TestCase):
+    """Tags accept code identifiers; ids and labels stay strict slugs."""
+
+    def setUp(self):
+        self.store = MemoryStore(Path(tempfile.mkdtemp()))
+
+    def test_code_identifier_tags_are_accepted(self):
+        entry = memory("a", "A memory about replicated actors.", ["area:x"])
+        entry["tags"] = ["bReplicates", "C4459", "from_pydata", "localUVDensities", "kebab-case"]
+        self.assertEqual(self.store.validate_memory(entry, None, "test"), [])
+
+    def test_duplicate_tags_are_still_rejected(self):
+        entry = memory("a", "A memory about replicated actors.", ["area:x"])
+        entry["tags"] = ["dupe", "dupe"]
+        self.assertTrue(self.store.validate_memory(entry, None, "test"))
+
+    def test_non_string_tags_are_still_rejected(self):
+        entry = memory("a", "A memory about replicated actors.", ["area:x"])
+        entry["tags"] = [42]
+        self.assertTrue(self.store.validate_memory(entry, None, "test"))
+
+    def test_ids_and_labels_remain_strict(self):
+        bad_id = memory("NotASlug", "A memory with an invalid id value.", ["area:x"])
+        self.assertTrue(self.store.validate_memory(bad_id, None, "test"))
+        bad_label = memory("a", "A memory with an invalid label value.", ["NotALabel"])
+        self.assertTrue(self.store.validate_memory(bad_label, None, "test"))
+
+
 class RecallTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
