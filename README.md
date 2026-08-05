@@ -115,6 +115,14 @@ Three skills teach the agent *when and how* to use the store well:
 | `project-memory-remember` | After a task, decide what is durable enough to store, deduplicate, cross-link, and validate. |
 | `project-memory-forget` | Safely delete a memory and clean up every reference to it. |
 
+`project-memory-remember` is **self-triggering**: at the end of a completed request the agent
+decides for itself whether the work produced a durable lesson and writes it without asking. A
+store only stays useful if it gets written to, and an agent that must ask permission every time
+mostly ends up not asking. The quality bar is unchanged — one-off fixes, generic programming
+questions, and pure code reads are still not memories — and when nothing clears the bar the
+agent stays silent rather than reporting an empty result. Tell it "don't remember this" to
+suppress a single request, or use `project-memory-forget` to remove anything it stored.
+
 Re-run `install-skills` after upgrading the package to refresh the copies.
 
 ## MCP tools

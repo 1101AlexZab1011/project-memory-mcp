@@ -1,6 +1,6 @@
 ---
 name: project-memory-remember
-description: Use after resolving a bug, task, build issue, debugging session, or project-specific problem when the user asks to remember the lesson, update .project-memory, or decide whether the resolved issue should become reusable project memory.
+description: Use after resolving a bug, task, build issue, debugging session, or project-specific problem to capture the reusable lesson in .project-memory. Invoke it on your own judgment, without waiting to be asked, whenever completed work produced durable project-specific knowledge (a non-obvious subsystem fact, a recurring failure mode, a misleading symptom, a build/test procedure, a hidden convention) or proved an existing memory stale, wrong, or superseded. Also use when the user explicitly asks to remember a lesson, update .project-memory, or decide whether a resolved issue should become reusable project memory.
 ---
 
 # Project Memory Remember
@@ -9,7 +9,34 @@ Use this skill after a task has been resolved or mostly resolved.
 
 The goal is to update `.project-memory/` with compact, reusable, project-specific knowledge that will help future agents solve similar tasks faster.
 
-Do not create memory automatically for every task. Create or update memory only when the resolved task revealed durable project knowledge.
+## Invocation
+
+This skill is self-triggering. At the end of a request that is semantically complete — a
+delivered answer, a finished change, a concluded investigation, an established blocker — decide
+for yourself whether the work produced durable knowledge, and act on that decision without
+asking permission first.
+
+- **Invoke it** when the work produced a non-obvious subsystem fact, a recurring failure mode, a
+  misleading symptom, a build/packaging/test procedure, or a hidden convention — or when it
+  proved an existing memory stale, wrong, or superseded. Write the memory, then state what was
+  stored.
+- **Stay silent** when the work was a one-off fix, a generic programming question, a pure code
+  read, a typo, or something already documented in the repo's agent instructions or plainly
+  visible in the code. Do not announce that nothing was worth remembering.
+
+Intermediate updates, plans, clarifying questions, and tool results are not completed requests;
+do not fire on those. A summary counts only when it is the requested final deliverable.
+
+Self-triggering is not a licence to write a memory per task. The bar below still decides; the
+only difference is that you apply it yourself instead of asking. If the bar is not met, make no
+changes and say nothing about memory — silence is the correct output.
+
+If the user says "don't remember this", "skip memory", or similar for the current request, do
+not invoke this skill at all. They can always remove a stored memory afterwards with
+`project-memory-forget`.
+
+Memory writes land in the git working tree as changed files under `.project-memory/` — mention
+them when reporting so they are visible before the next commit.
 
 ## Memory Store
 
@@ -209,7 +236,9 @@ Memory update result:
 - Stored lesson: <short summary or none>
 ```
 
-If nothing was worth remembering, the report should still be explicit:
+When nothing was worth remembering, the report depends on how the skill was invoked:
+
+- **The user explicitly asked** to update memory: be explicit that nothing was stored, and why.
 
 ```text
 Memory update result:
@@ -221,3 +250,6 @@ Memory update result:
 - Not remembered: this was a one-off issue and did not reveal reusable project-specific knowledge.
 - Stored lesson: none
 ```
+
+- **Self-triggered** on your own judgment: say nothing at all about memory. Do not print an
+  empty report — an automatic check that finds nothing should be invisible.
