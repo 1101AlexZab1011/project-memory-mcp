@@ -98,6 +98,50 @@ args = ["serve"]
 The server finds the store by walking up from its working directory to the nearest
 `.project-memory/`; pass `--root /path/to/project` to pin it explicitly.
 
+### Sharing one store across devices
+
+A SQLite-backed store can be served over HTTP so every device on a network reaches the same
+memory. Import an existing file store first, then serve it:
+
+```bash
+project-memory-mcp migrate --from ./.project-memory --project my-project --database ~/memory.db
+PROJECT_MEMORY_TOKEN=$(openssl rand -hex 24)   project-memory-mcp serve --http --database ~/memory.db --bind 192.168.1.50 --port 8765
+```
+
+Each project's `.mcp.json` then points at it:
+
+```json
+{
+  "mcpServers": {
+    "project-memory": {
+      "type": "http",
+      "url": "http://192.168.1.50:8765/mcp?project=my-project",
+      "headers": { "Authorization": "Bearer ${PROJECT_MEMORY_TOKEN}" }
+    }
+  }
+}
+```
+
+Keep the token in an environment variable rather than the file: `.mcp.json` is usually
+committed, and a secret in git history is the hardest kind to remove. If the variable is not
+set where the client starts, the server says so specifically instead of reporting a bad token.
+
+`--bind` is required and has no default. Use `127.0.0.1` for this machine only, or one
+interface's address — a VPN adapter such as Radmin or Tailscale works and extends the store
+beyond the local network. `0.0.0.0` publishes the store on *every* network the host is
+attached to, which is a decision rather than a convenience.
+
+The database file must stay on the host's local disk. Never place it on a network share:
+SQLite's locking is documented to corrupt there, and the HTTP layer exists precisely so the
+file does not have to travel.
+
+Security is deliberately narrow — one shared static token, checked in constant time, and no
+TLS. That suits a trusted LAN or an encrypted overlay. It is not enough for a hostile network,
+where the token would travel in the clear.
+
+Unknown project ids return 404 with the list of known projects, rather than quietly serving an
+empty store.
+
 **3. (Optional but recommended) Install the agent skills:**
 
 ```bash

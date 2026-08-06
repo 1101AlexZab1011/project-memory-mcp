@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -106,6 +107,26 @@ def cmd_validate(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     from .server import run_server
 
+    if args.http:
+        if not args.database:
+            print("error: --http requires --database.", file=sys.stderr)
+            return 1
+        if not args.bind:
+            # No default on purpose: 0.0.0.0 would publish the store on every
+            # network the host touches, which is a decision, not a convenience.
+            print("error: --bind is required with --http. Use 127.0.0.1 for this machine only, "
+                  "or the address of one interface (for example a VPN adapter) to reach other "
+                  "devices. Passing 0.0.0.0 exposes the store on every network this host is on.",
+                  file=sys.stderr)
+            return 1
+        token = args.token or os.environ.get("PROJECT_MEMORY_TOKEN")
+        if not token:
+            print("error: a token is required. Pass --token or set PROJECT_MEMORY_TOKEN.", file=sys.stderr)
+            return 1
+        from .http_server import run_http_server
+
+        return run_http_server(args.database, args.bind, args.port, token)
+
     if args.database:
         if not args.project:
             print("error: --project is required with --database.", file=sys.stderr)
@@ -180,7 +201,14 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--database", default=None,
                               help="Serve from a SQLite database instead of memory files.")
     serve_parser.add_argument("--project", default=None,
-                              help="Project id inside the database (required with --database).")
+                              help="Project id inside the database (required with --database over stdio).")
+    serve_parser.add_argument("--http", action="store_true",
+                              help="Serve MCP over HTTP so other devices can connect, instead of stdio.")
+    serve_parser.add_argument("--bind", default=None,
+                              help="Interface address to listen on. Required with --http; no default.")
+    serve_parser.add_argument("--port", type=int, default=8765, help="Port to listen on (default: 8765).")
+    serve_parser.add_argument("--token", default=None,
+                              help="Shared bearer token. Falls back to PROJECT_MEMORY_TOKEN.")
     serve_parser.set_defaults(func=cmd_serve)
 
     skills_parser = subparsers.add_parser(

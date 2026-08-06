@@ -120,13 +120,14 @@ def _now() -> str:
 
 
 class SqliteMemoryStore:
-    def __init__(self, database: Path | str, project: str) -> None:
+    def __init__(self, database: Path | str, project: str, create: bool = True,
+                 check_same_thread: bool = True) -> None:
         if not ID_RE.match(project):
             raise StoreError("Project id must be lowercase kebab-case.")
         self.project = project
         self.path = Path(database)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.path)
+        self.connection = sqlite3.connect(self.path, check_same_thread=check_same_thread)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA foreign_keys=ON")
@@ -135,11 +136,31 @@ class SqliteMemoryStore:
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
-        self.connection.execute(
-            "INSERT OR IGNORE INTO projects(id, name, created) VALUES (?, ?, ?)",
-            (project, project, _now()),
-        )
+        known = self.connection.execute(
+            "SELECT 1 FROM projects WHERE id=?", (project,)
+        ).fetchone()
+        if known is None:
+            if not create:
+                # A served project must already exist. Auto-creating one turns a
+                # typo in a client's URL into an empty store that looks like a
+                # working store, which is worse than an error.
+                existing = ", ".join(self.list_projects(self.connection)) or "(none)"
+                # Close before raising: an unknown project is a normal thing for
+                # a server to be asked for, and leaking a connection per bad
+                # request would eventually exhaust handles.
+                self.connection.close()
+                raise StoreError(f"Unknown project: {project}. Existing projects: {existing}")
+            self.connection.execute(
+                "INSERT INTO projects(id, name, created) VALUES (?, ?, ?)", (project, project, _now())
+            )
         self.connection.commit()
+
+    @staticmethod
+    def list_projects(connection: sqlite3.Connection) -> list[str]:
+        try:
+            return [row[0] for row in connection.execute("SELECT id FROM projects ORDER BY id")]
+        except sqlite3.Error:
+            return []
 
     def close(self) -> None:
         self.connection.close()
