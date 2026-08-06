@@ -36,8 +36,9 @@ So the gates must be *late enough to be evidence* and the early ones must be *re
 
 ## Decisions taken
 
-- **Capacity-bounded tiers, not calendar tiers.** Tier 1 holds N memories; filling it triggers
-  review of what has lived there long enough.
+- **Evidence-bounded tiers, not capacity-bounded ones.** ~~Tier 1 holds N memories; filling it
+  triggers review.~~ Reconsidered and not built — see *Why capacity was dropped* below. A tier
+  gate is exposure plus wall-clock time, and the pool size that produces is the bound.
 - **Archive before delete.** Early gates remove a memory from the ranked pool and keep it on
   disk. Only the long gate deletes.
 - **Delete on evidence, never on absence of evidence.** Low counters are absence.
@@ -133,8 +134,29 @@ whose value will never show up in usage — hard-won, rarely needed, expensive t
 can be published with `force`, which is the non-statistical path this design has needed since
 the beginning.
 
-**Capacity, not calendar, triggers review.** When tier 1 exceeds N, the memories that have
-lived there long enough are judged. Everything else waits.
+**A gate, not a capacity check, decides what is judged.** A memory is reviewable once it has
+had both enough exposure and enough time in its tier; everything else waits. There is no N and
+no capacity trigger — see below.
+
+### Why capacity was dropped
+
+The original decision was a bounded tier 1: N slots, and filling them triggers review. It was
+never implemented, and on inspection it should not be. It resolves to one of two things and
+both are worse than the gate:
+
+- **As a trigger** it is redundant. The Computer already sweeps on a floor timer with
+  idempotent enqueueing, and the gate still applies — so a capacity-fired sweep finds nothing
+  eligible and does nothing. State with no effect.
+- **As an eviction policy** it contradicts *delete on evidence, never on absence of evidence*.
+  A memory evicted early has empty counters because nothing has had the chance to happen yet,
+  not because it failed. Capacity pressure archives the good and the bad from a burst
+  identically. Archival is reversible, so this is not fatal — but nothing restores
+  automatically, so in practice a wrongly-archived memory is out of use anyway.
+
+**The gate already is a capacity bound, expressed in the right units.** Steady-state tier-1 size
+is roughly the write rate multiplied by the time-to-reviewable. Wanting a smaller pool means
+lowering `min_days` or `min_queries` — the same control, stated as evidence rather than as a
+count, and evidence is what this design says decisions must rest on.
 
 **Eligibility is measured in queries, not days.** A project that goes quiet for six weeks
 serves no queries, so its memories are never judged as "unused" — they were never asked. Age in
@@ -169,9 +191,8 @@ is sufficient. `applied` refines ordering within a cohort; it does not gate.
 
 ## Local audit — the nursery sweep
 
-Triggered by a capacity check on the write path that enqueues the project, plus a slow floor
-timer so the ladder keeps moving when writing is quiet. A background worker does the work; the
-agent's call never waits.
+Triggered by the Computer's floor timer, which is the only trigger there is. A background worker
+does the work; the agent's call never waits, and nothing is checked on the write path.
 
 Three outcomes, which is what distinguishes it from the remote sweep:
 
@@ -184,16 +205,16 @@ Two details that are easy to get wrong:
 **Counters travel with the promotion.** A memory that proved itself over three weeks locally
 must arrive carrying that history, or it looks brand new and has to earn its place twice.
 
-**Archived memories do not count toward capacity.** Otherwise the nursery fills with archives,
-the gate stops firing, and the ladder silently stalls.
+**Archived memories are held, not re-judged.** An already-archived memory returns `hold` before
+any gate is consulted, so the sweep neither re-archives it nor counts it as work.
 
-The nursery is capacity-bounded and single-user, so this sweep stays cheap no matter how large
-the shared store grows.
+The nursery is single-user and its size is set by how fast one person writes, so this sweep
+stays cheap no matter how large the shared store grows.
 
 ## Remote audit — the shared sweep
 
-Triggered by per-tier capacity bounds, a daily floor timer, and a dedup check on each arriving
-promotion.
+Triggered by the same floor timer as the local sweep, with the same per-tier gates. Per-tier
+capacity bounds were considered and dropped for the reason above.
 
 Outcomes are promotion between tiers, archival out of the ranked pool, and evidence-based
 deletion. Cost stays bounded because only what is due is examined: work per sweep is the sum
@@ -593,10 +614,32 @@ the browser is given the first and never the second.
   marking `stale` and `wrong` behaves the same way, the statistical half — which cannot detect
   wrongness — is all that remains. This is cheap to test before building on it: run agents
   against the current store for two weeks and count how often they mark anything.
-- **Thresholds are guesses until there is data.** N, the tier windows, the similarity cutoff.
+- **Thresholds are guesses until there is data.** The tier windows and the similarity cutoff.
   They must be relative to a store's own distribution or configurable, never constants fitted to
   one project. Report-only mode exists so that the first set can be observed rather than
-  trusted.
+  trusted. Reachability is now measured — see below — but whether the *verdicts* are right
+  still is not.
+- **The upper tiers are calibrated for a busier project than most.** A gate needs exposure and
+  days, and whichever takes longer binds. Time for a memory to become reviewable:
+
+  | usage | tier 1 | tier 2 | tier 3 |
+  |---|---|---|---|
+  | daily, 20 recalls/day | 30d | 180d | 730d |
+  | weekdays, 8/day | 30d | 180d | 875d |
+  | 3 days a week, 10 | 30d | 180d | 1167d |
+  | weekly, 5 | 70d | 700d | 7000d |
+  | twice a month, 5 | 150d | 1500d | 15000d |
+
+  Below **1.67 recalls/day** the query gate binds at tier 1 rather than the day gate; the
+  crossover is 2.78/day for tier 2 and 6.85/day for tier 3.
+
+  Tier 1 is fine for anyone: 30 days at normal use, 70–150 days for occasional use, which is a
+  reasonable nursery period rather than a stall. **Tier 2 is what matters**, because publication
+  requires it, and at 30–150 days it is reachable. Tier 3 is effectively out of reach for a
+  light-use project — which mostly means a memory that reaches tier 2 and passes review is
+  never examined again. That is the limit of an escalating-review ladder rather than a bug, but
+  it is not what "tier 3" implies, and `min_queries = 5000` should be read as "not in practice"
+  rather than as a plan.
 - **Federated ranking is approximate.** Rank fusion is sound and needs no calibration, but it
   discards how *strongly* a source matched. A source that is confidently right and one that is
   weakly relevant contribute the same at the same rank.

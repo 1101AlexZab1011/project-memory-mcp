@@ -344,15 +344,19 @@ def make_job(kind: str, project: str, **kwargs: Any) -> Job:
 class Scheduler:
     """Decides when jobs are submitted. Separate from what runs them.
 
-    Two triggers, matching how the work actually arrives:
+    One trigger: a floor timer, so tiering keeps moving in a project nobody is
+    writing to. A quiet store has to advance too, and every activity-driven
+    trigger fails exactly there.
 
-    - **A floor timer**, so tiering keeps moving in a project nobody is writing
-      to. Without it a quiet store never advances, because every other trigger
-      is driven by activity.
-    - **Capacity**, checked cheaply after writes: when tier 1 grows past its
-      bound, a sweep is due. This is the one that matters under load, and it is
-      why enqueueing is idempotent - a busy project would otherwise queue a
-      hundred identical sweeps.
+    A second, capacity-based trigger was planned - "tier 1 is full, sweep now" -
+    and deliberately dropped. It cannot do anything the timer does not: the
+    audit's gates still decide what is eligible, so a capacity-fired sweep
+    arrives to find nothing due. Making it do something would mean reviewing
+    memories before they have had the exposure to be judged on, which is the one
+    thing the audit is built not to do.
+
+    Enqueueing is idempotent anyway. That is worth keeping for its own sake - a
+    slow sweep must never let a backlog of identical ones accumulate behind it.
     """
 
     def __init__(self, computer: Computer, projects: Callable[[], list[str]],
