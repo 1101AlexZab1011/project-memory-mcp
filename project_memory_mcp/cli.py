@@ -281,6 +281,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
         steps.append(_merge_codex_toml(
             root / ".codex" / "config.toml", "project-memory-mcp", serve_args))
 
+    store = SqliteMemoryStore(database, project, create=False)
+    store.set_root_path(str(root))
+    store.close()
+    steps.append("recorded the project root, so anchors can be checked against the code")
+
     print(f"project memory ready for {root}")
     for step in steps:
         print(f"  {step}")
@@ -425,7 +430,7 @@ def cmd_compute(args: argparse.Namespace) -> int:
 
     computer.start()
     scheduler = Scheduler(computer, lambda: projects, interval_seconds=args.interval,
-                          kinds=tuple(args.kind) if args.kind else ("outbox", "audit", "dedup"))
+                          kinds=tuple(args.kind) if args.kind else ("outbox", "rebase", "audit", "dedup"))
     scheduler.start()
     print(f"project-memory-mcp computer: {len(projects)} project(s), every {scheduler.interval}s",
           file=sys.stderr)
@@ -649,7 +654,7 @@ def build_parser() -> argparse.ArgumentParser:
     compute_parser.add_argument("--database", required=True, help="Path to the SQLite database.")
     compute_parser.add_argument("--project", default=None, help="One project (default: all).")
     compute_parser.add_argument("--kind", action="append", default=None,
-                                choices=("audit", "outbox", "dedup"),
+                                choices=("audit", "outbox", "dedup", "reindex", "rebase"),
                                 help="Run only this job kind. Repeatable.")
     compute_parser.add_argument("--interval", type=int, default=3600,
                                 help="Seconds between sweeps (default: 3600).")

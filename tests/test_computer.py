@@ -171,12 +171,101 @@ class WorkTests(ComputerCase):
         self.assertEqual(1, peak[0])
 
 
+class AnchorTests(ComputerCase):
+    """Re-anchoring: the one correctness check that is a fact, not a judgment."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = Path(self.tmp.name) / "repo"
+        (self.root / "Source").mkdir(parents=True)
+        (self.root / "Source" / "Cache.cpp").write_text("// still here", encoding="utf-8")
+
+    def anchored(self, slug, files):
+        entry = memory(slug, CACHE)
+        entry["scope"]["files"] = files
+        return entry
+
+    def test_a_memory_whose_files_are_gone_is_reported(self):
+        store = self.open_store("demo")
+        self.addCleanup(store.close)
+        store.set_root_path(str(self.root))
+        store.create_memory(self.anchored("gone", ["Source/Deleted.cpp"]))
+        store.create_memory(self.anchored("here", ["Source/Cache.cpp"]))
+
+        result = store.check_anchors()
+
+        self.assertEqual(["gone"], [entry["id"] for entry in result["adrift"]])
+        self.assertEqual(2, result["checked"])
+
+    def test_one_surviving_anchor_is_enough(self):
+        # A memory spanning several files has not gone stale because one moved.
+        store = self.open_store("demo")
+        self.addCleanup(store.close)
+        store.set_root_path(str(self.root))
+        store.create_memory(self.anchored("partial", ["Source/Cache.cpp", "Source/Gone.cpp"]))
+        self.assertEqual([], store.check_anchors()["adrift"])
+
+    def test_memories_with_no_files_are_not_judged(self):
+        store = self.open_store("demo")
+        self.addCleanup(store.close)
+        store.set_root_path(str(self.root))
+        store.create_memory(memory("unanchored", CACHE))
+        self.assertEqual(0, store.check_anchors()["checked"])
+
+    def test_marking_is_opt_in_and_uses_stale_not_wrong(self):
+        # The files may have moved rather than gone; stale says "check this",
+        # which is exactly what the evidence supports.
+        store = self.open_store("demo")
+        self.addCleanup(store.close)
+        store.set_root_path(str(self.root))
+        store.create_memory(self.anchored("gone", ["Source/Deleted.cpp"]))
+
+        store.check_anchors()
+        self.assertEqual("active", store.get_memory("gone")["status"])
+        store.check_anchors(mark_stale=True)
+        self.assertEqual("stale", store.get_memory("gone")["status"])
+
+    def test_a_store_that_cannot_see_the_code_says_so(self):
+        # A server holds memories about repositories it cannot see. It reports
+        # having nothing to check rather than declaring everything adrift.
+        store = self.open_store("demo")
+        self.addCleanup(store.close)
+        store.create_memory(self.anchored("gone", ["Source/Deleted.cpp"]))
+        result = store.check_anchors()
+        self.assertEqual(0, result["checked"])
+        self.assertIn("no root_path", result["skipped"])
+
+    def test_the_job_runs_it(self):
+        store = self.open_store("demo")
+        store.set_root_path(str(self.root))
+        store.create_memory(self.anchored("gone", ["Source/Deleted.cpp"]))
+        store.close()
+        result = self.computer().run_one(make_job("rebase", "demo"))
+        self.assertEqual("ok", result["outcome"])
+        self.assertEqual(["gone"], [e["id"] for e in result["detail"]["adrift"]])
+
+
+class ReindexTests(ComputerCase):
+    def test_the_similarity_graph_is_rebuilt_in_slices(self):
+        store = self.open_store("demo")
+        for i in range(5):
+            store.create_memory(memory(f"note-{i}", f"{CACHE} variation {i}"))
+        store.close()
+        result = self.computer().run_one(make_job("reindex", "demo", chunk=2))
+        self.assertEqual("ok", result["outcome"])
+        self.assertEqual(5, result["detail"]["rebuilt"])
+
+    def test_reindexing_an_empty_project_terminates(self):
+        self.assertEqual({"rebuilt": 0},
+                         self.computer().run_one(make_job("reindex", "demo"))["detail"])
+
+
 class SchedulerTests(ComputerCase):
     def test_a_sweep_covers_every_project_and_every_kind(self):
         SqliteMemoryStore(self.db, "second").close()
         computer = self.computer()
         scheduler = Scheduler(computer, lambda: ["demo", "second"])
-        self.assertEqual(6, scheduler.sweep_now())
+        self.assertEqual(2 * len(scheduler.kinds), scheduler.sweep_now())
 
     def test_a_quiet_project_still_gets_swept(self):
         # Every other trigger is driven by activity, so without a floor timer a

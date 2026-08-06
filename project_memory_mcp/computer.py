@@ -230,15 +230,50 @@ def dedup_job(store: Any, threshold: float = 0.6, limit: int = 25) -> dict[str, 
             "pairs": [[m["id"] for m in pair["memories"]] for pair in found["candidates"][:limit]]}
 
 
+def reindex_job(store: Any, chunk: int = 500) -> dict[str, Any]:
+    """Rebuild the similarity graph in bounded slices.
+
+    Derived edges are computed per write, which means the graph reflects
+    whatever threshold was in force when each memory happened to be stored.
+    Rebuilding is what makes changing that threshold mean anything - and it is
+    precomputation, so it belongs here rather than on the write path.
+    """
+    offset, rebuilt = 0, 0
+    while True:
+        result = store.rebuild_derived_edges(limit=chunk, offset=offset)
+        rebuilt += result["rebuilt"]
+        offset = result["next_offset"]
+        if not result["remaining"] or not result["rebuilt"]:
+            return {"rebuilt": rebuilt}
+        time.sleep(YIELD_SECONDS)  # hand the interpreter back between slices
+
+
+def rebase_job(store: Any, mark_stale: bool = False) -> dict[str, Any]:
+    """Re-anchor memories to the code as it is now.
+
+    A memory naming files that no longer exist is describing something that has
+    gone. That is a fact rather than a judgment - the paths are there or they
+    are not - which is what makes it the one correctness check that can be
+    automated at all.
+
+    It needs the working tree, so it only ever runs on a machine that has it. A
+    server holds memories about repositories it cannot see, and there this job
+    reports that it has nothing to check rather than pretending otherwise.
+    """
+    return store.check_anchors(mark_stale=mark_stale)
+
+
 JOB_KINDS: dict[str, Callable[..., dict[str, Any]]] = {
     "audit": audit_job,
     "outbox": outbox_job,
     "dedup": dedup_job,
+    "reindex": reindex_job,
+    "rebase": rebase_job,
 }
 
 #: Lower runs first. Delivering queued work beats tidying, because somebody is
 #: waiting on the far end of a promotion and nobody is waiting on a sweep.
-PRIORITIES = {"outbox": 10, "audit": 20, "dedup": 30}
+PRIORITIES = {"outbox": 10, "rebase": 20, "audit": 30, "reindex": 40, "dedup": 50}
 
 
 def make_job(kind: str, project: str, **kwargs: Any) -> Job:
@@ -265,7 +300,8 @@ class Scheduler:
     """
 
     def __init__(self, computer: Computer, projects: Callable[[], list[str]],
-                 interval_seconds: int = 3600, kinds: tuple[str, ...] = ("outbox", "audit", "dedup")) -> None:
+                 interval_seconds: int = 3600,
+                 kinds: tuple[str, ...] = ("outbox", "rebase", "audit", "dedup")) -> None:
         self.computer = computer
         self.projects = projects
         self.interval = max(60, int(interval_seconds))

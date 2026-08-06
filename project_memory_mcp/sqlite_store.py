@@ -21,7 +21,7 @@ from typing import Any, Iterable
 from . import validation
 from .validation import ID_RE, LABEL_RE, LabelExpression
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # 64-day window for the spread bitmap: long enough to judge the early tiers,
 # and it fits one SQLite integer.
@@ -38,7 +38,11 @@ CREATE TABLE IF NOT EXISTS projects (
     id      TEXT PRIMARY KEY,
     name    TEXT NOT NULL,
     created TEXT NOT NULL,
-    queries INTEGER NOT NULL DEFAULT 0
+    queries INTEGER NOT NULL DEFAULT 0,
+    -- Where this project's code lives, when the store is on the same machine.
+    -- Null on a server: it holds memories about repositories it cannot see, so
+    -- anything needing the working tree is a local job only.
+    root_path TEXT
 );
 
 -- `uuid` is the identity every other table points at; `slug` is the readable
@@ -376,6 +380,16 @@ def _upgrade(connection: sqlite3.Connection) -> None:
         columns = {r[1] for r in connection.execute("PRAGMA table_info(memories)")}
     if "visibility" not in columns:
         _migrate_v5_to_v6(connection)
+    if "root_path" not in {r[1] for r in connection.execute("PRAGMA table_info(projects)")}:
+        _migrate_v6_to_v7(connection)
+
+
+def _migrate_v6_to_v7(connection: sqlite3.Connection) -> None:
+    """Record where a project's code lives, for the checks that need to see it."""
+    connection.execute("ALTER TABLE projects ADD COLUMN root_path TEXT")
+    connection.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+                       (str(SCHEMA_VERSION),))
+    connection.commit()
 
 
 def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
@@ -1089,6 +1103,80 @@ class SqliteMemoryStore:
             self._write(merged, memory_uuid, visibility=self._visibility_of(memory_uuid))
             self._synchronize_relationships(memory_id)
         return {"updated": memory_id, "related_candidates": []}
+
+    def set_root_path(self, root: str | None) -> dict[str, Any]:
+        """Tell this project where its code is, so anchors can be checked."""
+        with self.connection:
+            self.connection.execute("UPDATE projects SET root_path=? WHERE id=?",
+                                    (str(root) if root else None, self.project))
+        return {"project": self.project, "root_path": root}
+
+    def root_path(self) -> str | None:
+        row = self.connection.execute(
+            "SELECT root_path FROM projects WHERE id=?", (self.project,)).fetchone()
+        return row["root_path"] if row else None
+
+    def rebuild_derived_edges(self, limit: int = 500, offset: int = 0) -> dict[str, Any]:
+        """Recompute similarity neighbours for a slice of the project.
+
+        On a write only the new memory's edges are computed, which is right for
+        a write but leaves the graph reflecting whichever threshold happened to
+        be in force when each memory was stored. This rebuilds them, so changing
+        the threshold means something.
+
+        Sliced rather than wholesale: the caller runs it in bounded chunks and
+        hands the lock back between them, so a large project does not stop being
+        served while its graph is recomputed.
+        """
+        rows = self.connection.execute(
+            "SELECT uuid, body FROM memories WHERE project_id=? AND archived_at IS NULL "
+            "AND origin_remote IS NULL LIMIT ? OFFSET ?",
+            (self.project, limit, offset)).fetchall()
+        for row in rows:
+            with self.connection:
+                self._materialize_derived_edges(json.loads(row["body"]), row["uuid"])
+        remaining = self.connection.execute(
+            "SELECT COUNT(*) AS n FROM memories WHERE project_id=? AND archived_at IS NULL "
+            "AND origin_remote IS NULL", (self.project,)).fetchone()["n"] - (offset + len(rows))
+        return {"rebuilt": len(rows), "next_offset": offset + len(rows),
+                "remaining": max(0, remaining)}
+
+    def check_anchors(self, mark_stale: bool = False) -> dict[str, Any]:
+        """Find memories whose files no longer exist.
+
+        The one correctness check that is a fact rather than a judgment: either
+        the paths are there or they are not. It can only run where the code is,
+        which is why it belongs to a local installation and never to a server.
+
+        Marking stale rather than wrong: a file that vanished may have moved,
+        and stale says "check this against current code", which is exactly the
+        instruction the evidence supports.
+        """
+        root = self.root_path()
+        if not root:
+            return {"checked": 0, "skipped": "no root_path recorded for this project"}
+        base = Path(root)
+        if not base.is_dir():
+            return {"checked": 0, "skipped": f"root_path {root} is not a directory here"}
+
+        rows = self.connection.execute(
+            "SELECT uuid, slug, body, status FROM memories WHERE project_id=? "
+            "AND archived_at IS NULL AND origin_remote IS NULL", (self.project,)).fetchall()
+        checked = 0
+        adrift: list[dict[str, Any]] = []
+        for row in rows:
+            body = json.loads(row["body"])
+            files = [f for f in (body.get("scope") or {}).get("files") or [] if isinstance(f, str)]
+            if not files:
+                continue  # nothing anchored it in the first place
+            checked += 1
+            missing = [f for f in files if not (base / f).exists()]
+            if len(missing) != len(files):
+                continue  # at least one anchor still stands
+            adrift.append({"id": row["slug"], "files": missing, "status": row["status"]})
+            if mark_stale and row["status"] == "active":
+                self.update_memory(row["slug"], {"status": "stale"})
+        return {"checked": checked, "adrift": adrift, "marked_stale": bool(mark_stale)}
 
     def _visibility_of(self, memory_uuid: str) -> str:
         row = self.connection.execute(

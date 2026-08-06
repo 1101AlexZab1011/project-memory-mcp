@@ -129,14 +129,31 @@ class HttpServerTests(unittest.TestCase):
     def test_concurrent_requests_do_not_corrupt_the_connection(self):
         # ThreadingHTTPServer hands requests to arbitrary threads; SQLite
         # connections are not thread-safe, so this would fail without the lock.
-        results: list[int] = []
+        # Failures are captured rather than raised inside the workers, so when
+        # this does fail it says what happened instead of only that a count was
+        # wrong. It has failed roughly one full-suite run in four on Windows -
+        # never in isolation - which points at load from the rest of the suite
+        # rather than at this server. Recording the cause is how that gets
+        # settled the next time it happens.
+        results: list[object] = []
+        guard = threading.Lock()
+
         def hammer():
             for _ in range(5):
-                results.append(self.call("recall", {"query": "cache", "limit": 1, "full_count": 0})[0])
+                try:
+                    outcome: object = self.call(
+                        "recall", {"query": "cache", "limit": 1, "full_count": 0})[0]
+                except Exception as error:  # noqa: BLE001 - the point is to name it
+                    outcome = f"{type(error).__name__}: {error}"
+                with guard:
+                    results.append(outcome)
+
         threads = [threading.Thread(target=hammer) for _ in range(4)]
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
-        self.assertEqual(20, len(results))
-        self.assertTrue(all(status == 200 for status in results))
+            t.join(timeout=30)
+
+        self.assertEqual(20, len(results), f"some workers did not finish: {results}")
+        bad = [r for r in results if r != 200]
+        self.assertEqual([], bad, f"{len(bad)} of 20 concurrent requests did not return 200: {bad}")
