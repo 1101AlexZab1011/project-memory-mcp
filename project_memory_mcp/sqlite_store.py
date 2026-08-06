@@ -18,15 +18,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from . import usage
 from . import validation
 from .validation import ID_RE, LABEL_RE, LabelExpression
 
 SCHEMA_VERSION = 7
-
-# 64-day window for the spread bitmap: long enough to judge the early tiers,
-# and it fits one SQLite integer.
-SPREAD_WINDOW_DAYS = 64
-SPREAD_MASK = (1 << SPREAD_WINDOW_DAYS) - 1
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -284,62 +280,6 @@ StoreError = validation.StoreError
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _today() -> int:
-    """Days since the epoch, UTC. The unit of the spread bitmap."""
-    return datetime.now(timezone.utc).toordinal()
-
-
-def _as_signed(bits: int) -> int:
-    """SQLite integers are signed 64-bit; bit 63 set would overflow on write."""
-    bits &= SPREAD_MASK
-    return bits - (1 << SPREAD_WINDOW_DAYS) if bits >> (SPREAD_WINDOW_DAYS - 1) else bits
-
-
-def _touch_spread(bits: int, epoch: int | None, today: int) -> tuple[int, int]:
-    """Set today's bit in a 64-day rolling window, newest day in bit 0.
-
-    Spread - how many distinct days a memory was recalled on - says something
-    that a rate does not: thirty hits in one afternoon is a burst, while one hit
-    a month for a year is a memory that keeps proving itself.
-    """
-    bits &= SPREAD_MASK
-    if epoch is None:
-        return _as_signed(1), today
-    delta = today - epoch
-    if delta == 0:
-        return _as_signed(bits | 1), epoch
-    if delta < 0:
-        # A replica's clock ran behind, or rows merged out of order. Record the
-        # day in its own slot rather than rolling the window backwards.
-        back = -delta
-        if back < SPREAD_WINDOW_DAYS:
-            bits |= 1 << back
-        return _as_signed(bits), epoch
-    if delta >= SPREAD_WINDOW_DAYS:
-        return _as_signed(1), today
-    return _as_signed(((bits << delta) & SPREAD_MASK) | 1), today
-
-
-def _merge_spread(bits_a: int, epoch_a: int | None,
-                  bits_b: int, epoch_b: int | None) -> tuple[int, int | None]:
-    """Combine two replicas' windows by aligning them and OR-ing.
-
-    Two machines recalling a memory on the same day is one day of spread, which
-    is exactly what OR gives and what summing would not.
-    """
-    if epoch_a is None:
-        return bits_b & SPREAD_MASK, epoch_b
-    if epoch_b is None:
-        return bits_a & SPREAD_MASK, epoch_a
-    newest = max(epoch_a, epoch_b)
-    merged = 0
-    for bits, epoch in ((bits_a, epoch_a), (bits_b, epoch_b)):
-        shift = newest - epoch
-        if shift < SPREAD_WINDOW_DAYS:
-            merged |= ((bits & SPREAD_MASK) << shift) & SPREAD_MASK
-    return merged, newest
 
 
 def _ensure_replica_id(connection: sqlite3.Connection) -> str:
@@ -785,7 +725,7 @@ class SqliteMemoryStore:
             # being adjacent in time to something someone was reading.
             if record:
                 shown = self._uuids_for_slugs([r["id"] for r in results])
-                self._record_usage(shown.values(), direct=())
+                usage.record(self, shown.values(), direct=())
             payload = {"order": "recent", "offset": offset,
                        "label_query_labels": sorted(expression.used_labels),
                        "count": len(results), "memories": results}
@@ -877,7 +817,7 @@ class SqliteMemoryStore:
                 break
         results.sort(key=lambda r: (-r["score"], r["id"]))
         if record:
-            self._record_usage(surfaced, direct=direct)
+            usage.record(self, surfaced, direct=direct)
         payload: dict[str, Any] = {
             "query": query,
             "label_query_labels": sorted(expression.used_labels),
@@ -1132,43 +1072,6 @@ class SqliteMemoryStore:
         return {"rebuilt": len(rows), "next_offset": offset + len(rows),
                 "remaining": max(0, remaining)}
 
-    def check_anchors(self, mark_stale: bool = False) -> dict[str, Any]:
-        """Find memories whose files no longer exist.
-
-        The one correctness check that is a fact rather than a judgment: either
-        the paths are there or they are not. It can only run where the code is,
-        which is why it belongs to a local installation and never to a server.
-
-        Marking stale rather than wrong: a file that vanished may have moved,
-        and stale says "check this against current code", which is exactly the
-        instruction the evidence supports.
-        """
-        root = self.root_path()
-        if not root:
-            return {"checked": 0, "skipped": "no root_path recorded for this project"}
-        base = Path(root)
-        if not base.is_dir():
-            return {"checked": 0, "skipped": f"root_path {root} is not a directory here"}
-
-        rows = self.connection.execute(
-            "SELECT uuid, slug, body, status FROM memories WHERE project_id=? "
-            "AND archived_at IS NULL AND origin_remote IS NULL", (self.project,)).fetchall()
-        checked = 0
-        adrift: list[dict[str, Any]] = []
-        for row in rows:
-            body = json.loads(row["body"])
-            files = [f for f in (body.get("scope") or {}).get("files") or [] if isinstance(f, str)]
-            if not files:
-                continue  # nothing anchored it in the first place
-            checked += 1
-            missing = [f for f in files if not (base / f).exists()]
-            if len(missing) != len(files):
-                continue  # at least one anchor still stands
-            adrift.append({"id": row["slug"], "files": missing, "status": row["status"]})
-            if mark_stale and row["status"] == "active":
-                self.update_memory(row["slug"], {"status": "stale"})
-        return {"checked": checked, "adrift": adrift, "marked_stale": bool(mark_stale)}
-
     def _visibility_of(self, memory_uuid: str) -> str:
         row = self.connection.execute(
             "SELECT visibility FROM memories WHERE project_id=? AND uuid=?",
@@ -1268,35 +1171,6 @@ class SqliteMemoryStore:
                 "origin_remote=excluded.origin_remote",
                 rows)
 
-    def duplicate_candidates(self, limit: int = 25, threshold: float = 0.6) -> dict[str, Any]:
-        """Pairs that look like the same lesson written twice.
-
-        Similarity nominates; it never decides. A score is good at finding pairs
-        worth reading and bad at telling whether two statements mean the same
-        thing, so this returns both memories in full for an agent to judge.
-
-        Candidates come from the derived edges already materialized on write -
-        the memories that share labels or files - so this costs one pass over a
-        capped edge set rather than comparing every pair.
-        """
-        rows = self.connection.execute(
-            "SELECT DISTINCT CASE WHEN e.src < e.dst THEN e.src ELSE e.dst END AS a, "
-            "       CASE WHEN e.src < e.dst THEN e.dst ELSE e.src END AS b "
-            "FROM edges e "
-            "JOIN memories ma ON ma.project_id=e.project_id AND ma.uuid=e.src AND ma.archived_at IS NULL "
-            "JOIN memories mb ON mb.project_id=e.project_id AND mb.uuid=e.dst AND mb.archived_at IS NULL "
-            "WHERE e.project_id=? AND e.kind='derived'", (self.project,)
-        ).fetchall()
-
-        pairs = []
-        for row in rows:
-            left, right = self._body_by_uuid(row["a"]), self._body_by_uuid(row["b"])
-            score = _text_similarity(left, right)
-            if score >= threshold:
-                pairs.append({"score": round(score, 3), "memories": [left, right]})
-        pairs.sort(key=lambda p: -p["score"])
-        return {"count": len(pairs), "threshold": threshold, "candidates": pairs[:limit]}
-
     def merge_memories(self, keep_id: str, merge_id: str, reason: str) -> dict[str, Any]:
         """Fold one memory into another, keeping everything both knew.
 
@@ -1391,91 +1265,22 @@ class SqliteMemoryStore:
 
     # ------------------------------------------------------------------- usage
 
-    def load_usage(self) -> dict[str, Any]:
-        """Counters per memory, summed across every replica that reported one.
+    # ------------------------------------------------------------------- usage
+    #
+    # The arithmetic lives in usage.py - grow-only per-replica counters and the
+    # spread bitmap are their own idea with their own merge rules. What stays
+    # here is the boundary these two cross: callers speak slugs, the counters are
+    # keyed by uuid, and translating between them is the store's job.
 
-        Grow-only counters from independent replicas add; the spread bitmaps
-        OR, because two machines using a memory on the same day is one day of
-        spread, not two.
-        """
-        rows = self.connection.execute(
-            "SELECT m.slug AS slug, u.surfaced AS surfaced, u.surfaced_direct AS surfaced_direct, "
-            "u.applied AS applied, u.last_surfaced AS last_surfaced, u.last_applied AS last_applied, "
-            "u.spread_bits AS spread_bits, u.spread_epoch AS spread_epoch "
-            "FROM usage u JOIN memories m ON m.project_id=u.project_id AND m.uuid=u.memory_id "
-            "WHERE u.project_id=?", (self.project,)
-        ).fetchall()
-        merged: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            entry = merged.setdefault(row["slug"], {
-                "surfaced": 0, "surfaced_direct": 0, "applied": 0,
-                "last_surfaced": None, "last_applied": None, "_bits": 0, "_epoch": None,
-            })
-            entry["surfaced"] += row["surfaced"]
-            entry["surfaced_direct"] += row["surfaced_direct"]
-            entry["applied"] += row["applied"]
-            for field in ("last_surfaced", "last_applied"):
-                if row[field] and (entry[field] is None or row[field] > entry[field]):
-                    entry[field] = row[field]
-            entry["_bits"], entry["_epoch"] = _merge_spread(
-                entry["_bits"], entry["_epoch"], row["spread_bits"], row["spread_epoch"])
-        for entry in merged.values():
-            entry["spread_days"] = bin(entry.pop("_bits") & SPREAD_MASK).count("1")
-            entry.pop("_epoch")
-        return {"schema_version": SCHEMA_VERSION, "memories": merged}
+    def load_usage(self) -> dict[str, Any]:
+        return {"schema_version": SCHEMA_VERSION, **usage.load(self)}
 
     def record_use(self, memory_ids: list[str]) -> dict[str, Any]:
         if not isinstance(memory_ids, list) or not all(isinstance(i, str) for i in memory_ids):
             raise StoreError("memory_ids must be an array of strings.")
-        uuids = []
-        for memory_id in memory_ids:
-            uuids.append(self._uuid_for(memory_id))  # raises on unknown id
-        self._record_usage((), applied=uuids)
+        uuids = [self._uuid_for(memory_id) for memory_id in memory_ids]  # raises on unknown id
+        usage.record(self, (), applied=uuids)
         return {"recorded": sorted(set(memory_ids)), "field": "applied"}
-
-    def _record_usage(self, surfaced: Iterable[str], direct: Iterable[str] = (),
-                      applied: Iterable[str] = ()) -> None:
-        """Bump this replica's counters for the memories a call touched.
-
-        Every id here is a uuid. Rows are keyed by replica as well as memory, so
-        this only ever writes counters this machine owns - which is what lets a
-        push be an idempotent overwrite instead of a stream of increments.
-        """
-        surfaced, direct, applied = set(surfaced), set(direct), set(applied)
-        touched = sorted(surfaced | direct | applied)
-        if not touched:
-            return
-        stamp, today = _now(), _today()
-        with self.connection:
-            for memory_id in touched:
-                row = self.connection.execute(
-                    "SELECT spread_bits, spread_epoch FROM usage "
-                    "WHERE project_id=? AND memory_id=? AND replica_id=?",
-                    (self.project, memory_id, self.replica_id),
-                ).fetchone()
-                bits, epoch = _touch_spread(
-                    row["spread_bits"] if row else 0, row["spread_epoch"] if row else None, today)
-                self.connection.execute(
-                    "INSERT INTO usage(project_id, memory_id, replica_id, surfaced, surfaced_direct, "
-                    "applied, last_surfaced, last_applied, spread_bits, spread_epoch) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(project_id, memory_id, replica_id) DO UPDATE SET "
-                    "surfaced=surfaced+excluded.surfaced, "
-                    "surfaced_direct=surfaced_direct+excluded.surfaced_direct, "
-                    "applied=applied+excluded.applied, "
-                    "last_surfaced=COALESCE(excluded.last_surfaced, last_surfaced), "
-                    "last_applied=COALESCE(excluded.last_applied, last_applied), "
-                    "spread_bits=excluded.spread_bits, spread_epoch=excluded.spread_epoch",
-                    (self.project, memory_id, self.replica_id,
-                     1 if memory_id in surfaced else 0,
-                     1 if memory_id in direct else 0,
-                     1 if memory_id in applied else 0,
-                     stamp if memory_id in surfaced else None,
-                     stamp if memory_id in applied else None,
-                     bits, epoch),
-                )
-
-    # -------------------------------------------------------------- validation
 
     def validate_memory(self, memory: Any, known_labels: set[str] | None, where: str) -> list[str]:
         return validation.validate_memory(memory, known_labels, where)
@@ -1696,27 +1501,6 @@ class SqliteMemoryStore:
                 rel[target] = values
             if json.dumps(rel, sort_keys=True) != before:
                 self._write(other, row["uuid"], visibility=self._visibility_of(row["uuid"]))
-
-
-def _text_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
-    """Token overlap across the fields that carry the lesson.
-
-    Deliberately crude. Its job is to nominate pairs worth an agent's attention,
-    not to decide anything, so a cheap symmetric measure over the text a human
-    would actually compare is the right amount of machinery.
-    """
-    from .ranking import tokenize
-
-    def bag(memory: dict[str, Any]) -> set[str]:
-        parts = [memory.get("description") or ""]
-        for field in ("triggers", "remembered_facts", "solution_pattern", "pitfalls"):
-            parts.extend(memory.get(field) or [])
-        return set(tokenize(" ".join(parts)))
-
-    a, b = bag(left), bag(right)
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
 
 
 def _expand(text: str) -> str:

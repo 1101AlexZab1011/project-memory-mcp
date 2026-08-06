@@ -233,7 +233,9 @@ def dedup_job(store: Any, threshold: float = 0.6, limit: int = 25) -> dict[str, 
     Nominates only. Deciding whether two memories are one lesson is a reading
     comprehension question, and this is the wrong place to answer it.
     """
-    found = store.duplicate_candidates(limit=limit, threshold=threshold)
+    from .maintenance import duplicate_candidates
+
+    found = duplicate_candidates(store, limit=limit, threshold=threshold)
     return {"candidates": found["count"],
             "pairs": [[m["id"] for m in pair["memories"]] for pair in found["candidates"][:limit]]}
 
@@ -268,7 +270,9 @@ def rebase_job(store: Any, mark_stale: bool = False) -> dict[str, Any]:
     server holds memories about repositories it cannot see, and there this job
     reports that it has nothing to check rather than pretending otherwise.
     """
-    return store.check_anchors(mark_stale=mark_stale)
+    from .maintenance import check_anchors
+
+    return check_anchors(store, mark_stale=mark_stale)
 
 
 JOB_KINDS: dict[str, Callable[..., dict[str, Any]]] = {

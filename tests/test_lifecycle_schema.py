@@ -11,13 +11,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from project_memory_mcp.sqlite_store import (
-    SCHEMA_VERSION,
-    SPREAD_WINDOW_DAYS,
-    SqliteMemoryStore,
-    _merge_spread,
-    _touch_spread,
-)
+from project_memory_mcp.sqlite_store import SCHEMA_VERSION, SqliteMemoryStore
+from project_memory_mcp.usage import SPREAD_WINDOW_DAYS, merge_spread, touch_spread
 
 CACHE = "Session cache invalidation races the auth refresh."
 SHADER = "Shader compilation stalls on a cold start on the build farm."
@@ -165,39 +160,39 @@ class SpreadBitmapTests(unittest.TestCase):
     """Spread is distinct days, not a rate: bursts must not outrank durability."""
 
     def test_two_recalls_on_one_day_are_one_day_of_spread(self):
-        bits, epoch = _touch_spread(0, None, 1000)
-        bits, epoch = _touch_spread(bits, epoch, 1000)
+        bits, epoch = touch_spread(0, None, 1000)
+        bits, epoch = touch_spread(bits, epoch, 1000)
         self.assertEqual(1, bin(bits & ((1 << 64) - 1)).count("1"))
 
     def test_recalls_on_different_days_accumulate(self):
-        bits, epoch = _touch_spread(0, None, 1000)
+        bits, epoch = touch_spread(0, None, 1000)
         for day in (1001, 1005, 1030):
-            bits, epoch = _touch_spread(bits, epoch, day)
+            bits, epoch = touch_spread(bits, epoch, day)
         self.assertEqual(4, bin(bits & ((1 << 64) - 1)).count("1"))
         self.assertEqual(1030, epoch)
 
     def test_a_gap_longer_than_the_window_starts_over(self):
-        bits, epoch = _touch_spread(0, None, 1000)
-        bits, epoch = _touch_spread(bits, epoch, 1000 + SPREAD_WINDOW_DAYS + 5)
+        bits, epoch = touch_spread(0, None, 1000)
+        bits, epoch = touch_spread(bits, epoch, 1000 + SPREAD_WINDOW_DAYS + 5)
         self.assertEqual(1, bin(bits & ((1 << 64) - 1)).count("1"))
 
     def test_days_fall_out_of_the_window_as_it_rolls(self):
-        bits, epoch = _touch_spread(0, None, 1000)
-        bits, epoch = _touch_spread(bits, epoch, 1001)
-        bits, epoch = _touch_spread(bits, epoch, 1000 + SPREAD_WINDOW_DAYS)
+        bits, epoch = touch_spread(0, None, 1000)
+        bits, epoch = touch_spread(bits, epoch, 1001)
+        bits, epoch = touch_spread(bits, epoch, 1000 + SPREAD_WINDOW_DAYS)
         # The first day is now older than the window; the second and third stay.
         self.assertEqual(2, bin(bits & ((1 << 64) - 1)).count("1"))
 
     def test_a_clock_that_ran_backwards_does_not_roll_the_window(self):
-        bits, epoch = _touch_spread(0, None, 1000)
-        bits, epoch = _touch_spread(bits, epoch, 998)
+        bits, epoch = touch_spread(0, None, 1000)
+        bits, epoch = touch_spread(bits, epoch, 998)
         self.assertEqual(1000, epoch)
         self.assertEqual(2, bin(bits & ((1 << 64) - 1)).count("1"))
 
     def test_bit_63_stays_writable_as_a_signed_integer(self):
         # SQLite integers are signed; a naive bitmap overflows on write.
-        bits, epoch = _touch_spread(0, None, 1000)
-        bits, epoch = _touch_spread(bits, epoch, 1000 + SPREAD_WINDOW_DAYS - 1)
+        bits, epoch = touch_spread(0, None, 1000)
+        bits, epoch = touch_spread(bits, epoch, 1000 + SPREAD_WINDOW_DAYS - 1)
         self.assertLess(bits, 1 << 63)
         with sqlite3.connect(":memory:") as connection:
             connection.execute("CREATE TABLE t (b INTEGER)")
@@ -206,16 +201,16 @@ class SpreadBitmapTests(unittest.TestCase):
 
     def test_merging_two_replicas_ors_rather_than_sums(self):
         # The same day on two machines is one day of spread, not two.
-        a, _ = _touch_spread(0, None, 1000)
-        b, _ = _touch_spread(0, None, 1000)
-        merged, epoch = _merge_spread(a, 1000, b, 1000)
+        a, _ = touch_spread(0, None, 1000)
+        b, _ = touch_spread(0, None, 1000)
+        merged, epoch = merge_spread(a, 1000, b, 1000)
         self.assertEqual(1, bin(merged).count("1"))
         self.assertEqual(1000, epoch)
 
     def test_merging_aligns_windows_that_end_on_different_days(self):
-        a, epoch_a = _touch_spread(0, None, 1000)
-        b, epoch_b = _touch_spread(0, None, 1003)
-        merged, epoch = _merge_spread(a, epoch_a, b, epoch_b)
+        a, epoch_a = touch_spread(0, None, 1000)
+        b, epoch_b = touch_spread(0, None, 1003)
+        merged, epoch = merge_spread(a, epoch_a, b, epoch_b)
         self.assertEqual(1003, epoch)
         self.assertEqual(2, bin(merged).count("1"))
         self.assertTrue(merged & 1)          # the newer day, in bit 0

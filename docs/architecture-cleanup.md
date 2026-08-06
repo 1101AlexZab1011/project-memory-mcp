@@ -177,6 +177,42 @@ changes during extraction. Move the body, leave a delegating method, update call
 the delegator in a separate commit. Anything that wants to change behaviour is a different
 commit from anything that moves it.
 
+### Outcome, and where the plan above was wrong ✔
+
+Done: `messages.py` took the actor guard and the recall notice, `usage.py` took the counters and
+the spread bitmap, `maintenance.py` took anchor checking and duplicate nomination.
+
+**2,045 → 1,620 lines, 39 → 30 public methods.** The stated target of 1,200 and 25 is not met,
+and it was not a reachable number — it was set before anyone measured the file. What is actually
+in there:
+
+| | lines |
+|---|---|
+| class body | 957 |
+| `SCHEMA` DDL string | 229 |
+| migrations and `_upgrade` | 213 |
+| module helpers, imports, docstring | ~220 |
+
+Reaching 1,200 would mean cutting another 420, and the only pieces that size are `recall` (163
+lines and the heart of the product), the schema, or the migrations. All three are the store
+being the store. The floor for this file, honestly, is around 1,500.
+
+Two groupings from 4b and 4c were wrong and were **not** carried out:
+
+- **`rebuild_derived_edges` stays.** It needs `_materialize_derived_edges`, which every write
+  also uses. Extracting it would mean making that public — trading an internal call for a
+  wider public surface, which is worse than the thing being fixed.
+- **`merge_memories` stays.** It reaches five private methods (`_write`, `_visibility_of`,
+  `_synchronize_relationships`, `_body_by_uuid`, `_uuid_for`). Same trade, five times over.
+
+`load_usage` and `record_use` remain on the store as thin delegators. That is deliberate rather
+than a shortfall: callers speak slugs, the counters are keyed by uuid, and translating between
+the two is exactly the boundary the store exists to hold. The arithmetic moved; the boundary
+did not.
+
+The lesson worth keeping: a line-count target set without opening the file measures how bold the
+plan was, not how well the code is organised.
+
 ## Step 5 — Make the UI checkable without adding a build step
 
 **The change.** Move the JavaScript out of the Python string into `ui/app.js`, read from disk at

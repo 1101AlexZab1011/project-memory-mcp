@@ -13,6 +13,7 @@ from typing import Any
 
 from . import __version__
 from . import federation
+from . import maintenance
 from . import messages
 from .validation import StoreError
 
@@ -419,7 +420,8 @@ class McpServer:
                     unread_only=args.get("unread_only", True),
                     mark_read=args.get("mark_read", False))
             elif name == "find_duplicate_memories":
-                payload = self.store.duplicate_candidates(
+                payload = maintenance.duplicate_candidates(
+                    self.store,
                     limit=args.get("limit", 25), threshold=args.get("threshold", 0.6))
             elif name == "merge_memories":
                 payload = self.store.merge_memories(

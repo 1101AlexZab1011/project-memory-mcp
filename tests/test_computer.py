@@ -18,6 +18,7 @@ from pathlib import Path
 
 from project_memory_mcp.audit import AuditPolicy, TierGate
 from project_memory_mcp.computer import Budget, Computer, Job, Scheduler, make_job
+from project_memory_mcp import maintenance
 from project_memory_mcp.sqlite_store import SqliteMemoryStore
 
 CACHE = "Session cache invalidation races the auth refresh under load."
@@ -192,7 +193,7 @@ class AnchorTests(ComputerCase):
         store.create_memory(self.anchored("gone", ["Source/Deleted.cpp"]))
         store.create_memory(self.anchored("here", ["Source/Cache.cpp"]))
 
-        result = store.check_anchors()
+        result = maintenance.check_anchors(store)
 
         self.assertEqual(["gone"], [entry["id"] for entry in result["adrift"]])
         self.assertEqual(2, result["checked"])
@@ -203,14 +204,14 @@ class AnchorTests(ComputerCase):
         self.addCleanup(store.close)
         store.set_root_path(str(self.root))
         store.create_memory(self.anchored("partial", ["Source/Cache.cpp", "Source/Gone.cpp"]))
-        self.assertEqual([], store.check_anchors()["adrift"])
+        self.assertEqual([], maintenance.check_anchors(store)["adrift"])
 
     def test_memories_with_no_files_are_not_judged(self):
         store = self.open_store("demo")
         self.addCleanup(store.close)
         store.set_root_path(str(self.root))
         store.create_memory(memory("unanchored", CACHE))
-        self.assertEqual(0, store.check_anchors()["checked"])
+        self.assertEqual(0, maintenance.check_anchors(store)["checked"])
 
     def test_marking_is_opt_in_and_uses_stale_not_wrong(self):
         # The files may have moved rather than gone; stale says "check this",
@@ -220,9 +221,9 @@ class AnchorTests(ComputerCase):
         store.set_root_path(str(self.root))
         store.create_memory(self.anchored("gone", ["Source/Deleted.cpp"]))
 
-        store.check_anchors()
+        maintenance.check_anchors(store)
         self.assertEqual("active", store.get_memory("gone")["status"])
-        store.check_anchors(mark_stale=True)
+        maintenance.check_anchors(store, mark_stale=True)
         self.assertEqual("stale", store.get_memory("gone")["status"])
 
     def test_a_store_that_cannot_see_the_code_says_so(self):
@@ -231,7 +232,7 @@ class AnchorTests(ComputerCase):
         store = self.open_store("demo")
         self.addCleanup(store.close)
         store.create_memory(self.anchored("gone", ["Source/Deleted.cpp"]))
-        result = store.check_anchors()
+        result = maintenance.check_anchors(store)
         self.assertEqual(0, result["checked"])
         self.assertIn("no root_path", result["skipped"])
 

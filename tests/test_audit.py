@@ -24,6 +24,7 @@ from project_memory_mcp.audit import (
     last_run,
     run_audit,
 )
+from project_memory_mcp import maintenance
 from project_memory_mcp.sqlite_store import SqliteMemoryStore
 
 CACHE = "Session cache invalidation races the auth refresh under load."
@@ -414,7 +415,7 @@ class DuplicateTests(AuditCase):
     def test_a_near_identical_pair_is_nominated_with_both_bodies(self):
         self.store.create_memory(self.first)
         self.store.create_memory(self.second)
-        found = self.store.duplicate_candidates()
+        found = maintenance.duplicate_candidates(self.store)
         self.assertEqual(1, found["count"])
         pair = found["candidates"][0]
         self.assertEqual({"cache-race-a", "cache-race-b"}, {m["id"] for m in pair["memories"]})
@@ -425,7 +426,7 @@ class DuplicateTests(AuditCase):
         different = memory("shader-note", SHADER, ["area:x"])
         different["scope"]["files"] = ["Source/Cache.cpp"]
         self.store.create_memory(different)
-        self.assertEqual(0, self.store.duplicate_candidates()["count"])
+        self.assertEqual(0, maintenance.duplicate_candidates(self.store)["count"])
 
     def test_merging_keeps_everything_both_knew(self):
         self.first["pitfalls"] = ["Do not clear the cache mid-request."]
@@ -475,4 +476,4 @@ class DuplicateTests(AuditCase):
         self.store.create_memory(self.first)
         self.store.create_memory(self.second)
         self.store.merge_memories("cache-race-a", "cache-race-b", "One fact.")
-        self.assertEqual(0, self.store.duplicate_candidates()["count"])
+        self.assertEqual(0, maintenance.duplicate_candidates(self.store)["count"])

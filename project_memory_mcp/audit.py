@@ -36,7 +36,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
-from .sqlite_store import SPREAD_MASK, SqliteMemoryStore, _merge_spread, _now
+from .sqlite_store import SqliteMemoryStore, _now
+from .usage import SPREAD_MASK, merge_spread
 
 VERDICT_PROMOTE = "promote"
 VERDICT_ARCHIVE = "archive"
@@ -183,7 +184,7 @@ def _collect(store: SqliteMemoryStore) -> tuple[int, list[dict[str, Any]]]:
         entry["surfaced"] += row["surfaced"]
         entry["surfaced_direct"] += row["surfaced_direct"]
         entry["applied"] += row["applied"]
-        entry["_bits"], entry["_epoch"] = _merge_spread(
+        entry["_bits"], entry["_epoch"] = merge_spread(
             entry["_bits"], entry["_epoch"], row["spread_bits"], row["spread_epoch"])
 
     # Authored links only. Derived edges are computed similarity, so counting
