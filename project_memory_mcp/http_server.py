@@ -503,25 +503,26 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": str(exc)})
             return
 
-        if _talks_to_other_machines(message):
-            # Run outside the project lock, and hand the lock down instead. A
-            # federated recall waits on other people's servers; holding this
-            # project's lock across that would stall every other request for it,
-            # reads included. recall_across takes the lock for its two database
-            # phases and drops it for the fan-out.
-            #
-            # No actor is set: the only tool routed here is a read, and
-            # attribution exists for writes.
-            response = McpServer(store, db_lock=lock).handle(message)
-        else:
-            with lock:
-                # Set while the lock is held, so the attribution recorded by any
-                # write belongs to the caller that triggered it and to nobody else.
-                store.actor = self.client.describe() if self.client else None
-                try:
+        # The identity is per request, and store.actor is thread-local, so it is
+        # set the same way on both paths and always cleared. Setting it only on
+        # the locked path would leave the unlocked one reading whatever this
+        # thread last did - which is how a caller ends up being told the
+        # unread-message count of a different client.
+        actor = self.client.describe() if self.client else None
+        try:
+            store.actor = actor
+            if _talks_to_other_machines(message):
+                # Run outside the project lock, and hand the lock down instead. A
+                # federated recall waits on other people's servers; holding this
+                # project's lock across that would stall every other request for
+                # it, reads included. recall_across takes the lock for its two
+                # database phases and drops it for the fan-out.
+                response = McpServer(store, db_lock=lock).handle(message)
+            else:
+                with lock:
                     response = McpServer(store).handle(message)
-                finally:
-                    store.actor = None
+        finally:
+            store.actor = None
         if response is None:
             self.send_response(204)
             self.end_headers()

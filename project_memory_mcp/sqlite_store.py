@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid as uuid_module
 from datetime import datetime, timezone
 from pathlib import Path
@@ -495,9 +496,17 @@ class SqliteMemoryStore:
             (str(SCHEMA_VERSION),),
         )
         self.replica_id = _ensure_replica_id(self.connection)
-        #: Who the current caller is, set by the HTTP layer for the duration of
+        #: Who the current caller is, set by the transport for the duration of
         #: one request. None means a local write with no authenticated client.
-        self.actor: dict[str, Any] | None = None
+        #:
+        #: Thread-local, because one store object serves every request thread and
+        #: this is the only per-request state on it. It used to be a plain
+        #: attribute, correct only because the project lock happened to span the
+        #: whole of handle(). The moment one call was allowed to run outside that
+        #: lock, a request could read the identity another thread had left here -
+        #: and be told the unread-message count belonging to a different client.
+        #: Identity must not depend on a lock taken for something else.
+        self._actor = threading.local()
         known = self.connection.execute(
             "SELECT 1 FROM projects WHERE id=?", (project,)
         ).fetchone()
@@ -523,6 +532,14 @@ class SqliteMemoryStore:
             return [row[0] for row in connection.execute("SELECT id FROM projects ORDER BY id")]
         except sqlite3.Error:
             return []
+
+    @property
+    def actor(self) -> dict[str, Any] | None:
+        return getattr(self._actor, "value", None)
+
+    @actor.setter
+    def actor(self, value: dict[str, Any] | None) -> None:
+        self._actor.value = value
 
     def close(self) -> None:
         self.connection.close()
