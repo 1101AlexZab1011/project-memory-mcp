@@ -289,7 +289,8 @@ project-memory-mcp validate        --database DB --project ID
 project-memory-mcp serve           --database DB [--project ID] [--http --bind ADDR [--port N]]
                                    [--token T] [--no-ui] [--backup-dir DIR]
 project-memory-mcp migrate         --from DIR --database DB --project ID
-project-memory-mcp backup          --database DB [--snapshot DIR | --export FILE]
+project-memory-mcp backup          --database DB --out DEST [--format db|json]
+                                   [--project ID] [--keep N]
 project-memory-mcp restore         --database DB --from FILE
 project-memory-mcp install-skills  [--root DIR] [--claude] [--codex] [--dest DIR]
 ```
