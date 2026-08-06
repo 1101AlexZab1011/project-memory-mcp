@@ -164,3 +164,36 @@ class SqliteStoreTests(unittest.TestCase):
     def test_project_id_must_be_a_slug(self):
         with self.assertRaises(StoreError):
             SqliteMemoryStore(self.db, project="Not A Slug")
+
+    def test_neighborhood_walks_authored_links_only(self):
+        self.store.create_memory(memory("a", FIRST, ["area:x"]))
+        self.store.create_memory(memory("b", SECOND, ["area:x"], related=["a"]))
+        result = self.store.get_memory_neighborhood("b", depth=1)
+        self.assertEqual("b", result["root"])
+        self.assertIn("a", [n["id"] for n in result["nodes"]])
+        self.assertTrue(all(e["type"] != "derived" for e in result["edges"]))
+
+    def test_neighborhood_rejects_unknown_id(self):
+        with self.assertRaises(StoreError):
+            self.store.get_memory_neighborhood("nope")
+
+    def test_recall_recent_order_and_anchors(self):
+        for i in range(3):
+            self.store.create_memory(memory("m-" + str(i), "Memory number %d about a failure." % i, ["area:x"]))
+        newest = self.store.recall(order="recent", limit=3, full_count=0)
+        self.assertEqual("m-2", newest["memories"][0]["id"])
+        before = self.store.recall(order="recent", before="m-2", limit=2, full_count=0)
+        self.assertEqual(["m-1", "m-0"], [m["id"] for m in before["memories"]])
+        after = self.store.recall(order="recent", after="m-0", limit=2, full_count=0)
+        self.assertEqual(["m-1", "m-2"], [m["id"] for m in after["memories"]])
+        self.assertNotIn("m-2", [m["id"] for m in before["memories"][:0]])
+
+    def test_recall_rejects_bad_order_and_anchor_combinations(self):
+        with self.assertRaises(StoreError):
+            self.store.recall(order="sideways")
+        with self.assertRaises(StoreError):
+            self.store.recall(before="m-1")
+        with self.assertRaises(StoreError):
+            self.store.recall(order="recent", before="a", after="b")
+        with self.assertRaises(StoreError):
+            self.store.recall(offset=-1)

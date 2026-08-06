@@ -176,7 +176,8 @@ TOOLS = [
 
 
 class McpServer:
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(self, store: Any) -> None:
+        # Any backend exposing the store API: file or SQLite.
         self.store = store
 
     def handle(self, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -284,9 +285,11 @@ def write_message(message: dict[str, Any]) -> None:
     sys.stdout.buffer.flush()
 
 
-def run_server(root: Path | str | None = None) -> int:
-    store = MemoryStore(root)
-    if not store.memory_root.is_dir():
+def run_server(root: Path | str | None = None, store: Any = None) -> int:
+    """Serve MCP over stdio for ``store``, or a file-backed store under ``root``."""
+    if store is None:
+        store = MemoryStore(root)
+    if getattr(store, "memory_root", None) is not None and not store.memory_root.is_dir():
         print(
             f"project-memory-mcp: no {STORE_DIR_NAME} store found at {store.root}; "
             "tools will fail until you run 'project-memory-mcp init'.",
@@ -300,5 +303,6 @@ def run_server(root: Path | str | None = None) -> int:
         response = server.handle(message)
         if response is not None:
             write_message(response)
-    store.flush_usage(force=True)
+    if hasattr(store, "flush_usage"):
+        store.flush_usage(force=True)
     return 0

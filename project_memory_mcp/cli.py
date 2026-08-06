@@ -106,6 +106,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     from .server import run_server
 
+    if args.database:
+        if not args.project:
+            print("error: --project is required with --database.", file=sys.stderr)
+            return 1
+        from .sqlite_store import SqliteMemoryStore
+
+        store = SqliteMemoryStore(args.database, args.project)
+        print(f"project-memory-mcp: serving project '{args.project}' from {store.path} "
+              f"({store.count()} memories)", file=sys.stderr)
+        return run_server(store=store)
     root = _resolve_root(args.root, require_store=False)
     return run_server(root)
 
@@ -167,6 +177,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve_parser = subparsers.add_parser("serve", help="Run the stdio MCP server.")
     serve_parser.add_argument("--root", default=None, help="Project root (default: search upward from cwd).")
+    serve_parser.add_argument("--database", default=None,
+                              help="Serve from a SQLite database instead of memory files.")
+    serve_parser.add_argument("--project", default=None,
+                              help="Project id inside the database (required with --database).")
     serve_parser.set_defaults(func=cmd_serve)
 
     skills_parser = subparsers.add_parser(

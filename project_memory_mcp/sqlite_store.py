@@ -240,10 +240,14 @@ class SqliteMemoryStore:
         query: str = "",
         label_query: Any = None,
         related_to: str | None = None,
+        before: str | None = None,
+        after: str | None = None,
         status_filter: list[str] | str | None = None,
         limit: int = 8,
+        offset: int = 0,
         full_count: int = 3,
         include_derived: bool = True,
+        order: str = "relevance",
     ) -> dict[str, Any]:
         """Ranked retrieval that never loads the project.
 
@@ -256,13 +260,43 @@ class SqliteMemoryStore:
 
         if limit < 1:
             raise StoreError("limit must be >= 1.")
+        if offset < 0:
+            raise StoreError("offset must be >= 0.")
         if full_count < 0:
             raise StoreError("full_count must be >= 0.")
+        if order not in ("relevance", "recent"):
+            raise StoreError("order must be 'relevance' or 'recent'.")
+        if before and after:
+            raise StoreError("Pass before or after, not both.")
+        if (before or after) and order != "recent":
+            raise StoreError("before/after anchors require order='recent'.")
         if related_to is not None:
             self.get_memory(related_to)
         known = set(self.list_labels()["labels"])
         expression = LabelExpression(label_query, known)
         statuses = _normalize_status_filter(status_filter)
+
+        if order == "recent":
+            statuses_for_walk = _normalize_status_filter(status_filter)
+            bodies = self.timeline_window(before or after, forward=bool(after),
+                                          limit=limit, offset=offset, statuses=statuses_for_walk)
+            memories = [m for m in bodies if expression.matches(m.get("labels") or [])]
+            results = []
+            for position, memory in enumerate(memories):
+                entry = _light_record(memory)
+                entry["created"] = (memory.get("evidence") or {}).get("created")
+                if position < full_count:
+                    entry["memory"] = memory
+                results.append(entry)
+            self._record_usage([r["id"] for r in results], "surfaced")
+            payload = {"order": "recent", "offset": offset,
+                       "label_query_labels": sorted(expression.used_labels),
+                       "count": len(results), "memories": results}
+            if before:
+                payload["before"] = before
+            if after:
+                payload["after"] = after
+            return payload
 
         text_scores = self.text_candidates(query) if query else {}
         seeds = dict(sorted(text_scores.items(), key=lambda i: -i[1])[:WALK_SEEDS])
@@ -389,6 +423,87 @@ class SqliteMemoryStore:
         # Drop dangling targets that were never expanded, so every node in the
         # walk has its edges represented rather than a truncated view.
         return {node: {n: w for n, w in edges.items() if n in adjacency} for node, edges in adjacency.items()}
+
+    def get_memory_neighborhood(self, memory_id: str, depth: int = 1, max_nodes: int = 25) -> dict[str, Any]:
+        """Bounded relationship graph around one memory.
+
+        Walks the edges table breadth-first. Derived edges are excluded: this
+        answers "what did somebody link to this", and computed similarity would
+        drown the authored links it exists to show.
+        """
+        if depth < 0:
+            raise StoreError("depth must be >= 0.")
+        if max_nodes < 1:
+            raise StoreError("max_nodes must be >= 1.")
+        self.get_memory(memory_id)  # raises on unknown id
+
+        nodes: dict[str, dict[str, Any]] = {}
+        edges: list[dict[str, Any]] = []
+        seen_edges: set[tuple[str, str, str]] = set()
+        frontier = [memory_id]
+        for level in range(depth + 1):
+            if not frontier or len(nodes) >= max_nodes:
+                break
+            for node in frontier:
+                if node not in nodes and len(nodes) < max_nodes:
+                    nodes[node] = _light_record(self.get_memory(node))
+            if level == depth:
+                break
+            placeholders = ",".join("?" * len(frontier))
+            rows = self.connection.execute(
+                f"SELECT src, dst, kind, reason FROM edges WHERE project_id=? AND kind<>'derived' "
+                f"AND src IN ({placeholders})",
+                (self.project, *frontier),
+            ).fetchall()
+            nxt: list[str] = []
+            for row in rows:
+                key = (row["kind"], row["src"], row["dst"])
+                if key not in seen_edges:
+                    seen_edges.add(key)
+                    edge = {"type": row["kind"], "from": row["src"], "to": row["dst"]}
+                    if row["reason"]:
+                        edge["reason"] = row["reason"]
+                    edges.append(edge)
+                if row["dst"] not in nodes and row["dst"] not in nxt and len(nodes) + len(nxt) < max_nodes:
+                    nxt.append(row["dst"])
+            frontier = nxt
+        return {"root": memory_id, "depth": depth, "nodes": list(nodes.values()), "edges": edges}
+
+    def timeline_window(
+        self,
+        anchor: str | None,
+        forward: bool,
+        limit: int,
+        offset: int,
+        statuses: set[str] | None,
+    ) -> list[dict[str, Any]]:
+        """Memories adjacent to ``anchor`` in creation order, nearest first.
+
+        Indexed range scan rather than a sort: the anchor's timestamp bounds the
+        query, so cost tracks the window rather than the store.
+        """
+        params: list[Any] = [self.project]
+        where = "project_id=?"
+        if anchor is not None:
+            row = self.connection.execute(
+                "SELECT created, id FROM memories WHERE project_id=? AND id=?", (self.project, anchor)
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"Unknown memory id: {anchor}")
+            comparison = ">" if forward else "<"
+            where += f" AND (created, id) {comparison} (?, ?)"
+            params += [row["created"], row["id"]]
+        if statuses is not None:
+            where += f" AND status IN ({','.join('?' * len(statuses))})"
+            params += sorted(statuses)
+        direction = "ASC" if forward else "DESC"
+        params += [limit, offset]
+        rows = self.connection.execute(
+            f"SELECT body FROM memories WHERE {where} "
+            f"ORDER BY created {direction}, id {direction} LIMIT ? OFFSET ?",
+            params,
+        ).fetchall()
+        return [json.loads(row["body"]) for row in rows]
 
     def recent(self, limit: int = 8, offset: int = 0) -> dict[str, Any]:
         """Newest first, straight out of an index - no ranking involved."""
