@@ -46,7 +46,8 @@ MEMORY_FIELDS = (
 )
 SCOPE_REQUIRED_FIELDS = ("project", "area", "files")
 SCOPE_FIELDS = ("project", "area", "files", "applies_to")
-EVIDENCE_FIELDS = ("created_from_task", "last_validated")
+EVIDENCE_REQUIRED_FIELDS = ("created_from_task", "last_validated")
+EVIDENCE_FIELDS = ("created_from_task", "last_validated", "created")
 RELATIONSHIP_FIELDS = ("related", "supersedes", "superseded_by")
 
 # Buffer usage counters this long before writing them out (see flush_usage).
@@ -65,6 +66,24 @@ def find_store_root(start: Path | str | None = None) -> Path | None:
         if (candidate / STORE_DIR_NAME).is_dir():
             return candidate
     return None
+
+
+def creation_order_key(memory: dict[str, Any]) -> str:
+    """Best available creation time for ordering.
+
+    ``evidence.created`` is written by create_memory. Memories predating it
+    fall back to ``last_validated``, which is a date rather than a timestamp
+    but is what a store written before this existed can offer. Anything with
+    neither sorts last.
+    """
+    evidence = memory.get("evidence") or {}
+    created = evidence.get("created")
+    if isinstance(created, str) and created:
+        return created
+    validated = evidence.get("last_validated")
+    if isinstance(validated, str) and validated:
+        return validated  # date-only: sorts correctly against ISO timestamps
+    return ""
 
 
 class LabelExpression:
@@ -304,8 +323,10 @@ class MemoryStore:
         related_to: str | None = None,
         status_filter: list[str] | str | None = None,
         limit: int = 8,
+        offset: int = 0,
         full_count: int = 3,
         include_derived: bool = True,
+        order: str = "relevance",
     ) -> dict[str, Any]:
         """Ranked retrieval in one call.
 
@@ -324,8 +345,12 @@ class MemoryStore:
         """
         if limit < 1:
             raise StoreError("limit must be >= 1.")
+        if offset < 0:
+            raise StoreError("offset must be >= 0.")
         if full_count < 0:
             raise StoreError("full_count must be >= 0.")
+        if order not in ("relevance", "recent"):
+            raise StoreError("order must be 'relevance' or 'recent'.")
         if related_to is not None:
             self._find_memory_path(related_to)  # raises on unknown id
         known = set(self.list_labels()["labels"].keys())
@@ -334,6 +359,9 @@ class MemoryStore:
         records = self.load_memories()
         if not records:
             return {"query": query, "considered": 0, "count": 0, "memories": []}
+
+        if order == "recent":
+            return self._recall_recent(expression, statuses, limit, offset, full_count)
 
         context = self.ranking_context(include_derived=include_derived)
         memories = context.memories
@@ -350,6 +378,7 @@ class MemoryStore:
         )
 
         results: list[dict[str, Any]] = []
+        skipped = 0
         for entry in ranked:
             memory_id = entry["id"]
             memory = memories[memory_id]
@@ -358,6 +387,9 @@ class MemoryStore:
             if not expression.matches(memory.get("labels") or []):
                 continue
             if entry["score"] <= 0.0:
+                continue
+            if skipped < offset:
+                skipped += 1
                 continue
             result = self._light_record(memory_id, records[memory_id]["path"], memory)
             result["score"] = entry["score"]
@@ -471,10 +503,58 @@ class MemoryStore:
             pending[f"last_{field}"] = stamp
         self.flush_usage()
 
+
+    def _recall_recent(
+        self,
+        expression: LabelExpression,
+        statuses: set[str] | None,
+        limit: int,
+        offset: int,
+        full_count: int,
+    ) -> dict[str, Any]:
+        """Newest memories first, skipping ranking entirely.
+
+        Recency is an ordering, not a relevance judgment, so there is nothing
+        to score: no BM25, no walk. Sorting the already-cached records costs a
+        fraction of a millisecond even on a store of thousands, which makes
+        this the cheapest way into the store.
+        """
+        records = self.load_memories()
+        rows = []
+        for memory_id, record in records.items():
+            memory = record["memory"]
+            if statuses is not None and memory.get("status") not in statuses:
+                continue
+            if not expression.matches(memory.get("labels") or []):
+                continue
+            rows.append((creation_order_key(memory), memory_id, record))
+        rows.sort(key=lambda row: (row[0], row[1]), reverse=True)
+
+        window = rows[offset : offset + limit]
+        results: list[dict[str, Any]] = []
+        for position, (created, memory_id, record) in enumerate(window):
+            result = self._light_record(memory_id, record["path"], record["memory"])
+            result["created"] = created or None
+            if position < full_count:
+                result["memory"] = record["memory"]
+            results.append(result)
+        self._record_usage([entry["id"] for entry in results], "surfaced")
+        return {
+            "order": "recent",
+            "label_query_labels": sorted(expression.used_labels),
+            "considered": len(rows),
+            "offset": offset,
+            "count": len(results),
+            "memories": results,
+        }
+
     # -------------------------------------------------------------- mutations
 
     def create_memory(self, memory: dict[str, Any], related_label_query: Any = None) -> dict[str, Any]:
         def mutate() -> dict[str, Any]:
+            evidence = memory.setdefault("evidence", {})
+            if isinstance(evidence, dict) and not evidence.get("created"):
+                evidence["created"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             self._require_valid_memory(memory)
             memory_id = memory["id"]
             if self._memory_path_or_none(memory_id) is not None:
@@ -631,7 +711,7 @@ class MemoryStore:
         if not isinstance(evidence, dict):
             errors.append(f"{where}: evidence must be an object.")
         else:
-            for field in EVIDENCE_FIELDS:
+            for field in EVIDENCE_REQUIRED_FIELDS:
                 if field not in evidence:
                     errors.append(f"{where}: evidence is missing '{field}'.")
             for field in evidence:
@@ -643,6 +723,8 @@ class MemoryStore:
                 value = evidence["last_validated"]
                 if not isinstance(value, str) or not DATE_RE.match(value):
                     errors.append(f"{where}: evidence.last_validated must be YYYY-MM-DD.")
+            if "created" in evidence and not isinstance(evidence["created"], str):
+                errors.append(f"{where}: evidence.created must be an ISO-8601 string.")
 
         relationships = memory["relationships"]
         if not isinstance(relationships, dict):

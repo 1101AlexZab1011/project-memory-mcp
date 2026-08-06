@@ -53,7 +53,7 @@ TOOLS = [
         "Ranked retrieval in ONE call - prefer this over search_memories + repeated get_memory. "
         "Scores every memory by text relevance, personalized-PageRank proximity in the relationship "
         "graph, and label overlap, then returns the best matches with the top few inlined in full. "
-        "Omit query and label_query to get the most central memories as an overview of the store.",
+        "Omit query and label_query to get the most central memories as an overview of the store. Pass order='recent' for the newest memories instead, with offset to page back through history.",
         {
             "query": {
                 "type": ["string", "null"],
@@ -73,7 +73,19 @@ TOOLS = [
                 "type": ["array", "string", "null"],
                 "items": {"type": "string"},
             },
+            "order": {
+                "type": ["string", "null"],
+                "enum": ["relevance", "recent", None],
+                "default": "relevance",
+                "description": "'relevance' ranks by text/graph/label score. 'recent' returns newest first, skipping ranking entirely - use it to see what has been learned lately, or with offset to page back through history.",
+            },
             "limit": {"type": ["integer", "null"], "minimum": 1, "default": 8},
+            "offset": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "default": 0,
+                "description": "Skip this many results. With order='recent' this pages back through history.",
+            },
             "full_count": {
                 "type": ["integer", "null"],
                 "minimum": 0,
@@ -199,7 +211,9 @@ class McpServer:
                     related_to=args.get("related_to"),
                     status_filter=args.get("status_filter"),
                     limit=args.get("limit") if args.get("limit") is not None else 8,
+                    offset=args.get("offset") or 0,
                     full_count=args.get("full_count") if args.get("full_count") is not None else 3,
+                    order=args.get("order") or "relevance",
                     include_derived=(
                         True if args.get("include_derived") is None else bool(args["include_derived"])
                     ),

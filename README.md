@@ -166,7 +166,16 @@ Three ways to call it:
 {"query": "packaging fails when the editor is open"}  // symptom lookup
 {"related_to": "cache-invalidation-race"}             // what to read alongside this
 {}                                                    // most central memories: orient me
+{"order": "recent", "limit": 10}                      // what has been learned lately
+{"order": "recent", "limit": 10, "offset": 10}        // page back through history
 ```
+
+`order: "recent"` skips ranking entirely and returns newest first, which makes it the
+cheapest way into the store — recency is an ordering, not a relevance judgment, so there is
+nothing to score. `offset` pages back through history. Filters still apply, so
+`{"order": "recent", "label_query": "area:auth"}` is "what have we learned about auth
+lately". Memories are stamped with `evidence.created` on write; ones predating that field
+fall back to `last_validated`.
 
 `related_to` anchors the walk at one memory, turning "is related" into a *degree* of
 relatedness: authored links rank first, then memories reachable through the graph. With no

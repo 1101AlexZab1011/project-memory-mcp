@@ -404,3 +404,58 @@ class UsageTests(unittest.TestCase):
         reloaded = MemoryStore(self.store.root).load_usage()
         self.assertEqual(1, reloaded["memories"]["cache-race"]["surfaced"])
         self.assertFalse(self.store.flush_usage(force=True))  # nothing left pending
+
+
+class RecentOrderTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        store_dir = root / ".project-memory" / "active"
+        store_dir.mkdir(parents=True)
+        (root / ".project-memory" / "labels.json").write_text(
+            json.dumps({"schema_version": 1, "description": "l",
+                        "labels": {"area:x": {"description": "x"}, "area:z": {"description": "z"}}}),
+            encoding="utf-8",
+        )
+        for i, stamp in enumerate(["2026-01-01T00:00:00Z", "2026-03-01T00:00:00Z", "2026-06-01T00:00:00Z"]):
+            entry = memory(f"m-{i}", f"Memory number {i} about a recurring failure.", ["area:x"])
+            entry["evidence"]["created"] = stamp
+            (store_dir / f"m-{i}.json").write_text(json.dumps(entry), encoding="utf-8")
+        # No `created` at all: must still order, by last_validated, and sort last.
+        old = memory("legacy", "A memory written before created existed.", ["area:z"])
+        old["evidence"]["last_validated"] = "2020-01-01"
+        (store_dir / "legacy.json").write_text(json.dumps(old), encoding="utf-8")
+        self.store = MemoryStore(root)
+
+    def test_newest_first(self):
+        result = self.store.recall(order="recent", limit=10, full_count=0)
+        self.assertEqual(["m-2", "m-1", "m-0", "legacy"], [m["id"] for m in result["memories"]])
+        self.assertEqual("recent", result["order"])
+
+    def test_offset_pages_back_through_history(self):
+        page = self.store.recall(order="recent", limit=2, offset=2, full_count=0)
+        self.assertEqual(["m-0", "legacy"], [m["id"] for m in page["memories"]])
+        self.assertEqual(2, page["offset"])
+
+    def test_recency_ignores_relevance_entirely(self):
+        # A query that strongly matches m-0 must not reorder a recency listing.
+        result = self.store.recall(query="Memory number 0", order="recent", limit=2, full_count=0)
+        self.assertEqual(["m-2", "m-1"], [m["id"] for m in result["memories"]])
+        self.assertNotIn("why", result["memories"][0])
+
+    def test_filters_still_apply(self):
+        result = self.store.recall(order="recent", label_query="area:z", full_count=0)
+        self.assertEqual(["legacy"], [m["id"] for m in result["memories"]])
+
+    def test_create_stamps_evidence_created(self):
+        self.store.create_memory(memory("brand-new", "A memory created through the store API.", ["area:x"]))
+        created = self.store.get_memory("brand-new")["evidence"]["created"]
+        self.assertRegex(created, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertEqual("brand-new", self.store.recall(order="recent", limit=1, full_count=0)["memories"][0]["id"])
+
+    def test_rejects_bad_order_and_offset(self):
+        with self.assertRaises(StoreError):
+            self.store.recall(order="sideways")
+        with self.assertRaises(StoreError):
+            self.store.recall(offset=-1)
