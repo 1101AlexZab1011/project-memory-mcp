@@ -54,13 +54,21 @@ def duplicate_candidates(store: Any, limit: int = 25,
     memories that share labels or files - so this costs one pass over a capped
     edge set rather than comparing every pair.
     """
+    # The CASE is what makes a pair canonical, and it is load-bearing: derived
+    # edges are not mirrored, so a plain `e.src < e.dst` filter silently drops
+    # every pair that happens to have been stored the other way round. Ordering
+    # by uuid and only then reading the slugs collapses both directions to one
+    # row without depending on which direction exists.
     rows = store.connection.execute(
-        "SELECT DISTINCT ma.slug AS a, mb.slug AS b FROM edges e "
+        "SELECT DISTINCT "
+        "  CASE WHEN e.src < e.dst THEN ma.slug ELSE mb.slug END AS a, "
+        "  CASE WHEN e.src < e.dst THEN mb.slug ELSE ma.slug END AS b "
+        "FROM edges e "
         "JOIN memories ma ON ma.project_id=e.project_id AND ma.uuid=e.src "
         "  AND ma.archived_at IS NULL "
         "JOIN memories mb ON mb.project_id=e.project_id AND mb.uuid=e.dst "
         "  AND mb.archived_at IS NULL "
-        "WHERE e.project_id=? AND e.kind='derived' AND e.src < e.dst", (store.project,)
+        "WHERE e.project_id=? AND e.kind='derived'", (store.project,)
     ).fetchall()
 
     pairs = []

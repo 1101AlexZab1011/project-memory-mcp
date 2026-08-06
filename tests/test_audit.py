@@ -421,6 +421,30 @@ class DuplicateTests(AuditCase):
         self.assertEqual({"cache-race-a", "cache-race-b"}, {m["id"] for m in pair["memories"]})
         self.assertGreater(pair["score"], 0.6)
 
+    def test_a_pair_is_found_whichever_way_round_its_edge_is_stored(self):
+        # Derived edges are not mirrored, so which of the two uuids is `src` is
+        # an accident of insertion order. Filtering on `src < dst` instead of
+        # canonicalising drops half of all pairs, and only on the runs where the
+        # uuids happen to sort the wrong way - which is exactly how it hid.
+        self.store.create_memory(self.first)
+        self.store.create_memory(self.second)
+        uuids = {row["slug"]: row["uuid"] for row in self.store.connection.execute(
+            "SELECT slug, uuid FROM memories WHERE project_id='demo'")}
+        a, b = uuids["cache-race-a"], uuids["cache-race-b"]
+
+        for src, dst in ((a, b), (b, a)):
+            with self.subTest(direction=f"{'a->b' if src == a else 'b->a'}"):
+                with self.store.connection:
+                    self.store.connection.execute(
+                        "DELETE FROM edges WHERE project_id='demo' AND kind='derived'")
+                    self.store.connection.execute(
+                        "INSERT INTO edges(project_id, src, dst, kind) "
+                        "VALUES ('demo',?,?,'derived')", (src, dst))
+                found = maintenance.duplicate_candidates(self.store)
+                self.assertEqual(1, found["count"])
+                self.assertEqual({"cache-race-a", "cache-race-b"},
+                                 {m["id"] for m in found["candidates"][0]["memories"]})
+
     def test_memories_about_the_same_area_are_not_duplicates(self):
         self.store.create_memory(self.first)
         different = memory("shader-note", SHADER, ["area:x"])
