@@ -1,9 +1,8 @@
 # project-memory-mcp
 
-File-based, git-friendly **project memory for coding agents** — a JSON memory store that
-lives inside your repository, served to agents over the
-[Model Context Protocol](https://modelcontextprotocol.io), with matching agent skills
-for disciplined recall and curation.
+Shared, database-backed **project memory for coding agents** — a SQLite store served to
+agents over the [Model Context Protocol](https://modelcontextprotocol.io), with a browser
+management UI and matching agent skills for disciplined recall and curation.
 
 Coding agents (Claude Code, Codex, and others) forget everything between sessions.
 This tool gives each repository a small, reviewable knowledge base of hard-won,
@@ -12,9 +11,9 @@ build quirks — so future sessions don't re-derive them from scratch.
 
 ## Design
 
-- **Plain JSON files in your repo.** One file per memory under `.project-memory/active/`.
-  No database, no embeddings, no external service. Memories diff, merge, and get code-reviewed
-  like any other file, and they travel with the repository.
+- **One database, many projects, any device.** SQLite with FTS5, served over HTTP so
+  every machine on your network reaches the same memory. Retrieval cost does not grow
+  with the size of the store.
 - **Label graph instead of vector search.** Memories carry canonical `prefix:kebab-case`
   labels from a registry you control. Agents retrieve by label cluster
   (`area:auth AND kind:bug`), then use `description`/`triggers` for cheap relevance checks —
@@ -24,10 +23,9 @@ build quirks — so future sessions don't re-derive them from scratch.
   neighborhood query walks the graph with bounded depth.
 - **Lifecycle statuses, not deletion.** `active` / `stale` / `superseded` / `wrong` —
   disproven memories become warnings instead of silently disappearing.
-- **Strict validation.** A JSON Schema plus a built-in validator that checks the whole
-  store: field shapes, label registry membership, filename/id agreement, and relationship
-  bidirectionality. Every mutation is transactional — validated, and rolled back on failure.
-- **Zero runtime dependencies.** Pure Python standard library.
+- **Strict validation.** A JSON Schema plus a built-in validator: field shapes, label
+  registry membership, and relationship bidirectionality. Every mutation is transactional —
+  validated, and rolled back on failure.
 
 ## Installation
 
@@ -51,25 +49,14 @@ Requires Python 3.10+.
 
 ## Quick start
 
-**1. Initialize a store in your project:**
+**1. Create a project in a database:**
 
 ```bash
-cd /path/to/your/project
-project-memory-mcp init
+project-memory-mcp init --database ~/memory.db --project my-project
 ```
 
-This scaffolds:
-
-```text
-.project-memory/
-  README.md            store rules for humans and agents
-  labels.json          canonical label registry (starter kind:/context: labels)
-  memory.schema.json   JSON Schema for memory files
-  active/              one JSON file per memory
-  .gitignore           keeps usage.json local (written for you)
-```
-
-Commit the whole folder.
+One database holds many projects. This creates the project and seeds its label registry,
+so it is servable and visible in the UI before its first memory exists.
 
 **2. Register the MCP server with your agent.**
 
@@ -81,7 +68,7 @@ Claude Code — add to your project's `.mcp.json`:
     "project-memory": {
       "type": "stdio",
       "command": "project-memory-mcp",
-      "args": ["serve"]
+      "args": ["serve", "--database", "/path/to/memory.db", "--project", "my-project"]
     }
   }
 }
@@ -92,20 +79,22 @@ Codex — add to `~/.codex/config.toml`:
 ```toml
 [mcp_servers.project-memory]
 command = "project-memory-mcp"
-args = ["serve"]
+args = ["serve", "--database", "/path/to/memory.db", "--project", "my-project"]
 ```
-
-The server finds the store by walking up from its working directory to the nearest
-`.project-memory/`; pass `--root /path/to/project` to pin it explicitly.
 
 ### Sharing one store across devices
 
-A SQLite-backed store can be served over HTTP so every device on a network reaches the same
-memory. Import an existing file store first, then serve it:
+The same database can be served over HTTP so every device on a network reaches the same
+memory:
+
+```bash
+PROJECT_MEMORY_TOKEN=$(openssl rand -hex 24) project-memory-mcp serve --http --database ~/memory.db --bind 192.168.1.50 --port 8765
+```
+
+Coming from a pre-0.4.0 file store, import it first — this leaves the source untouched:
 
 ```bash
 project-memory-mcp migrate --from ./.project-memory --project my-project --database ~/memory.db
-PROJECT_MEMORY_TOKEN=$(openssl rand -hex 24)   project-memory-mcp serve --http --database ~/memory.db --bind 192.168.1.50 --port 8765
 ```
 
 Each project's `.mcp.json` then points at it:
@@ -277,8 +266,7 @@ the same ordering, and retrieval never rewrites a memory. But that leaves the st
 idea which memories are ever actually *useful*, which matters because an agent that decides
 for itself what to remember tends to over-capture rather than under-capture.
 
-So two counters are kept in `.project-memory/usage.json`, deliberately outside the memory
-files:
+So two counters are kept in a `usage` table, deliberately outside the memory documents:
 
 - **surfaced** — incremented by `recall` for every memory it returns. Automatic.
 - **applied** — incremented by `record_memory_use`, which the agent calls for the memories that
@@ -296,9 +284,13 @@ memory file changes, so repeat calls in a live server skip the rebuild entirely.
 ## CLI
 
 ```text
-project-memory-mcp init            [--root DIR] [--force]
-project-memory-mcp validate        [--root DIR]
-project-memory-mcp serve           [--root DIR]
+project-memory-mcp init            --database DB --project ID [--force]
+project-memory-mcp validate        --database DB --project ID
+project-memory-mcp serve           --database DB [--project ID] [--http --bind ADDR [--port N]]
+                                   [--token T] [--no-ui] [--backup-dir DIR]
+project-memory-mcp migrate         --from DIR --database DB --project ID
+project-memory-mcp backup          --database DB [--snapshot DIR | --export FILE]
+project-memory-mcp restore         --database DB --from FILE
 project-memory-mcp install-skills  [--root DIR] [--claude] [--codex] [--dest DIR]
 ```
 

@@ -1,13 +1,13 @@
 ---
 name: project-memory-remember
-description: Use after resolving a bug, task, build issue, debugging session, or project-specific problem to capture the reusable lesson in .project-memory. Invoke it on your own judgment, without waiting to be asked, whenever completed work produced durable project-specific knowledge (a non-obvious subsystem fact, a recurring failure mode, a misleading symptom, a build/test procedure, a hidden convention) or proved an existing memory stale, wrong, or superseded. Also use when the user explicitly asks to remember a lesson, update .project-memory, or decide whether a resolved issue should become reusable project memory.
+description: Use after resolving a bug, task, build issue, debugging session, or project-specific problem to capture the reusable lesson in project memory. Invoke it on your own judgment, without waiting to be asked, whenever completed work produced durable project-specific knowledge (a non-obvious subsystem fact, a recurring failure mode, a misleading symptom, a build/test procedure, a hidden convention) or proved an existing memory stale, wrong, or superseded. Also use when the user explicitly asks to remember a lesson, update project memory, or decide whether a resolved issue should become reusable project memory.
 ---
 
 # Project Memory Remember
 
 Use this skill after a task has been resolved or mostly resolved.
 
-The goal is to update `.project-memory/` with compact, reusable, project-specific knowledge that will help future agents solve similar tasks faster.
+The goal is to record compact, reusable, project-specific knowledge that will help future agents solve similar tasks faster.
 
 ## Invocation
 
@@ -35,32 +35,15 @@ If the user says "don't remember this", "skip memory", or similar for the curren
 not invoke this skill at all. They can always remove a stored memory afterwards with
 `project-memory-forget`.
 
-Memory writes land in the git working tree as changed files under `.project-memory/` — mention
-them when reporting so they are visible before the next commit.
+Memory writes go to a shared database, not to the working tree. They take effect immediately
+for every agent and device using the same store, and are not part of any commit — so mention
+what you stored when reporting, since it will not show up in `git status`.
 
 ## Memory Store
 
-Use this folder:
-
-```text
-.project-memory/
-```
-
-Expected structure:
-
-```text
-.project-memory/
-  README.md
-  labels.json
-  memory.schema.json
-  active/
-```
-
-Memory files are JSON. Each memory, regardless of status (`active`, `stale`, `superseded`, or `wrong`), lives under:
-
-```text
-.project-memory/active/<id>.json
-```
+Memories live in a database reached through the `project-memory` MCP server. Every memory
+carries a status (`active`, `stale`, `superseded`, or `wrong`) and is reached by the tools
+below, never by reading files.
 
 ## What Is Worth Remembering
 
@@ -107,15 +90,16 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
    - Use `list_labels` to see the canonical labels before choosing any.
    - `search_memories` remains available for an exhaustive unranked sweep of a label cluster,
      and `get_memory` for reading a specific candidate in full.
-   - If MCP is unavailable, inspect `.project-memory/active/*.json`, reading only `id`,
-     `status`, `description`, `labels`, `tags`, `scope`, and `triggers` first.
+   - If the MCP server is unreachable, stop here. Memories live in a database and there is
+     no file to read instead; storing nothing is correct, and writing a memory you could not
+     check for duplicates is not.
 
 2. Decide whether the resolved task contains reusable knowledge.
    - If not, report that nothing should be remembered and explain why.
    - Also check the reverse case: did solving this task rely on a recalled memory that turned out to be wrong, stale, or misleading, or did the task's outcome make an existing memory invalid or unusable? If so, that memory must be updated (`wrong`/`stale`/`superseded`) or deleted per step 3 — do not leave a disproven memory sitting as `active`.
 
 3. If something is worth remembering, decide whether to:
-   - create a new memory JSON file;
+   - create a new memory;
    - edit an existing active memory;
    - mark an existing memory as `stale`, `wrong`, or `superseded`;
    - delete only if the memory is invalid junk, unsafe to store, or a pure duplicate with no historical value;
@@ -171,7 +155,7 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
 ```
 
 6. Assign canonical labels.
-   - Load `.project-memory/labels.json` or call MCP `list_labels`.
+   - Call `list_labels` for the registry.
    - Reuse existing labels whenever they reasonably describe the memory.
    - Add a new label only if the lesson is a fundamentally new, durable retrieval subclass that existing labels cannot express.
    - Do not add synonyms, one-off labels, or labels for details already covered by `description`, `triggers`, `tags`, or `scope.files`.
@@ -199,7 +183,6 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
    - Author one `reason` string per pair, phrased to make sense read from either end, since both
      sides get that same sentence.
    - `relationships.supersedes` / `relationships.superseded_by` stay plain memory-id arrays.
-   - If MCP is unavailable, compare the new/changed memory's `labels` and `description` against the same fields in `.project-memory/active/*.json`. Read only those fields; do not study whole memories just to check relatedness.
 
 8. Keep memories granular.
    - One memory = one reusable lesson.
@@ -220,7 +203,7 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
     - Ensure no comments or trailing commas exist.
     - Ensure `id` matches filename.
     - Ensure required fields exist.
-    - Ensure every label exists in `.project-memory/labels.json`.
+    - Ensure every label exists in the registry (`list_labels`).
     - Ensure every `relationships.related` entry is an `{id, reason}` object, not a bare string, and that links are bidirectional.
 
 11. Report the result to the user.

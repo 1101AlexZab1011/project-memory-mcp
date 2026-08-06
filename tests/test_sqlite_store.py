@@ -47,6 +47,15 @@ class SqliteStoreTests(unittest.TestCase):
         for label in ("area:x", "area:z", "kind:bug"):
             self.store.add_label(label, "description for " + label)
 
+    def test_a_bad_label_query_raises_the_store_error_callers_catch(self):
+        # The label grammar used to live in the file backend and raise that
+        # module's StoreError, which the HTTP layer does not catch - so an
+        # unknown label in a query returned 500 instead of a client error.
+        self.store.create_memory(memory("cache-race", CACHE, ["area:x"]))
+        for bad in ("area:unregistered", "area:x AND", "NotALabel"):
+            with self.subTest(query=bad), self.assertRaises(StoreError):
+                self.store.recall("anything", label_query=bad)
+
     def test_create_and_read_back(self):
         self.store.create_memory(memory("cache-race", CACHE, ["area:x"]))
         got = self.store.get_memory("cache-race")

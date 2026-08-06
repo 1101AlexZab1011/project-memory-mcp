@@ -1,14 +1,18 @@
-"""Memory document validation, shared by every storage backend.
+"""Memory document validation and the label query grammar.
 
-Pure functions over a memory dict: no store, no filesystem, no database. The
-file backend and the SQLite backend validate identically, so a memory that is
-valid in one is valid in the other.
+Pure functions over a memory dict: no store, no filesystem, no database. This
+is also where ``StoreError`` lives, so that every layer raises and catches one
+exception class rather than one per backend.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Callable
+
+
+class StoreError(ValueError):
+    """Raised for any invalid input, invalid store state, or failed operation."""
 
 VALID_STATUSES = {"active", "stale", "superseded", "wrong"}
 ID_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
@@ -169,3 +173,135 @@ def check_string_array(
             errors.append(f"{where}: field '{name}' value '{item}' has an invalid format.")
     if unique and len(set(value)) != len(value):
         errors.append(f"{where}: field '{name}' contains duplicate values.")
+
+
+class LabelExpression:
+    """Compiled label query: either a dict with all/any/not arrays, or a string
+    expression using AND, OR, NOT, and parentheses over registered labels."""
+
+    def __init__(self, query: Any, known_labels: set[str]) -> None:
+        self.query = query
+        self.known_labels = known_labels
+        self.used_labels: set[str] = set()
+        self._predicate = self._compile(query)
+
+    def matches(self, labels: list[str]) -> bool:
+        return self._predicate(set(labels))
+
+    def _compile(self, query: Any) -> Callable[[set[str]], bool]:
+        if query in (None, "", {}, []):
+            return lambda _labels: True
+        if isinstance(query, dict):
+            all_labels = self._normalize_label_list(query.get("all") or query.get("and") or [])
+            any_labels = self._normalize_label_list(query.get("any") or query.get("or") or [])
+            not_labels = self._normalize_label_list(query.get("not") or [])
+            return lambda labels: (
+                all(label in labels for label in all_labels)
+                and (not any_labels or any(label in labels for label in any_labels))
+                and all(label not in labels for label in not_labels)
+            )
+        if isinstance(query, str):
+            tokens = self._tokenize(query)
+            if not tokens:
+                return lambda _labels: True
+            parser = _LabelParser(tokens, self._record_label)
+            expr = parser.parse_expression()
+            parser.expect_end()
+            return expr
+        raise StoreError("label_query must be an object, string, null, or omitted.")
+
+    def _normalize_label_list(self, value: Any) -> list[str]:
+        if isinstance(value, str):
+            items = [value]
+        elif isinstance(value, list):
+            items = value
+        else:
+            raise StoreError("Label query groups must be strings or arrays of strings.")
+        labels: list[str] = []
+        for item in items:
+            if not isinstance(item, str):
+                raise StoreError("Labels must be strings.")
+            labels.append(self._record_label(item))
+        return labels
+
+    def _record_label(self, label: str) -> str:
+        normalized = label.strip().lower()
+        if not LABEL_RE.match(normalized):
+            raise StoreError(f"Invalid label format: {label}")
+        if normalized not in self.known_labels:
+            raise StoreError(f"Unknown label: {normalized}")
+        self.used_labels.add(normalized)
+        return normalized
+
+    @staticmethod
+    def _tokenize(query: str) -> list[str]:
+        token_re = re.compile(r"\s*(AND|OR|NOT|\(|\)|[a-z]+:[a-z0-9]+(?:-[a-z0-9]+)*)\s*", re.IGNORECASE)
+        tokens: list[str] = []
+        pos = 0
+        while pos < len(query):
+            match = token_re.match(query, pos)
+            if not match:
+                raise StoreError(f"Invalid label query near: {query[pos:]}")
+            token = match.group(1)
+            tokens.append(token.upper() if token.upper() in {"AND", "OR", "NOT"} else token.lower())
+            pos = match.end()
+        return tokens
+
+
+class _LabelParser:
+    def __init__(self, tokens: list[str], record_label: Callable[[str], str]) -> None:
+        self.tokens = tokens
+        self.record_label = record_label
+        self.pos = 0
+
+    def parse_expression(self) -> Callable[[set[str]], bool]:
+        return self.parse_or()
+
+    def parse_or(self) -> Callable[[set[str]], bool]:
+        left = self.parse_and()
+        while self._peek() == "OR":
+            self.pos += 1
+            right = self.parse_and()
+            left = (lambda left=left, right=right: lambda labels: left(labels) or right(labels))()
+        return left
+
+    def parse_and(self) -> Callable[[set[str]], bool]:
+        left = self.parse_unary()
+        while self._peek() == "AND":
+            self.pos += 1
+            right = self.parse_unary()
+            left = (lambda left=left, right=right: lambda labels: left(labels) and right(labels))()
+        return left
+
+    def parse_unary(self) -> Callable[[set[str]], bool]:
+        if self._peek() == "NOT":
+            self.pos += 1
+            inner = self.parse_unary()
+            return lambda labels: not inner(labels)
+        return self.parse_primary()
+
+    def parse_primary(self) -> Callable[[set[str]], bool]:
+        token = self._peek()
+        if token is None:
+            raise StoreError("Unexpected end of label query.")
+        if token == "(":
+            self.pos += 1
+            expr = self.parse_expression()
+            if self._peek() != ")":
+                raise StoreError("Missing ')' in label query.")
+            self.pos += 1
+            return expr
+        if token in {"AND", "OR", "NOT", ")"}:
+            raise StoreError(f"Unexpected token in label query: {token}")
+        self.pos += 1
+        label = self.record_label(token)
+        return lambda labels: label in labels
+
+    def expect_end(self) -> None:
+        if self._peek() is not None:
+            raise StoreError(f"Unexpected token in label query: {self._peek()}")
+
+    def _peek(self) -> str | None:
+        if self.pos >= len(self.tokens):
+            return None
+        return self.tokens[self.pos]

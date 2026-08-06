@@ -1,6 +1,6 @@
 ---
 name: project-memory-recall
-description: Check .project-memory for prior lessons before working on a task in this repository - recurring bugs, misleading symptoms, subsystem behavior, build/test/deployment quirks, or conventions that were solved before and written down. One `recall` call answers this; make it whenever a task touches this project's code, build, or tooling and you cannot already rule out that something relevant was stored. Also use on explicit cues like "we solved this before", "this happened again", "check project memory".
+description: Check project memory for prior lessons before working on a task in this repository - recurring bugs, misleading symptoms, subsystem behavior, build/test/deployment quirks, or conventions that were solved before and written down. One `recall` call answers this; make it whenever a task touches this project's code, build, or tooling and you cannot already rule out that something relevant was stored. Also use on explicit cues like "we solved this before", "this happened again", "check project memory".
 ---
 
 # Project Memory Recall
@@ -88,7 +88,13 @@ Not worth a call:
 
 ## If The MCP Server Is Unavailable
 
-Read `.project-memory/active/*.json` directly. Inspect only `id`, `status`,
-`description`, `labels`, `tags`, `scope`, and `triggers` first; open the full
-`remembered_facts`, `solution_pattern`, and `pitfalls` only for memories that survive
-that filter. Skip `wrong` and `superseded` unless you need the history.
+Memories live in a database reached through this server. There is no file to read instead,
+so say plainly that project memory is unreachable and carry on with the task.
+
+Do not treat this as "nothing was found". An unreachable store and an empty store look
+identical from the outside and mean opposite things: the first says prior lessons may exist
+and you cannot see them, the second says none were recorded. Never report that no memory
+exists when you could not reach it.
+
+If the repository contains a `.project-memory/` directory, it is a leftover from before the
+database. Do not read it — it is not maintained and its contents may contradict the store.

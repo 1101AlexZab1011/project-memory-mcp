@@ -5,27 +5,18 @@ description: Use when the user asks to forget, delete, remove, retract, or inval
 
 # Project Memory Forget
 
-Use this skill to permanently remove one or more memories from `.project-memory/` and to clean up every reference to those memories elsewhere in the store, so nothing is left dangling.
+Use this skill to permanently remove one or more memories from the store and to clean up every reference to those memories elsewhere in the store, so nothing is left dangling.
 
 Prefer the `project-memory` MCP server when available:
 
 - Use `search_memories` to resolve the target.
 - Use `delete_memory` with `confirm_exact_id` for deletion and cleanup.
-- Fall back to the manual workflow below only when MCP tools are unavailable.
+- Without those tools there is no fallback: memories live in a database, not in files.
+  Say the store is unreachable rather than guessing.
 
 This is a destructive operation on the memory store. Treat it with the same care as any other destructive action: be certain which memory the user means before deleting, and never guess on an ambiguous query.
 
 Prefer `project-memory-remember`'s `stale` / `wrong` / `superseded` status path when a memory should be kept for historical or warning value. Use this skill only when the user explicitly wants a memory gone entirely.
-
-## Memory Store
-
-```text
-.project-memory/
-  README.md
-  labels.json
-  memory.schema.json
-  active/
-```
 
 ## Step 1 — Resolve the query to specific memory ids
 
@@ -43,8 +34,6 @@ Resolve it with `recall`:
   those are often exactly what someone asks to retract.
 - Read the top candidates in full before acting. Deletion is not reversible through this tool,
   so a confident-looking ranking is not on its own sufficient grounds to delete.
-- If MCP is unavailable, read `.project-memory/active/*.json` and compare the query against
-  `id`, `description`, `tags`, and `triggers` for every memory.
 
 Resolution rules:
 
@@ -54,9 +43,9 @@ Resolution rules:
 
 ## Step 2 — Find every reference to the memory before deleting it
 
-Before deleting a memory file, find every other memory that points at it, since removing it must not leave a dangling reference:
+`delete_memory` cleans references for you. Verify the result rather than assuming it:
 
-- Search for the memory's `id` string across `.project-memory/active/*.json` to find every relationship that references it.
+- Use `get_memory_neighborhood` on the target first to see what points at it.
 - A hit can appear in `relationships.related[].id`, `relationships.supersedes[]`, or `relationships.superseded_by[]`.
 - Record every file that references the id being deleted and which field it appears in.
 
@@ -96,5 +85,5 @@ Memory forget result:
 - Deleted: none
 - Cleaned references in: none
 - Chain adjustments: none
-- Not deleted: no memory in .project-memory/ matched "<query>".
+- Not deleted: no memory matched "<query>".
 ```

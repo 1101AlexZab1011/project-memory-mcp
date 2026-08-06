@@ -1,15 +1,15 @@
-"""Command-line interface: init, validate, serve, install-skills."""
+"""Command-line interface: init, validate, serve, install-skills, migrate, backup."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
 from pathlib import Path
 
 from . import __version__
-from .store import STORE_DIR_NAME, MemoryStore, find_store_root
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 TEMPLATES_ROOT = PACKAGE_ROOT / "templates"
@@ -17,90 +17,57 @@ SKILLS_ROOT = PACKAGE_ROOT / "skills"
 
 SKILL_NAMES = ("project-memory-recall", "project-memory-remember", "project-memory-forget")
 
-# template file in this package -> file name inside .project-memory/
-STORE_TEMPLATES = {
-    "labels.json": "labels.json",
-    "memory.schema.json": "memory.schema.json",
-    "STORE_README.md": "README.md",
-}
-
-
-def _resolve_root(root_arg: str | None, require_store: bool) -> Path | None:
-    if root_arg:
-        root = Path(root_arg).resolve()
-        if require_store and not (root / STORE_DIR_NAME).is_dir():
-            print(f"error: no {STORE_DIR_NAME} store in {root}. Run 'project-memory-mcp init' first.", file=sys.stderr)
-            return None
-        return root
-    root = find_store_root()
-    if root is None:
-        if require_store:
-            print(
-                f"error: no {STORE_DIR_NAME} store found at or above {Path.cwd()}. "
-                "Run 'project-memory-mcp init' first, or pass --root.",
-                file=sys.stderr,
-            )
-            return None
-        return Path.cwd()
-    return root
-
 
 def cmd_init(args: argparse.Namespace) -> int:
-    root = Path(args.root).resolve() if args.root else Path.cwd()
-    store_dir = root / STORE_DIR_NAME
-    active_dir = store_dir / "active"
-    active_dir.mkdir(parents=True, exist_ok=True)
-    # Git does not track empty directories, so a store committed before its
-    # first memory is written would arrive at the next clone without active/
-    # and fail validation. Keep the directory alive with a placeholder.
-    gitkeep = active_dir / ".gitkeep"
-    if not gitkeep.exists():
-        gitkeep.write_text("", encoding="utf-8")
-    # usage.json is local telemetry, not part of the shared store: it records
-    # what this machine retrieved, which is noise in everyone else's diff.
-    store_ignore = store_dir / ".gitignore"
-    if not store_ignore.exists():
-        store_ignore.write_text("usage.json\n", encoding="utf-8")
+    """Create a project in a database and seed its label registry.
 
-    for template_name, target_name in STORE_TEMPLATES.items():
-        target = store_dir / target_name
-        if target.exists() and not args.force:
-            print(f"kept existing {target.relative_to(root)}")
-            continue
-        shutil.copyfile(TEMPLATES_ROOT / template_name, target)
-        print(f"wrote {target.relative_to(root)}")
+    A project otherwise does not exist until its first memory is written, which
+    means it is absent from the server's project list and cannot be served.
+    """
+    from .sqlite_store import SqliteMemoryStore, StoreError
 
-    store = MemoryStore(root)
-    errors = store.validate_store()
-    if errors:
-        for error in errors:
-            print(f"error: {error}", file=sys.stderr)
+    try:
+        store = SqliteMemoryStore(args.database, args.project)
+    except StoreError as error:
+        print(f"error: {error}", file=sys.stderr)
         return 1
-    print(f"Initialized project memory store in {store_dir}")
+
+    existing = store.list_labels()["labels"]
+    if existing and not args.force:
+        print(f"kept {len(existing)} existing label(s)")
+    else:
+        seed = json.loads((TEMPLATES_ROOT / "labels.json").read_text(encoding="utf-8"))
+        for label, data in sorted(seed["labels"].items()):
+            store.add_label(label, data["description"])
+        print(f"seeded {len(seed['labels'])} labels")
+
+    print(f"Project '{args.project}' ready in {store.path} ({store.count()} memories)")
+    store.close()
     return 0
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    root = _resolve_root(args.root, require_store=True)
-    if root is None:
+    """Re-check every stored memory against the schema.
+
+    Writes are validated already, so this catches drift from a migration, a
+    restore, or an edit made outside the tools - not ordinary use.
+    """
+    from .sqlite_store import SqliteMemoryStore, StoreError
+
+    try:
+        store = SqliteMemoryStore(args.database, args.project, create=False)
+    except StoreError as error:
+        print(f"error: {error}", file=sys.stderr)
         return 1
-    store = MemoryStore(root)
+
     errors = store.validate_store()
+    count = store.count()
+    store.close()
     if errors:
         for error in errors:
             print(f"error: {error}", file=sys.stderr)
         return 1
-    count = len(list(store.active_root.glob("*.json"))) if store.active_root.is_dir() else 0
     print(f"Project memory validation passed. Memories: {count}")
-    legacy_index = store.memory_root / "INDEX.json"
-    if legacy_index.is_file():
-        # Stores created before 0.3.0 carry a generated index that nothing reads
-        # any more. Say so once rather than deleting a file we did not write.
-        print(
-            f"note: {legacy_index.relative_to(root)} is obsolete as of 0.3.0 and is no longer "
-            "read or updated. It is safe to delete.",
-            file=sys.stderr,
-        )
     return 0
 
 
@@ -143,18 +110,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if scheduler is not None:
                 scheduler.stop()
 
-    if args.database:
-        if not args.project:
-            print("error: --project is required with --database.", file=sys.stderr)
-            return 1
-        from .sqlite_store import SqliteMemoryStore
+    if not args.database or not args.project:
+        print("error: stdio serving requires --database and --project.", file=sys.stderr)
+        return 1
+    from .sqlite_store import SqliteMemoryStore
 
-        store = SqliteMemoryStore(args.database, args.project)
-        print(f"project-memory-mcp: serving project '{args.project}' from {store.path} "
-              f"({store.count()} memories)", file=sys.stderr)
-        return run_server(store=store)
-    root = _resolve_root(args.root, require_store=False)
-    return run_server(root)
+    store = SqliteMemoryStore(args.database, args.project)
+    print(f"project-memory-mcp: serving project '{args.project}' from {store.path} "
+          f"({store.count()} memories)", file=sys.stderr)
+    return run_server(store)
 
 
 def cmd_install_skills(args: argparse.Namespace) -> int:
@@ -223,26 +187,26 @@ def cmd_restore(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="project-memory-mcp",
-        description="File-based, git-friendly project memory for coding agents, served over MCP.",
+        description="Shared, database-backed project memory for coding agents, served over MCP.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = subparsers.add_parser("init", help=f"Scaffold a {STORE_DIR_NAME}/ store in a project.")
-    init_parser.add_argument("--root", default=None, help="Project root to initialize (default: current directory).")
-    init_parser.add_argument("--force", action="store_true", help="Overwrite existing store template files.")
+    init_parser = subparsers.add_parser("init", help="Create a project in a database and seed its labels.")
+    init_parser.add_argument("--database", required=True, help="Path to the SQLite database.")
+    init_parser.add_argument("--project", required=True, help="Project id (lowercase kebab-case).")
+    init_parser.add_argument("--force", action="store_true", help="Re-seed labels even if some already exist.")
     init_parser.set_defaults(func=cmd_init)
 
-    validate_parser = subparsers.add_parser("validate", help="Validate the store.")
-    validate_parser.add_argument("--root", default=None, help="Project root (default: search upward from cwd).")
+    validate_parser = subparsers.add_parser("validate", help="Re-check every stored memory against the schema.")
+    validate_parser.add_argument("--database", required=True, help="Path to the SQLite database.")
+    validate_parser.add_argument("--project", required=True, help="Project id inside the database.")
     validate_parser.set_defaults(func=cmd_validate)
 
-    serve_parser = subparsers.add_parser("serve", help="Run the stdio MCP server.")
-    serve_parser.add_argument("--root", default=None, help="Project root (default: search upward from cwd).")
-    serve_parser.add_argument("--database", default=None,
-                              help="Serve from a SQLite database instead of memory files.")
+    serve_parser = subparsers.add_parser("serve", help="Run the MCP server over stdio or HTTP.")
+    serve_parser.add_argument("--database", default=None, help="Path to the SQLite database.")
     serve_parser.add_argument("--project", default=None,
-                              help="Project id inside the database (required with --database over stdio).")
+                              help="Project id inside the database (required over stdio).")
     serve_parser.add_argument("--http", action="store_true",
                               help="Serve MCP over HTTP so other devices can connect, instead of stdio.")
     serve_parser.add_argument("--bind", default=None,

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .store import STORE_DIR_NAME, MemoryStore, StoreError
+from .validation import StoreError
 
 
 def _tool(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
@@ -162,7 +162,7 @@ TOOLS = [
     ),
     _tool(
         "add_label",
-        "Add a canonical label to .project-memory/labels.json and validate the store.",
+        "Add a canonical label to the project's label registry.",
         {"label": {"type": "string"}, "description": {"type": "string"}},
         ["label", "description"],
     ),
@@ -285,16 +285,8 @@ def write_message(message: dict[str, Any]) -> None:
     sys.stdout.buffer.flush()
 
 
-def run_server(root: Path | str | None = None, store: Any = None) -> int:
-    """Serve MCP over stdio for ``store``, or a file-backed store under ``root``."""
-    if store is None:
-        store = MemoryStore(root)
-    if getattr(store, "memory_root", None) is not None and not store.memory_root.is_dir():
-        print(
-            f"project-memory-mcp: no {STORE_DIR_NAME} store found at {store.root}; "
-            "tools will fail until you run 'project-memory-mcp init'.",
-            file=sys.stderr,
-        )
+def run_server(store: Any) -> int:
+    """Serve MCP over stdio for ``store``."""
     server = McpServer(store)
     while True:
         message = read_message()

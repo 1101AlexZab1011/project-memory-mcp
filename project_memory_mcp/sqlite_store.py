@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import validation
-from .validation import ID_RE, LABEL_RE
+from .validation import ID_RE, LABEL_RE, LabelExpression
 
 SCHEMA_VERSION = 1
 
@@ -111,8 +111,9 @@ DERIVED_THRESHOLD = 0.34
 _STATUS_FACTORS = {"active": 1.0, "stale": 0.7, "superseded": 0.4, "wrong": 0.2}
 
 
-class StoreError(ValueError):
-    """Raised for invalid input, invalid store state, or a failed operation."""
+# Re-exported: callers import StoreError from the store they use, and the label
+# grammar raises it too, so both must be the same class.
+StoreError = validation.StoreError
 
 
 def _now() -> str:
@@ -229,7 +230,6 @@ class SqliteMemoryStore:
         Label filtering happens in SQL; the label expression grammar is still
         evaluated in Python so that AND/OR/NOT keep working unchanged.
         """
-        from .store import LabelExpression  # local import: shared grammar, no cycle at import time
 
         known = set(self.list_labels()["labels"])
         expression = LabelExpression(label_query, known)
@@ -277,7 +277,6 @@ class SqliteMemoryStore:
         full, so cost tracks the size of the answer rather than the store.
         """
         from .ranking import personalized_pagerank
-        from .store import LabelExpression
 
         if limit < 1:
             raise StoreError("limit must be >= 1.")

@@ -1,7 +1,8 @@
-"""project-memory-mcp: file-based, git-friendly project memory for coding agents."""
+"""project-memory-mcp: shared, database-backed project memory for coding agents."""
 
-from .store import MemoryStore, StoreError, find_store_root
+from .sqlite_store import SqliteMemoryStore
+from .validation import StoreError
 
 __version__ = "0.4.0"
 
-__all__ = ["MemoryStore", "StoreError", "find_store_root", "__version__"]
+__all__ = ["SqliteMemoryStore", "StoreError", "__version__"]

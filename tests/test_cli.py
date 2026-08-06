@@ -3,80 +3,72 @@ import unittest
 from pathlib import Path
 
 from project_memory_mcp.cli import main
-from project_memory_mcp.store import MemoryStore
+from project_memory_mcp.sqlite_store import SqliteMemoryStore
 
-from test_store import make_memory
+from test_validation import make_memory
 
 
 class CliTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name)
+        self.db = self.root / "memory.db"
 
-    def tearDown(self):
-        self.tempdir.cleanup()
+    def open_store(self, project="demo"):
+        store = SqliteMemoryStore(self.db, project, create=False)
+        self.addCleanup(store.close)
+        return store
 
-    def test_init_scaffolds_a_valid_store(self):
-        exit_code = main(["init", "--root", str(self.root)])
+    def test_init_creates_the_project_and_seeds_labels(self):
+        exit_code = main(["init", "--database", str(self.db), "--project", "demo"])
 
         self.assertEqual(0, exit_code)
-        store_dir = self.root / ".project-memory"
-        for name in ("labels.json", "memory.schema.json", "README.md"):
-            self.assertTrue((store_dir / name).is_file(), name)
-        self.assertTrue((store_dir / "active").is_dir())
-        self.assertEqual([], MemoryStore(self.root).validate_store())
-
-    def test_init_keeps_the_empty_active_dir_trackable_by_git(self):
-        # Git does not track empty directories. Without a placeholder, a store
-        # committed before its first memory arrives at the next clone with no
-        # active/ at all, and validation fails on the missing directory.
-        main(["init", "--root", str(self.root)])
-
-        self.assertTrue((self.root / ".project-memory" / "active" / ".gitkeep").is_file())
-
-    def test_placeholder_is_not_mistaken_for_a_memory(self):
-        main(["init", "--root", str(self.root)])
-        store = MemoryStore(self.root)
-
+        store = self.open_store()
         self.assertEqual([], store.validate_store())
-        self.assertEqual(0, store.recall()["considered"])
+        self.assertTrue(store.list_labels()["labels"])
 
-    def test_init_keeps_existing_files_without_force(self):
-        main(["init", "--root", str(self.root)])
-        labels_path = self.root / ".project-memory" / "labels.json"
-        custom = labels_path.read_text(encoding="utf-8").replace("A recurring failure mode", "custom description")
-        labels_path.write_text(custom, encoding="utf-8")
+    def test_init_makes_the_project_visible_before_any_memory_exists(self):
+        # Without this the project does not exist until its first write, so the
+        # server cannot serve it and it is missing from the UI's project list.
+        main(["init", "--database", str(self.db), "--project", "demo"])
 
-        main(["init", "--root", str(self.root)])
+        store = self.open_store()
+        self.assertEqual(["demo"], SqliteMemoryStore.list_projects(store.connection))
+        self.assertEqual(0, store.count())
 
-        self.assertIn("custom description", labels_path.read_text(encoding="utf-8"))
+    def test_init_keeps_existing_labels_without_force(self):
+        main(["init", "--database", str(self.db), "--project", "demo"])
+        store = self.open_store()
+        before = store.list_labels()["labels"]["kind:bug"]["description"]
 
-    def test_starter_labels_support_a_full_memory_lifecycle(self):
-        main(["init", "--root", str(self.root)])
-        store = MemoryStore(self.root)
+        main(["init", "--database", str(self.db), "--project", "demo"])
 
-        memory = make_memory("first-lesson", ["kind:bug", "context:runtime"])
-        store.create_memory(memory)
+        self.assertEqual(before, self.open_store().list_labels()["labels"]["kind:bug"]["description"])
+
+    def test_projects_in_one_database_are_initialized_independently(self):
+        main(["init", "--database", str(self.db), "--project", "demo"])
+        main(["init", "--database", str(self.db), "--project", "other"])
+
+        store = self.open_store()
+        self.assertEqual(["demo", "other"], SqliteMemoryStore.list_projects(store.connection))
+
+    def test_seeded_labels_support_a_full_memory_lifecycle(self):
+        main(["init", "--database", str(self.db), "--project", "demo"])
+        store = self.open_store()
+        store.create_memory(make_memory("first-lesson", ["kind:bug", "context:runtime"]))
 
         result = store.search_memories(label_query="kind:bug")
+
         self.assertEqual(["first-lesson"], [entry["id"] for entry in result["memories"]])
-        self.assertEqual(0, main(["validate", "--root", str(self.root)]))
+        self.assertEqual(0, main(["validate", "--database", str(self.db), "--project", "demo"]))
 
-    def test_init_writes_no_index(self):
-        main(["init", "--root", str(self.root)])
+    def test_validate_reports_an_unknown_project_instead_of_creating_one(self):
+        main(["init", "--database", str(self.db), "--project", "demo"])
 
-        self.assertFalse((self.root / ".project-memory" / "INDEX.json").exists())
-
-    def test_a_pre_0_3_index_left_on_disk_is_tolerated(self):
-        # Upgraded stores still have the file committed; it must not fail
-        # validation, and nothing should read or rewrite it.
-        main(["init", "--root", str(self.root)])
-        legacy = self.root / ".project-memory" / "INDEX.json"
-        legacy.write_text('{"schema_version": 1, "memories": []}', encoding="utf-8")
-        MemoryStore(self.root).create_memory(make_memory("first-lesson", ["kind:bug"]))
-
-        self.assertEqual(0, main(["validate", "--root", str(self.root)]))
-        self.assertEqual('{"schema_version": 1, "memories": []}', legacy.read_text(encoding="utf-8"))
+        self.assertEqual(1, main(["validate", "--database", str(self.db), "--project", "nope"]))
+        store = self.open_store()
+        self.assertEqual(["demo"], SqliteMemoryStore.list_projects(store.connection))
 
     def test_install_skills_copies_all_skills(self):
         exit_code = main(["install-skills", "--root", str(self.root), "--claude", "--codex"])
