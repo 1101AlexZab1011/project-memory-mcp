@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid as uuid_module
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -20,7 +21,12 @@ from typing import Any, Iterable
 from . import validation
 from .validation import ID_RE, LABEL_RE, LabelExpression
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# 64-day window for the spread bitmap: long enough to judge the early tiers,
+# and it fits one SQLite integer.
+SPREAD_WINDOW_DAYS = 64
+SPREAD_MASK = (1 << SPREAD_WINDOW_DAYS) - 1
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -31,9 +37,13 @@ CREATE TABLE IF NOT EXISTS projects (
     created TEXT NOT NULL
 );
 
+-- `uuid` is the identity every other table points at; `slug` is the readable
+-- name the tools and the agent speak. Two people working offline will each coin
+-- `shader-compile-stall` for different lessons, so identity cannot be the name.
 CREATE TABLE IF NOT EXISTS memories (
     project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    id                TEXT NOT NULL,
+    uuid              TEXT NOT NULL,
+    slug              TEXT NOT NULL,
     status            TEXT NOT NULL,
     description       TEXT NOT NULL,
     created           TEXT,
@@ -41,10 +51,13 @@ CREATE TABLE IF NOT EXISTS memories (
     created_from_task TEXT,
     area              TEXT,
     body              TEXT NOT NULL,
-    PRIMARY KEY (project_id, id)
+    PRIMARY KEY (project_id, uuid)
 );
+-- Unique for now: one writer, so a duplicate slug is a mistake rather than a
+-- merge. Relaxing this is a sync concern, and dropping an index is cheap.
+CREATE UNIQUE INDEX IF NOT EXISTS memories_slug ON memories(project_id, slug);
 CREATE INDEX IF NOT EXISTS memories_status  ON memories(project_id, status);
-CREATE INDEX IF NOT EXISTS memories_created ON memories(project_id, created);
+CREATE INDEX IF NOT EXISTS memories_created ON memories(project_id, created, slug);
 
 CREATE TABLE IF NOT EXISTS labels (
     project_id TEXT NOT NULL, memory_id TEXT NOT NULL, label TEXT NOT NULL,
@@ -70,11 +83,26 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS edges_dst ON edges(project_id, dst);
 
+-- One row per (memory, replica). Counters are grow-only and each replica owns
+-- its own row exclusively, so merging is a SUM and pushing is an idempotent
+-- overwrite rather than a stream of increments.
+--
+-- `surfaced` counts every appearance; `surfaced_direct` counts only the ones
+-- the memory earned by matching the query. Without the split, a weak memory
+-- linked to a popular one inherits its neighbour's traffic and never ages out.
+--
+-- `spread_bits` is a 64-day rolling bitmap, one bit per day, newest in bit 0.
+-- Distinct days is a popcount, merging across replicas is a bitwise OR, and it
+-- costs 8 bytes - where storing the days themselves would not stay bounded.
 CREATE TABLE IF NOT EXISTS usage (
-    project_id TEXT NOT NULL, memory_id TEXT NOT NULL,
-    surfaced INTEGER NOT NULL DEFAULT 0, applied INTEGER NOT NULL DEFAULT 0,
+    project_id TEXT NOT NULL, memory_id TEXT NOT NULL, replica_id TEXT NOT NULL,
+    surfaced INTEGER NOT NULL DEFAULT 0,
+    surfaced_direct INTEGER NOT NULL DEFAULT 0,
+    applied INTEGER NOT NULL DEFAULT 0,
     last_surfaced TEXT, last_applied TEXT,
-    PRIMARY KEY (project_id, memory_id)
+    spread_bits INTEGER NOT NULL DEFAULT 0,
+    spread_epoch INTEGER,
+    PRIMARY KEY (project_id, memory_id, replica_id)
 );
 
 CREATE TABLE IF NOT EXISTS revisions (
@@ -120,6 +148,163 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _today() -> int:
+    """Days since the epoch, UTC. The unit of the spread bitmap."""
+    return datetime.now(timezone.utc).toordinal()
+
+
+def _as_signed(bits: int) -> int:
+    """SQLite integers are signed 64-bit; bit 63 set would overflow on write."""
+    bits &= SPREAD_MASK
+    return bits - (1 << SPREAD_WINDOW_DAYS) if bits >> (SPREAD_WINDOW_DAYS - 1) else bits
+
+
+def _touch_spread(bits: int, epoch: int | None, today: int) -> tuple[int, int]:
+    """Set today's bit in a 64-day rolling window, newest day in bit 0.
+
+    Spread - how many distinct days a memory was recalled on - says something
+    that a rate does not: thirty hits in one afternoon is a burst, while one hit
+    a month for a year is a memory that keeps proving itself.
+    """
+    bits &= SPREAD_MASK
+    if epoch is None:
+        return _as_signed(1), today
+    delta = today - epoch
+    if delta == 0:
+        return _as_signed(bits | 1), epoch
+    if delta < 0:
+        # A replica's clock ran behind, or rows merged out of order. Record the
+        # day in its own slot rather than rolling the window backwards.
+        back = -delta
+        if back < SPREAD_WINDOW_DAYS:
+            bits |= 1 << back
+        return _as_signed(bits), epoch
+    if delta >= SPREAD_WINDOW_DAYS:
+        return _as_signed(1), today
+    return _as_signed(((bits << delta) & SPREAD_MASK) | 1), today
+
+
+def _merge_spread(bits_a: int, epoch_a: int | None,
+                  bits_b: int, epoch_b: int | None) -> tuple[int, int | None]:
+    """Combine two replicas' windows by aligning them and OR-ing.
+
+    Two machines recalling a memory on the same day is one day of spread, which
+    is exactly what OR gives and what summing would not.
+    """
+    if epoch_a is None:
+        return bits_b & SPREAD_MASK, epoch_b
+    if epoch_b is None:
+        return bits_a & SPREAD_MASK, epoch_a
+    newest = max(epoch_a, epoch_b)
+    merged = 0
+    for bits, epoch in ((bits_a, epoch_a), (bits_b, epoch_b)):
+        shift = newest - epoch
+        if shift < SPREAD_WINDOW_DAYS:
+            merged |= ((bits & SPREAD_MASK) << shift) & SPREAD_MASK
+    return merged, newest
+
+
+def _ensure_replica_id(connection: sqlite3.Connection) -> str:
+    """This installation's identity, generated once and never coordinated.
+
+    Counters are keyed by it so that two machines' counts add rather than
+    overwrite each other.
+    """
+    row = connection.execute("SELECT value FROM meta WHERE key='replica_id'").fetchone()
+    if row is not None:
+        return row[0]
+    replica = str(uuid_module.uuid4())
+    connection.execute("INSERT INTO meta(key, value) VALUES ('replica_id', ?)", (replica,))
+    return replica
+
+
+def _upgrade(connection: sqlite3.Connection) -> None:
+    """Bring an older database up to the current schema, in place.
+
+    Runs before the schema script, because ``CREATE TABLE IF NOT EXISTS`` would
+    silently leave a v1 table as it found it.
+    """
+    tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "memories" not in tables:
+        return  # fresh database; the schema script creates the current version
+    columns = {r[1] for r in connection.execute("PRAGMA table_info(memories)")}
+    if "uuid" not in columns:
+        _migrate_v1_to_v2(connection)
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    """Give every memory a uuid and repoint the tables that referenced its slug.
+
+    The slug stays exactly as it was, so retrieval, relationships, and the FTS
+    index are unchanged - what moves is which value the other tables join on.
+    """
+    rows = connection.execute("SELECT project_id, id FROM memories").fetchall()
+    mapping = {(r[0], r[1]): str(uuid_module.uuid4()) for r in rows}
+
+    connection.executescript("""
+        ALTER TABLE memories RENAME TO memories_v1;
+        DROP INDEX IF EXISTS memories_status;
+        DROP INDEX IF EXISTS memories_created;
+        CREATE TABLE memories (
+            project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            uuid              TEXT NOT NULL,
+            slug              TEXT NOT NULL,
+            status            TEXT NOT NULL,
+            description       TEXT NOT NULL,
+            created           TEXT,
+            last_validated    TEXT,
+            created_from_task TEXT,
+            area              TEXT,
+            body              TEXT NOT NULL,
+            PRIMARY KEY (project_id, uuid)
+        );
+        ALTER TABLE usage RENAME TO usage_v1;
+        CREATE TABLE usage (
+            project_id TEXT NOT NULL, memory_id TEXT NOT NULL, replica_id TEXT NOT NULL,
+            surfaced INTEGER NOT NULL DEFAULT 0,
+            surfaced_direct INTEGER NOT NULL DEFAULT 0,
+            applied INTEGER NOT NULL DEFAULT 0,
+            last_surfaced TEXT, last_applied TEXT,
+            spread_bits INTEGER NOT NULL DEFAULT 0,
+            spread_epoch INTEGER,
+            PRIMARY KEY (project_id, memory_id, replica_id)
+        );
+    """)
+
+    connection.executemany(
+        "INSERT INTO memories(project_id, uuid, slug, status, description, created, "
+        "last_validated, created_from_task, area, body) "
+        "SELECT project_id, ?, id, status, description, created, last_validated, "
+        "created_from_task, area, body FROM memories_v1 WHERE project_id=? AND id=?",
+        [(new, project, old) for (project, old), new in mapping.items()],
+    )
+
+    for table, column in (("labels", "memory_id"), ("files", "memory_id"),
+                          ("revisions", "memory_id"), ("memories_fts", "memory_id"),
+                          ("edges", "src"), ("edges", "dst")):
+        connection.executemany(
+            f"UPDATE {table} SET {column}=? WHERE project_id=? AND {column}=?",
+            [(new, project, old) for (project, old), new in mapping.items()],
+        )
+
+    # Historical counts belong to this replica - it is the only one that has
+    # ever written to this database. surfaced_direct starts at 0 because the
+    # split did not exist when those surfacings were recorded, and inventing a
+    # value would put made-up evidence in front of the audit.
+    replica = _ensure_replica_id(connection)
+    connection.executemany(
+        "INSERT INTO usage(project_id, memory_id, replica_id, surfaced, applied, "
+        "last_surfaced, last_applied) SELECT project_id, ?, ?, surfaced, applied, "
+        "last_surfaced, last_applied FROM usage_v1 WHERE project_id=? AND memory_id=?",
+        [(new, replica, project, old) for (project, old), new in mapping.items()],
+    )
+
+    connection.executescript("DROP TABLE memories_v1; DROP TABLE usage_v1;")
+    connection.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+                       (str(SCHEMA_VERSION),))
+    connection.commit()
+
+
 class SqliteMemoryStore:
     def __init__(self, database: Path | str, project: str, create: bool = True,
                  check_same_thread: bool = True) -> None:
@@ -132,11 +317,13 @@ class SqliteMemoryStore:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA foreign_keys=ON")
+        _upgrade(self.connection)
         self.connection.executescript(SCHEMA)
         self.connection.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
+        self.replica_id = _ensure_replica_id(self.connection)
         known = self.connection.execute(
             "SELECT 1 FROM projects WHERE id=?", (project,)
         ).fetchone()
@@ -199,9 +386,39 @@ class SqliteMemoryStore:
 
     # ------------------------------------------------------------------- reads
 
+    # The tools, the UI and the memory documents all speak slugs; every table
+    # other than `memories` joins on uuid. These three translate at that seam,
+    # and everything below the seam works in uuid.
+
+    def _uuid_for(self, slug: str) -> str:
+        row = self.connection.execute(
+            "SELECT uuid FROM memories WHERE project_id=? AND slug=?", (self.project, slug)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"Unknown memory id: {slug}")
+        return row["uuid"]
+
+    def _body_by_uuid(self, memory_uuid: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT body FROM memories WHERE project_id=? AND uuid=?", (self.project, memory_uuid)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"Unknown memory uuid: {memory_uuid}")
+        return json.loads(row["body"])
+
+    def _slugs_for(self, uuids: Iterable[str]) -> dict[str, str]:
+        ids = sorted(set(uuids))
+        if not ids:
+            return {}
+        rows = self.connection.execute(
+            f"SELECT uuid, slug FROM memories WHERE project_id=? "
+            f"AND uuid IN ({','.join('?' * len(ids))})", (self.project, *ids),
+        ).fetchall()
+        return {row["uuid"]: row["slug"] for row in rows}
+
     def get_memory(self, memory_id: str) -> dict[str, Any]:
         row = self.connection.execute(
-            "SELECT body FROM memories WHERE project_id=? AND id=?", (self.project, memory_id)
+            "SELECT body FROM memories WHERE project_id=? AND slug=?", (self.project, memory_id)
         ).fetchone()
         if row is None:
             raise StoreError(f"Unknown memory id: {memory_id}")
@@ -214,9 +431,9 @@ class SqliteMemoryStore:
 
     def load_memories(self) -> dict[str, dict[str, Any]]:
         rows = self.connection.execute(
-            "SELECT id, body FROM memories WHERE project_id=? ORDER BY id", (self.project,)
+            "SELECT slug, body FROM memories WHERE project_id=? ORDER BY slug", (self.project,)
         ).fetchall()
-        return {row["id"]: json.loads(row["body"]) for row in rows}
+        return {row["slug"]: json.loads(row["body"]) for row in rows}
 
     def search_memories(
         self,
@@ -236,12 +453,12 @@ class SqliteMemoryStore:
         statuses = _normalize_status_filter(status_filter)
         needle = text_query.lower().strip() if text_query else ""
 
-        sql = "SELECT id, body FROM memories WHERE project_id=?"
+        sql = "SELECT slug, body FROM memories WHERE project_id=?"
         params: list[Any] = [self.project]
         if statuses is not None:
             sql += f" AND status IN ({','.join('?' * len(statuses))})"
             params.extend(sorted(statuses))
-        sql += " ORDER BY id"
+        sql += " ORDER BY slug"
 
         matches: list[dict[str, Any]] = []
         for row in self.connection.execute(sql, params):
@@ -308,7 +525,11 @@ class SqliteMemoryStore:
                 if position < full_count:
                     entry["memory"] = memory
                 results.append(entry)
-            self._record_usage([r["id"] for r in results], "surfaced")
+            # Browsing the timeline is retrieval by position, not by match, so
+            # it never counts as direct: a memory should not earn its tier by
+            # being adjacent in time to something someone was reading.
+            shown = self._uuids_for_slugs([r["id"] for r in results])
+            self._record_usage(shown.values(), direct=())
             payload = {"order": "recent", "offset": offset,
                        "label_query_labels": sorted(expression.used_labels),
                        "count": len(results), "memories": results}
@@ -318,10 +539,11 @@ class SqliteMemoryStore:
                 payload["after"] = after
             return payload
 
+        related_uuid = self._uuid_for(related_to) if related_to else None
         text_scores = self.text_candidates(query) if query else {}
         seeds = dict(sorted(text_scores.items(), key=lambda i: -i[1])[:WALK_SEEDS])
-        if related_to:
-            seeds[related_to] = max(1.0, sum(seeds.values()))
+        if related_uuid:
+            seeds[related_uuid] = max(1.0, sum(seeds.values()))
 
         graph_scores: dict[str, float] = {}
         if seeds:
@@ -334,7 +556,7 @@ class SqliteMemoryStore:
         graph_weight = 1.0 if related_to else 0.3
         combined: dict[str, float] = {}
         for memory_id in set(text_scores) | set(graph_scores):
-            if memory_id == related_to:
+            if memory_id == related_uuid:
                 continue
             combined[memory_id] = text_scores.get(memory_id, 0.0) + graph_weight * graph_scores.get(memory_id, 0.0)
 
@@ -342,17 +564,22 @@ class SqliteMemoryStore:
             # No query at all: fall back to the most connected memories, which
             # is the "orient me in this store" answer.
             rows = self.connection.execute(
-                "SELECT src AS id, COUNT(*) AS degree FROM edges WHERE project_id=? "
+                "SELECT src AS uuid, COUNT(*) AS degree FROM edges WHERE project_id=? "
                 "GROUP BY src ORDER BY degree DESC LIMIT ?", (self.project, limit * 4),
             ).fetchall()
-            combined = {row["id"]: float(row["degree"]) for row in rows}
+            combined = {row["uuid"]: float(row["degree"]) for row in rows}
 
+        # Tie-break on the slug, not the uuid: which memories survive the limit
+        # must not depend on a random identifier.
+        slugs = self._slugs_for(combined)
         results: list[dict[str, Any]] = []
-        for memory_id, score in sorted(combined.items(), key=lambda i: (-i[1], i[0])):
+        surfaced: list[str] = []
+        direct: list[str] = []
+        for memory_id, score in sorted(combined.items(), key=lambda i: (-i[1], slugs.get(i[0], i[0]))):
             if score <= 0.0:
                 continue
             try:
-                memory = self.get_memory(memory_id)
+                memory = self._body_by_uuid(memory_id)
             except StoreError:
                 continue
             if statuses is not None and memory.get("status") not in statuses:
@@ -370,10 +597,16 @@ class SqliteMemoryStore:
             if len(results) < full_count:
                 result["memory"] = memory
             results.append(result)
+            surfaced.append(memory_id)
+            # Direct means the memory matched the query itself. Everything else
+            # arrived through a neighbour, and riding a popular neighbour's
+            # traffic is not evidence that this memory is worth keeping.
+            if text_scores.get(memory_id, 0.0) > 0.0:
+                direct.append(memory_id)
             if len(results) >= limit:
                 break
         results.sort(key=lambda r: (-r["score"], r["id"]))
-        self._record_usage([r["id"] for r in results], "surfaced")
+        self._record_usage(surfaced, direct=direct)
         payload: dict[str, Any] = {
             "query": query,
             "label_query_labels": sorted(expression.used_labels),
@@ -455,18 +688,18 @@ class SqliteMemoryStore:
             raise StoreError("depth must be >= 0.")
         if max_nodes < 1:
             raise StoreError("max_nodes must be >= 1.")
-        self.get_memory(memory_id)  # raises on unknown id
+        root_uuid = self._uuid_for(memory_id)  # raises on unknown id
 
         nodes: dict[str, dict[str, Any]] = {}
         edges: list[dict[str, Any]] = []
         seen_edges: set[tuple[str, str, str]] = set()
-        frontier = [memory_id]
+        frontier = [root_uuid]
         for level in range(depth + 1):
             if not frontier or len(nodes) >= max_nodes:
                 break
             for node in frontier:
                 if node not in nodes and len(nodes) < max_nodes:
-                    nodes[node] = _light_record(self.get_memory(node))
+                    nodes[node] = _light_record(self._body_by_uuid(node))
             if level == depth:
                 break
             placeholders = ",".join("?" * len(frontier))
@@ -480,14 +713,21 @@ class SqliteMemoryStore:
                 key = (row["kind"], row["src"], row["dst"])
                 if key not in seen_edges:
                     seen_edges.add(key)
-                    edge = {"type": row["kind"], "from": row["src"], "to": row["dst"]}
-                    if row["reason"]:
-                        edge["reason"] = row["reason"]
-                    edges.append(edge)
+                    edges.append({"type": row["kind"], "from": row["src"], "to": row["dst"],
+                                  "reason": row["reason"]})
                 if row["dst"] not in nodes and row["dst"] not in nxt and len(nodes) + len(nxt) < max_nodes:
                     nxt.append(row["dst"])
             frontier = nxt
-        return {"root": memory_id, "depth": depth, "nodes": list(nodes.values()), "edges": edges}
+        # The graph is walked in uuid space; callers only ever see slugs.
+        slugs = self._slugs_for(list(nodes) + [e[end] for e in edges for end in ("from", "to")])
+        rendered = []
+        for edge in edges:
+            entry = {"type": edge["type"], "from": slugs.get(edge["from"], edge["from"]),
+                     "to": slugs.get(edge["to"], edge["to"])}
+            if edge["reason"]:
+                entry["reason"] = edge["reason"]
+            rendered.append(entry)
+        return {"root": memory_id, "depth": depth, "nodes": list(nodes.values()), "edges": rendered}
 
     def timeline_window(
         self,
@@ -506,13 +746,13 @@ class SqliteMemoryStore:
         where = "project_id=?"
         if anchor is not None:
             row = self.connection.execute(
-                "SELECT created, id FROM memories WHERE project_id=? AND id=?", (self.project, anchor)
+                "SELECT created, slug FROM memories WHERE project_id=? AND slug=?", (self.project, anchor)
             ).fetchone()
             if row is None:
                 raise StoreError(f"Unknown memory id: {anchor}")
             comparison = ">" if forward else "<"
-            where += f" AND (created, id) {comparison} (?, ?)"
-            params += [row["created"], row["id"]]
+            where += f" AND (created, slug) {comparison} (?, ?)"
+            params += [row["created"], row["slug"]]
         if statuses is not None:
             where += f" AND status IN ({','.join('?' * len(statuses))})"
             params += sorted(statuses)
@@ -520,7 +760,7 @@ class SqliteMemoryStore:
         params += [limit, offset]
         rows = self.connection.execute(
             f"SELECT body FROM memories WHERE {where} "
-            f"ORDER BY created {direction}, id {direction} LIMIT ? OFFSET ?",
+            f"ORDER BY created {direction}, slug {direction} LIMIT ? OFFSET ?",
             params,
         ).fetchall()
         return [json.loads(row["body"]) for row in rows]
@@ -532,7 +772,7 @@ class SqliteMemoryStore:
             # not sargable and turned this into a full scan and sort. Writes and
             # migration both populate `created`, so the fallback is not needed.
             "SELECT body FROM memories WHERE project_id=? "
-            "ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
+            "ORDER BY created DESC, slug DESC LIMIT ? OFFSET ?",
             (self.project, limit, offset),
         ).fetchall()
         memories = [_light_record(json.loads(row["body"])) for row in rows]
@@ -547,102 +787,149 @@ class SqliteMemoryStore:
         self._require_valid(memory)
         memory_id = memory["id"]
         if self.connection.execute(
-            "SELECT 1 FROM memories WHERE project_id=? AND id=?", (self.project, memory_id)
+            "SELECT 1 FROM memories WHERE project_id=? AND slug=?", (self.project, memory_id)
         ).fetchone():
             raise StoreError(f"Memory already exists: {memory_id}")
         with self.connection:
-            self._write(memory)
+            self._write(memory, str(uuid_module.uuid4()))
             self._synchronize_relationships(memory_id)
         return {"created": memory_id, "related_candidates": []}
 
     def update_memory(self, memory_id: str, patch: dict[str, Any], related_label_query: Any = None) -> dict[str, Any]:
         if "id" in patch and patch["id"] != memory_id:
             raise StoreError("update_memory cannot change a memory id.")
-        current = self.get_memory(memory_id)
+        memory_uuid = self._uuid_for(memory_id)
+        current = self._body_by_uuid(memory_uuid)
         merged = _deep_merge(current, patch)
         self._require_valid(merged)
         with self.connection:
             self.connection.execute(
                 "INSERT INTO revisions(project_id, memory_id, revised_at, body) VALUES (?,?,?,?)",
-                (self.project, memory_id, _now(), json.dumps(current)),
+                (self.project, memory_uuid, _now(), json.dumps(current)),
             )
-            self._write(merged)
+            self._write(merged, memory_uuid)
             self._synchronize_relationships(memory_id)
         return {"updated": memory_id, "related_candidates": []}
 
     def delete_memory(self, memory_id: str, confirm_exact_id: str) -> dict[str, Any]:
         if confirm_exact_id != memory_id:
             raise StoreError("confirm_exact_id must exactly match id.")
-        body = self.get_memory(memory_id)
+        memory_uuid = self._uuid_for(memory_id)
+        body = self._body_by_uuid(memory_uuid)
         touched: list[str] = []
         with self.connection:
             self.connection.execute(
                 "INSERT INTO revisions(project_id, memory_id, revised_at, body) VALUES (?,?,?,?)",
-                (self.project, memory_id, _now(), json.dumps(body)),
+                (self.project, memory_uuid, _now(), json.dumps(body)),
             )
             referrers = self.connection.execute(
-                "SELECT DISTINCT src FROM edges WHERE project_id=? AND dst=?", (self.project, memory_id)
+                "SELECT DISTINCT src FROM edges WHERE project_id=? AND dst=?", (self.project, memory_uuid)
             ).fetchall()
             for row in referrers:
-                other = self.get_memory(row["src"])
+                other_uuid = row["src"]
+                other = self._body_by_uuid(other_uuid)
                 rel = other["relationships"]
                 rel["related"] = [e for e in rel["related"] if e.get("id") != memory_id]
                 for field in ("supersedes", "superseded_by"):
                     rel[field] = [v for v in rel[field] if v != memory_id]
-                self._write(other)
+                self._write(other, other_uuid)
                 touched.append(other["id"])
-            for table in ("memories", "labels", "usage"):
+            for table in ("memories", "labels", "files", "usage", "memories_fts"):
                 self.connection.execute(
                     f"DELETE FROM {table} WHERE project_id=? AND "
-                    f"{'id' if table == 'memories' else 'memory_id'}=?",
-                    (self.project, memory_id),
+                    f"{'uuid' if table == 'memories' else 'memory_id'}=?",
+                    (self.project, memory_uuid),
                 )
             self.connection.execute(
                 "DELETE FROM edges WHERE project_id=? AND (src=? OR dst=?)",
-                (self.project, memory_id, memory_id),
+                (self.project, memory_uuid, memory_uuid),
             )
         return {"deleted": memory_id, "cleaned_references_in": sorted(set(touched))}
 
     # ------------------------------------------------------------------- usage
 
     def load_usage(self) -> dict[str, Any]:
+        """Counters per memory, summed across every replica that reported one.
+
+        Grow-only counters from independent replicas add; the spread bitmaps
+        OR, because two machines using a memory on the same day is one day of
+        spread, not two.
+        """
         rows = self.connection.execute(
-            "SELECT memory_id, surfaced, applied, last_surfaced, last_applied "
-            "FROM usage WHERE project_id=?", (self.project,)
+            "SELECT m.slug AS slug, u.surfaced AS surfaced, u.surfaced_direct AS surfaced_direct, "
+            "u.applied AS applied, u.last_surfaced AS last_surfaced, u.last_applied AS last_applied, "
+            "u.spread_bits AS spread_bits, u.spread_epoch AS spread_epoch "
+            "FROM usage u JOIN memories m ON m.project_id=u.project_id AND m.uuid=u.memory_id "
+            "WHERE u.project_id=?", (self.project,)
         ).fetchall()
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "memories": {
-                row["memory_id"]: {
-                    "surfaced": row["surfaced"], "applied": row["applied"],
-                    "last_surfaced": row["last_surfaced"], "last_applied": row["last_applied"],
-                }
-                for row in rows
-            },
-        }
+        merged: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            entry = merged.setdefault(row["slug"], {
+                "surfaced": 0, "surfaced_direct": 0, "applied": 0,
+                "last_surfaced": None, "last_applied": None, "_bits": 0, "_epoch": None,
+            })
+            entry["surfaced"] += row["surfaced"]
+            entry["surfaced_direct"] += row["surfaced_direct"]
+            entry["applied"] += row["applied"]
+            for field in ("last_surfaced", "last_applied"):
+                if row[field] and (entry[field] is None or row[field] > entry[field]):
+                    entry[field] = row[field]
+            entry["_bits"], entry["_epoch"] = _merge_spread(
+                entry["_bits"], entry["_epoch"], row["spread_bits"], row["spread_epoch"])
+        for entry in merged.values():
+            entry["spread_days"] = bin(entry.pop("_bits") & SPREAD_MASK).count("1")
+            entry.pop("_epoch")
+        return {"schema_version": SCHEMA_VERSION, "memories": merged}
 
     def record_use(self, memory_ids: list[str]) -> dict[str, Any]:
         if not isinstance(memory_ids, list) or not all(isinstance(i, str) for i in memory_ids):
             raise StoreError("memory_ids must be an array of strings.")
+        uuids = []
         for memory_id in memory_ids:
-            self.get_memory(memory_id)  # raises on unknown id
-        self._record_usage(memory_ids, "applied")
+            uuids.append(self._uuid_for(memory_id))  # raises on unknown id
+        self._record_usage((), applied=uuids)
         return {"recorded": sorted(set(memory_ids)), "field": "applied"}
 
-    def _record_usage(self, memory_ids: Iterable[str], field: str) -> None:
-        ids = sorted(set(memory_ids))
-        if not ids:
+    def _record_usage(self, surfaced: Iterable[str], direct: Iterable[str] = (),
+                      applied: Iterable[str] = ()) -> None:
+        """Bump this replica's counters for the memories a call touched.
+
+        Every id here is a uuid. Rows are keyed by replica as well as memory, so
+        this only ever writes counters this machine owns - which is what lets a
+        push be an idempotent overwrite instead of a stream of increments.
+        """
+        surfaced, direct, applied = set(surfaced), set(direct), set(applied)
+        touched = sorted(surfaced | direct | applied)
+        if not touched:
             return
-        stamp = _now()
-        # An UPSERT per memory, so there is no read-modify-write of a whole
-        # counters document the way the file backend needed.
+        stamp, today = _now(), _today()
         with self.connection:
-            for memory_id in ids:
+            for memory_id in touched:
+                row = self.connection.execute(
+                    "SELECT spread_bits, spread_epoch FROM usage "
+                    "WHERE project_id=? AND memory_id=? AND replica_id=?",
+                    (self.project, memory_id, self.replica_id),
+                ).fetchone()
+                bits, epoch = _touch_spread(
+                    row["spread_bits"] if row else 0, row["spread_epoch"] if row else None, today)
                 self.connection.execute(
-                    f"INSERT INTO usage(project_id, memory_id, {field}, last_{field}) VALUES (?,?,1,?) "
-                    f"ON CONFLICT(project_id, memory_id) DO UPDATE SET "
-                    f"{field}={field}+1, last_{field}=excluded.last_{field}",
-                    (self.project, memory_id, stamp),
+                    "INSERT INTO usage(project_id, memory_id, replica_id, surfaced, surfaced_direct, "
+                    "applied, last_surfaced, last_applied, spread_bits, spread_epoch) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(project_id, memory_id, replica_id) DO UPDATE SET "
+                    "surfaced=surfaced+excluded.surfaced, "
+                    "surfaced_direct=surfaced_direct+excluded.surfaced_direct, "
+                    "applied=applied+excluded.applied, "
+                    "last_surfaced=COALESCE(excluded.last_surfaced, last_surfaced), "
+                    "last_applied=COALESCE(excluded.last_applied, last_applied), "
+                    "spread_bits=excluded.spread_bits, spread_epoch=excluded.spread_epoch",
+                    (self.project, memory_id, self.replica_id,
+                     1 if memory_id in surfaced else 0,
+                     1 if memory_id in direct else 0,
+                     1 if memory_id in applied else 0,
+                     stamp if memory_id in surfaced else None,
+                     stamp if memory_id in applied else None,
+                     bits, epoch),
                 )
 
     # -------------------------------------------------------------- validation
@@ -681,58 +968,75 @@ class SqliteMemoryStore:
 
     # ---------------------------------------------------------------- internal
 
-    def _write(self, memory: dict[str, Any]) -> None:
-        memory_id = memory["id"]
+    def _write(self, memory: dict[str, Any], memory_uuid: str) -> None:
+        slug = memory["id"]
         evidence = memory.get("evidence") or {}
         scope = memory.get("scope") or {}
         self.connection.execute(
-            "INSERT INTO memories(project_id, id, status, description, created, last_validated, "
-            "created_from_task, area, body) VALUES (?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(project_id, id) DO UPDATE SET status=excluded.status, "
+            "INSERT INTO memories(project_id, uuid, slug, status, description, created, last_validated, "
+            "created_from_task, area, body) VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(project_id, uuid) DO UPDATE SET slug=excluded.slug, status=excluded.status, "
             "description=excluded.description, created=excluded.created, "
             "last_validated=excluded.last_validated, created_from_task=excluded.created_from_task, "
             "area=excluded.area, body=excluded.body",
-            (self.project, memory_id, memory["status"], memory["description"],
+            (self.project, memory_uuid, slug, memory["status"], memory["description"],
              evidence.get("created"), evidence.get("last_validated"),
              evidence.get("created_from_task"), scope.get("area"), json.dumps(memory)),
         )
         self.connection.execute("DELETE FROM labels WHERE project_id=? AND memory_id=?",
-                                (self.project, memory_id))
+                                (self.project, memory_uuid))
         self.connection.executemany(
             "INSERT OR IGNORE INTO labels(project_id, memory_id, label) VALUES (?,?,?)",
-            [(self.project, memory_id, label) for label in memory.get("labels") or []],
+            [(self.project, memory_uuid, label) for label in memory.get("labels") or []],
         )
         self.connection.execute("DELETE FROM files WHERE project_id=? AND memory_id=?",
-                                (self.project, memory_id))
+                                (self.project, memory_uuid))
         self.connection.executemany(
             "INSERT OR IGNORE INTO files(project_id, memory_id, path) VALUES (?,?,?)",
-            [(self.project, memory_id, path) for path in (memory.get("scope") or {}).get("files") or []],
+            [(self.project, memory_uuid, path) for path in (memory.get("scope") or {}).get("files") or []],
         )
         self.connection.execute("DELETE FROM edges WHERE project_id=? AND kind<>'derived' AND src=?",
-                                (self.project, memory_id))
+                                (self.project, memory_uuid))
+        # Bodies reference their targets by slug; edges join on uuid. A target
+        # that does not exist yet is simply not edged - validate_store reads the
+        # bodies, so a dangling reference is still reported there.
         relationships = memory.get("relationships") or {}
-        rows = [(self.project, memory_id, e["id"], "related", e.get("reason"))
-                for e in relationships.get("related") or [] if isinstance(e, dict)]
-        rows += [(self.project, memory_id, t, kind, None)
+        targets = [e["id"] for e in relationships.get("related") or [] if isinstance(e, dict)]
+        targets += [t for kind in ("supersedes", "superseded_by") for t in relationships.get(kind) or []]
+        resolved = self._uuids_for_slugs(targets)
+        rows = [(self.project, memory_uuid, resolved[e["id"]], "related", e.get("reason"))
+                for e in relationships.get("related") or []
+                if isinstance(e, dict) and e["id"] in resolved]
+        rows += [(self.project, memory_uuid, resolved[t], kind, None)
                  for kind in ("supersedes", "superseded_by")
-                 for t in relationships.get(kind) or []]
+                 for t in relationships.get(kind) or [] if t in resolved]
         self.connection.executemany(
             "INSERT OR REPLACE INTO edges(project_id, src, dst, kind, reason) VALUES (?,?,?,?,?)", rows)
-        self._index_text(memory)
-        self._materialize_derived_edges(memory)
+        self._index_text(memory, memory_uuid)
+        self._materialize_derived_edges(memory, memory_uuid)
 
-    def _index_text(self, memory: dict[str, Any]) -> None:
+    def _uuids_for_slugs(self, slugs: Iterable[str]) -> dict[str, str]:
+        wanted = sorted({s for s in slugs if isinstance(s, str)})
+        if not wanted:
+            return {}
+        rows = self.connection.execute(
+            f"SELECT uuid, slug FROM memories WHERE project_id=? "
+            f"AND slug IN ({','.join('?' * len(wanted))})", (self.project, *wanted),
+        ).fetchall()
+        return {row["slug"]: row["uuid"] for row in rows}
+
+    def _index_text(self, memory: dict[str, Any], memory_uuid: str) -> None:
         """Refresh this memory's FTS row, identifiers already case-split."""
         memory_id = memory["id"]
         self.connection.execute(
-            "DELETE FROM memories_fts WHERE project_id=? AND memory_id=?", (self.project, memory_id)
+            "DELETE FROM memories_fts WHERE project_id=? AND memory_id=?", (self.project, memory_uuid)
         )
         scope = memory.get("scope") or {}
         self.connection.execute(
             "INSERT INTO memories_fts(project_id, memory_id, id_text, description, triggers, tags, "
             "labels, facts, pattern, pitfalls, scope_text) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
-                self.project, memory_id,
+                self.project, memory_uuid,
                 _expand(memory_id),
                 _expand(memory.get("description") or ""),
                 _expand(" ".join(memory.get("triggers") or [])),
@@ -746,7 +1050,7 @@ class SqliteMemoryStore:
             ),
         )
 
-    def _materialize_derived_edges(self, memory: dict[str, Any]) -> None:
+    def _materialize_derived_edges(self, memory: dict[str, Any], memory_uuid: str) -> None:
         """Store this memory's strongest label/file neighbours as derived edges.
 
         The file backend recomputed these across every pair on each rebuild,
@@ -757,7 +1061,7 @@ class SqliteMemoryStore:
         the labels and files tables, so a write costs a handful of queries
         rather than one row read per candidate.
         """
-        memory_id = memory["id"]
+        memory_id = memory_uuid
         self.connection.execute(
             "DELETE FROM edges WHERE project_id=? AND kind='derived' AND (src=? OR dst=?)",
             (self.project, memory_id, memory_id),
@@ -818,13 +1122,13 @@ class SqliteMemoryStore:
         related_map = {e["id"]: e["reason"] for e in current["relationships"]["related"]}
         for target_id in related_map:
             if not self.connection.execute(
-                "SELECT 1 FROM memories WHERE project_id=? AND id=?", (self.project, target_id)
+                "SELECT 1 FROM memories WHERE project_id=? AND slug=?", (self.project, target_id)
             ).fetchone():
                 raise StoreError(f"relationships.related references unknown memory: {target_id}")
         for row in self.connection.execute(
-            "SELECT id FROM memories WHERE project_id=? AND id<>?", (self.project, memory_id)
+            "SELECT uuid, body FROM memories WHERE project_id=? AND slug<>?", (self.project, memory_id)
         ).fetchall():
-            other = self.get_memory(row["id"])
+            other = json.loads(row["body"])
             before = json.dumps(other["relationships"], sort_keys=True)
             rel = other["relationships"]
             rel["related"] = [e for e in rel["related"] if e.get("id") != memory_id]
@@ -836,7 +1140,7 @@ class SqliteMemoryStore:
                     values.append(memory_id)
                 rel[target] = values
             if json.dumps(rel, sort_keys=True) != before:
-                self._write(other)
+                self._write(other, row["uuid"])
 
 
 def _expand(text: str) -> str:

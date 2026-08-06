@@ -95,7 +95,8 @@ class SqliteStoreTests(unittest.TestCase):
         self.store.update_memory("a", {"status": "stale"})
         self.assertEqual("stale", self.store.get_memory("a")["status"])
         row = self.store.connection.execute(
-            "SELECT COUNT(*) AS n FROM revisions WHERE project_id='demo' AND memory_id='a'"
+            "SELECT COUNT(*) AS n FROM revisions WHERE project_id='demo' AND memory_id=?",
+            (self.store._uuid_for("a"),),
         ).fetchone()
         self.assertEqual(1, row["n"])
 

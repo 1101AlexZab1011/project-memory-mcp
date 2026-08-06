@@ -51,7 +51,7 @@ class StoreTestCase(unittest.TestCase):
     def corrupt(self, memory):
         """Replace a stored body without going through validation."""
         self.store.connection.execute(
-            "UPDATE memories SET body=? WHERE project_id=? AND id=?",
+            "UPDATE memories SET body=? WHERE project_id=? AND slug=?",
             (json.dumps(memory), self.store.project, memory["id"]),
         )
         self.store.connection.commit()

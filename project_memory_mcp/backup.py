@@ -19,6 +19,7 @@ Snapshots restore exactly; exports restore the durable content. Keep both.
 from __future__ import annotations
 
 import json
+import uuid
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -98,7 +99,7 @@ def export_json(database: Path | str, destination: Path | str, project: str | No
 
         payload: dict[str, Any] = {
             "format": "project-memory-export",
-            "format_version": 1,
+            "format_version": 2,
             "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "source": str(database),
             "projects": {},
@@ -107,7 +108,7 @@ def export_json(database: Path | str, destination: Path | str, project: str | No
             memories = [
                 json.loads(row["body"])
                 for row in connection.execute(
-                    "SELECT body FROM memories WHERE project_id=? ORDER BY id", (name,)
+                    "SELECT body FROM memories WHERE project_id=? ORDER BY slug", (name,)
                 )
             ]
             labels = {
@@ -116,16 +117,24 @@ def export_json(database: Path | str, destination: Path | str, project: str | No
                     "SELECT label, description FROM label_registry WHERE project_id=? ORDER BY label", (name,)
                 )
             }
-            usage = {
-                row["memory_id"]: {
-                    "surfaced": row["surfaced"], "applied": row["applied"],
-                    "last_surfaced": row["last_surfaced"], "last_applied": row["last_applied"],
+            # Keyed by slug and by replica: an export has to survive being read
+            # into a different database, where the uuids will not match, and it
+            # must not collapse two replicas' counters into one.
+            usage: dict[str, dict[str, Any]] = {}
+            for row in connection.execute(
+                "SELECT m.slug AS slug, u.replica_id AS replica_id, u.surfaced AS surfaced, "
+                "u.surfaced_direct AS surfaced_direct, u.applied AS applied, "
+                "u.last_surfaced AS last_surfaced, u.last_applied AS last_applied, "
+                "u.spread_bits AS spread_bits, u.spread_epoch AS spread_epoch "
+                "FROM usage u JOIN memories m ON m.project_id=u.project_id AND m.uuid=u.memory_id "
+                "WHERE u.project_id=? ORDER BY m.slug, u.replica_id", (name,)
+            ):
+                usage.setdefault(row["slug"], {})[row["replica_id"]] = {
+                    "surfaced": row["surfaced"], "surfaced_direct": row["surfaced_direct"],
+                    "applied": row["applied"], "last_surfaced": row["last_surfaced"],
+                    "last_applied": row["last_applied"],
+                    "spread_bits": row["spread_bits"], "spread_epoch": row["spread_epoch"],
                 }
-                for row in connection.execute(
-                    "SELECT memory_id, surfaced, applied, last_surfaced, last_applied "
-                    "FROM usage WHERE project_id=?", (name,)
-                )
-            }
             payload["projects"][name] = {"labels": labels, "memories": memories, "usage": usage}
     finally:
         connection.close()
@@ -137,6 +146,21 @@ def export_json(database: Path | str, destination: Path | str, project: str | No
         "written": str(destination),
         "projects": {name: len(data["memories"]) for name, data in payload["projects"].items()},
     }
+
+
+def _replica_counters(by_replica: Any) -> dict[str, dict[str, Any]]:
+    """Normalize either export shape into {replica_id: counters}.
+
+    Format 1 stored one flat set of counters per memory, from before counters
+    were attributed to a replica. Those belong to whoever wrote that database,
+    which nothing records - so they are parked under a legacy id rather than
+    silently credited to the machine doing the restore.
+    """
+    if not isinstance(by_replica, dict):
+        return {}
+    if any(isinstance(v, dict) for v in by_replica.values()):
+        return {k: v for k, v in by_replica.items() if isinstance(v, dict)}
+    return {"legacy": by_replica}
 
 
 def import_json(database: Path | str, source: Path | str) -> dict[str, Any]:
@@ -163,14 +187,26 @@ def import_json(database: Path | str, source: Path | str) -> dict[str, Any]:
                     pass  # already registered; import is re-runnable
             with store.connection:
                 for memory in data.get("memories") or []:
-                    store._write(memory)
-                for memory_id, counters in (data.get("usage") or {}).items():
-                    store.connection.execute(
-                        "INSERT OR REPLACE INTO usage(project_id, memory_id, surfaced, applied, "
-                        "last_surfaced, last_applied) VALUES (?,?,?,?,?,?)",
-                        (name, memory_id, counters.get("surfaced", 0), counters.get("applied", 0),
-                         counters.get("last_surfaced"), counters.get("last_applied")),
-                    )
+                    existing = store.connection.execute(
+                        "SELECT uuid FROM memories WHERE project_id=? AND slug=?", (name, memory["id"])
+                    ).fetchone()
+                    store._write(memory, existing["uuid"] if existing else str(uuid.uuid4()))
+                for slug, by_replica in (data.get("usage") or {}).items():
+                    row = store.connection.execute(
+                        "SELECT uuid FROM memories WHERE project_id=? AND slug=?", (name, slug)
+                    ).fetchone()
+                    if row is None:
+                        continue  # counters for a memory the export did not carry
+                    for replica_id, counters in _replica_counters(by_replica).items():
+                        store.connection.execute(
+                            "INSERT OR REPLACE INTO usage(project_id, memory_id, replica_id, surfaced, "
+                            "surfaced_direct, applied, last_surfaced, last_applied, spread_bits, "
+                            "spread_epoch) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            (name, row["uuid"], replica_id, counters.get("surfaced", 0),
+                             counters.get("surfaced_direct", 0), counters.get("applied", 0),
+                             counters.get("last_surfaced"), counters.get("last_applied"),
+                             counters.get("spread_bits", 0), counters.get("spread_epoch")),
+                        )
             restored[name] = len(data.get("memories") or [])
         finally:
             store.close()
