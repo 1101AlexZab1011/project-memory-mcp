@@ -143,9 +143,10 @@ TOOLS = [
     ),
     _tool(
         "promote_memory",
-        "Publish one public memory to one named remote. Never publish to every remote: the same "
-        "lesson on several servers then diverges independently. If the remote is unreachable the "
-        "work is queued and retried, and you are told so rather than failing.",
+        "Queue one public memory for publication to one named remote. Never publish to every "
+        "remote: the same lesson on several servers then diverges independently. Delivery "
+        "happens in the background, so the answer is always 'queued' - it tells you the memory "
+        "is allowed out, not that it has arrived. Use outbox_status to see whether it did.",
         {"id": {"type": "string"}, "remote": {"type": "string"},
          "force": {"type": ["boolean", "null"], "default": False,
                    "description": "Publish a memory that has not yet earned a tier. Use only for "
@@ -158,6 +159,14 @@ TOOLS = [
                                           "real credential, edit the memory instead: record "
                                           "where the secret lives, never its value."}},
         ["id", "remote"],
+    ),
+    _tool(
+        "outbox_status",
+        "Memories queued for publication that have not been delivered yet, with the number of "
+        "attempts and the last error. A queued promotion is retried in the background; this is "
+        "how you find out whether it landed, and why not if it did not.",
+        {"limit": {"type": ["integer", "null"], "default": 50}},
+        [],
     ),
     _tool(
         "set_memory_visibility",
@@ -356,6 +365,8 @@ class McpServer:
                 payload = self.store.promote(args["id"], args["remote"],
                                              force=bool(args.get("force")),
                                              allow_secrets=bool(args.get("allow_secrets")))
+            elif name == "outbox_status":
+                payload = self.store.outbox_status(limit=args.get("limit") or 50)
             elif name == "set_memory_visibility":
                 payload = self.store.set_visibility(args["id"], args["visibility"])
             elif name == "send_message":

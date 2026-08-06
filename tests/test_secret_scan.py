@@ -152,7 +152,7 @@ class PromotionGateTests(unittest.TestCase):
             facts=[f"STRIPE_KEY={STRIPE}"]))
         with self.assertRaises(StoreError):
             self.store.promote("leaky", "team", force=True)
-        # With allow_secrets it gets as far as the network, which is not up.
+        # With allow_secrets it passes every gate and reaches the outbox.
         result = self.store.promote("leaky", "team", force=True, allow_secrets=True)
         self.assertEqual("leaky", result["queued"])
 
@@ -161,7 +161,7 @@ class PromotionGateTests(unittest.TestCase):
             "clean", "Where the staging key lives.",
             facts=["It is STRIPE_KEY in .env.staging, rotated quarterly by the platform team."]))
         result = self.store.promote("clean", "team", force=True)
-        self.assertEqual("clean", result["queued"])  # queued: the remote is down
+        self.assertEqual("clean", result["queued"])
 
     def test_promotion_targets_warns_before_the_attempt(self):
         self._public("leaky", memory(

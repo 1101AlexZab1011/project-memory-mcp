@@ -273,8 +273,10 @@ $('#publish').onclick = async () => {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({project: $('#project').value, id: current, remote,
                             force: currentTier < 2})});
-    alert(r.promoted ? `Published ${r.promoted} to ${r.remote}.`
-      : `${r.queued} is queued for ${r.remote} and will be retried: ${r.reason}`);
+    // Queued is the only answer there is: delivery happens in the background,
+    // so promising "published" here would be claiming something unknown.
+    alert(`${r.queued} is queued for ${r.remote}. It will be delivered in the ` +
+          `background; ${r.waiting} item(s) waiting.`);
   } catch (e) { alert(e.message); }
 };
 $('#logout').onclick = async () => {

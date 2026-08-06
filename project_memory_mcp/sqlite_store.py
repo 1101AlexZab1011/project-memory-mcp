@@ -1361,20 +1361,31 @@ class SqliteMemoryStore:
     #: the rare-but-critical lesson that will never accrue usage on its own.
     MIN_PROMOTION_TIER = 2
 
-    def promote(self, memory_id: str, remote: str, private_key: Any = None,
+    def promote(self, memory_id: str, remote: str,
                 force: bool = False, allow_secrets: bool = False) -> dict[str, Any]:
-        """Publish one memory to one named remote.
+        """Queue one memory for publication to one named remote.
 
         Never to all of them: that is how one lesson ends up duplicated across
-        servers with independently diverging edits. If the remote is unreachable
-        the work waits in the outbox rather than failing the agent's call.
+        servers with independently diverging edits.
+
+        **This does not touch the network.** Everything checkable here is checked
+        here, and then the work goes in the outbox for the Computer to deliver.
+        Publishing inline would put a remote's availability on the request path:
+        one promotion to an unreachable server would hold this project's lock for
+        the whole connect timeout, stalling every other request including reads.
+        The delivery machinery already exists and already runs first among jobs;
+        the only reason this used to send inline is that it predates the Computer.
+
+        So the answer is always "queued", never "published". An agent gets an
+        immediate, honest answer about whether the memory is *allowed* out, and
+        finds out separately whether it got there - see ``outbox_status``.
 
         ``force`` overrides the tier requirement; ``allow_secrets`` overrides the
         credential scan. They are separate arguments because they are separate
         judgments - "this matters more than its usage shows" and "that string is
         not a secret" are not the same claim, and one should never imply the other.
         """
-        from . import federation, secret_scan
+        from . import secret_scan
 
         memory_uuid = self._uuid_for(memory_id)
         if self._visibility_of(memory_uuid) != "public":
@@ -1403,24 +1414,49 @@ class SqliteMemoryStore:
         body = self.get_memory(memory_id)
         # Last gate before the memory leaves this machine. A secret in a local
         # memory sits on the host that already has it; this is the crossing.
+        # Checked here as well as at delivery so the refusal reaches whoever can
+        # act on it, rather than only a job log nobody reads.
         if not allow_secrets:
             findings = secret_scan.scan(body)
             if findings:
                 raise StoreError(secret_scan.explain(memory_id, findings))
-        client = federation.RemoteClient(matches[0], self.project, private_key)
-        try:
-            client.call("create_memory", {"memory": body, "visibility": "public",
-                                          "uuid": memory_uuid})
-        except Exception as error:  # queued rather than raised: the agent is not the one waiting
-            with self.connection:
-                self.connection.execute(
-                    "INSERT INTO outbox(project_id, memory_id, remote, queued_at, last_error) "
-                    "VALUES (?,?,?,?,?)", (self.project, memory_uuid, remote, _now(), str(error)))
-            return {"queued": memory_id, "remote": remote, "reason": str(error)}
+
         with self.connection:
-            self.connection.execute("UPDATE remotes SET last_ok=?, last_error=NULL WHERE name=?",
-                                    (_now(), remote))
-        return {"promoted": memory_id, "remote": remote}
+            # Queueing the same memory for the same remote twice would deliver it
+            # twice. Re-queueing is a legitimate thing to ask for - after an edit,
+            # or after a failure - so it refreshes the existing row instead of
+            # refusing, and clears the stale error with it.
+            existing = self.connection.execute(
+                "SELECT id FROM outbox WHERE project_id=? AND memory_id=? AND remote=?",
+                (self.project, memory_uuid, remote)).fetchone()
+            if existing:
+                self.connection.execute(
+                    "UPDATE outbox SET queued_at=?, last_error=NULL WHERE id=?",
+                    (_now(), existing["id"]))
+            else:
+                self.connection.execute(
+                    "INSERT INTO outbox(project_id, memory_id, remote, queued_at) "
+                    "VALUES (?,?,?,?)", (self.project, memory_uuid, remote, _now()))
+        waiting = self.connection.execute(
+            "SELECT COUNT(*) n FROM outbox WHERE project_id=?", (self.project,)).fetchone()["n"]
+        return {"queued": memory_id, "remote": remote, "waiting": waiting,
+                "note": "delivery happens in the background; check outbox_status"}
+
+    def outbox_status(self, limit: int = 50) -> dict[str, Any]:
+        """What is waiting to be published, and why it has not gone yet.
+
+        The receipt for a queued promotion. Without it "queued" is a promise with
+        nothing to check it against.
+        """
+        rows = self.connection.execute(
+            "SELECT o.memory_id, o.remote, o.queued_at, o.attempts, o.last_error, m.slug "
+            "FROM outbox o LEFT JOIN memories m "
+            "  ON m.project_id=o.project_id AND m.uuid=o.memory_id "
+            "WHERE o.project_id=? ORDER BY o.id LIMIT ?", (self.project, limit)).fetchall()
+        return {"count": len(rows), "queued": [
+            {"id": row["slug"] or row["memory_id"], "remote": row["remote"],
+             "queued_at": row["queued_at"], "attempts": row["attempts"],
+             "last_error": row["last_error"]} for row in rows]}
 
     def drain_outbox(self, private_key: Any = None, limit: int = 50) -> dict[str, Any]:
         """Retry queued promotions. Safe to call as often as you like."""
@@ -1461,6 +1497,11 @@ class SqliteMemoryStore:
             sent.append(body["id"])
             with self.connection:
                 self.connection.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
+                # Recorded here because this is now the only place a delivery
+                # succeeds, so it is the only place that knows the remote is up.
+                self.connection.execute(
+                    "UPDATE remotes SET last_ok=?, last_error=NULL WHERE name=?",
+                    (_now(), row["remote"]))
         result = {"sent": sent, "still_queued": len(rows) - len(sent)}
         if held:
             # Named separately from a delivery failure: retrying will not help,

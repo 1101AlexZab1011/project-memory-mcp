@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -246,10 +247,62 @@ class TwoServerTests(TierCase):
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
         self.earn("cache-race")
         result = self.store.promote("cache-race", "team")
-        self.assertEqual("cache-race", result["promoted"])
+        # Queued, not published: promote never speaks to the network. The
+        # Computer's outbox job is what delivers.
+        self.assertEqual("cache-race", result["queued"])
+        self.assertNotIn("promoted", result)
+        self.store.drain_outbox()
         found = self.store.federated_recall("cache invalidation races auth", limit=5)
         entry = [m for m in found["memories"] if m["id"] == "cache-race"][0]
         self.assertEqual(["local", "team"], entry["sources"])
+
+    def test_promotion_does_not_touch_the_network(self):
+        # The point of the whole change. A remote that black-holes the
+        # connection would previously have held this project's lock for the full
+        # connect timeout, stalling every other request including reads.
+        federation.add_remote(self.store.connection, "blackhole", "http://192.0.2.1:9/", "down")
+        self.store.create_memory(memory("cache-race", CACHE), visibility="public")
+        self.earn("cache-race")
+        started = time.monotonic()
+        result = self.store.promote("cache-race", "blackhole")
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual("cache-race", result["queued"])
+
+    def test_queueing_the_same_memory_twice_does_not_send_it_twice(self):
+        self.store.create_memory(memory("cache-race", CACHE), visibility="public")
+        self.earn("cache-race")
+        self.store.promote("cache-race", "team")
+        self.store.promote("cache-race", "team")
+        self.assertEqual(1, self.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM outbox").fetchone()["n"])
+        self.assertEqual(["cache-race"], self.store.drain_outbox()["sent"])
+
+    def test_outbox_status_reports_what_is_waiting_and_why(self):
+        federation.add_remote(self.store.connection, "flaky", "http://127.0.0.1:9/", "down")
+        self.store.create_memory(memory("cache-race", CACHE), visibility="public")
+        self.earn("cache-race")
+        self.store.promote("cache-race", "flaky")
+
+        queued = self.store.outbox_status()
+        self.assertEqual(1, queued["count"])
+        self.assertEqual("cache-race", queued["queued"][0]["id"])
+        self.assertEqual(0, queued["queued"][0]["attempts"])
+        self.assertIsNone(queued["queued"][0]["last_error"])
+
+        self.store.drain_outbox()
+        after = self.store.outbox_status()
+        self.assertEqual(1, after["queued"][0]["attempts"])
+        self.assertTrue(after["queued"][0]["last_error"])
+
+    def test_a_delivered_promotion_records_that_the_remote_is_up(self):
+        self.store.create_memory(memory("cache-race", CACHE), visibility="public")
+        self.earn("cache-race")
+        self.store.promote("cache-race", "team")
+        self.store.drain_outbox()
+        row = self.store.connection.execute(
+            "SELECT last_ok, last_error FROM remotes WHERE name='team'").fetchone()
+        self.assertTrue(row["last_ok"])
+        self.assertIsNone(row["last_error"])
 
     def test_a_queued_promotion_is_sent_when_the_remote_returns(self):
         federation.add_remote(self.store.connection, "flaky", "http://127.0.0.1:9/", "down")
