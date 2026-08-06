@@ -323,8 +323,18 @@ three million memories takes the same fifteen seconds as joining an empty one.
 ## Network
 
 Radmin is the wrong dependency: Windows and iOS only, nothing for Android or Linux, and
-proprietary. The current client config also hardcodes `26.114.199.95`, a Radmin-leased address,
-so every client breaks if the host, network, or tunnel changes.
+proprietary. The leased address `26.114.199.95` is also hardcoded in three places, so every one
+of them breaks if the host, network, or tunnel changes:
+
+```text
+<project>/.mcp.json                          client
+<project>/.codex/config.toml                 client
+<host>/project-memory/run-server.cmd         server bind
+```
+
+The clients cannot stop hardcoding an address until there is a *name* to point at, and that
+name comes from the overlay's DNS. So de-hardcoding is not independent work to do first — it
+lands with the network switch, in one pass.
 
 **Use a WireGuard-based overlay and refer to the server by name.** Tailscale covers every
 platform, traverses NAT automatically so a laptop works away from the LAN, and gives stable
