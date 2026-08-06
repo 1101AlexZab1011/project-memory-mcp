@@ -332,15 +332,23 @@ specific ways — each of which breaks something above.
 | Revocation | A lost laptop means rotating for everyone, so nobody rotates |
 | Permissions | The edit table above is advisory; anyone reaching the port can delete the store |
 
-**Per-client credentials.**
+**Identity is a keypair, not a token.**
 
 ```sql
-clients(client_id PK, replica_uuid, name, role, token_hash,
+clients(client_id PK, public_key, fingerprint, replica_uuid, name, role,
         project_scope, created, last_seen, revoked)
 ```
 
-Store the hash, never the token — this server ships scheduled backups and JSON export, and
-plaintext credentials would leave in every snapshot. The table is excluded from export.
+Each client generates an Ed25519 keypair on first run. The private key never leaves the machine
+and is never transmitted — not at enrollment, not per request, not ever. The server stores only
+the public key, so there is nothing secret in the table, nothing to leak through the scheduled
+backups and JSON exports this server ships, and nothing an operator could accidentally expose.
+
+That is a straight improvement over a token even for a single server. But the reason it belongs
+here rather than in a later phase is federation: **the same public key enrolled at several
+servers is verifiably the same actor**, with no central authority and no coordination between
+them. Token-based credentials cannot give that, and retrofitting keys after servers have issued
+tokens means re-enrolling every client.
 
 Two roles cover the real cases. **contributor** promotes, edits, and marks status.
 **admin** additionally hard-deletes, enrolls, and revokes.
@@ -349,6 +357,42 @@ Two roles cover the real cases. **contributor** promotes, edits, and marks statu
 token currently opens all of them; a credential should open only the projects its holder works
 on.
 
+### How a request is authenticated
+
+Agents sign; the browser keeps a session cookie. Two different clients with genuinely different
+constraints — a browser cannot hold a private key safely, an agent can.
+
+An agent signs a canonical string over the method, path, a timestamp and a hash of the body, and
+sends the signature with its key fingerprint. The server looks up the key and verifies. Stale
+timestamps are rejected, which is what stops a captured request being replayed.
+
+This matters more here than it would elsewhere, because of the deployment posture: with no TLS,
+a bearer token on the wire is readable by anyone on the path, and a reader becomes a writer.
+A signature is equally readable and useless — it authorises one request, once. On a trusted
+overlay that is belt and braces; on a plain LAN it is the difference between eavesdropping and
+takeover.
+
+### Enrollment, without transmitting a secret
+
+1. An admin creates a client entry and gets a short code, valid 15 minutes, single use.
+2. The new machine generates its keypair locally.
+3. It sends the code, its **public** key, and a display name.
+4. The server checks the code, burns it, and stores the key against a new client row.
+5. Nothing secret ever crossed the wire, in either direction.
+
+A leaked code after use is worthless; before use its window is fifteen minutes and one attempt.
+Compare this with issuing a token: there, the credential itself travels, and whoever sees it
+holds it.
+
+**Key loss is re-enrollment.** A dead laptop means generating a new key and enrolling again as a
+new client. Past attribution stays as it was — it is history, and history should not be editable
+by whoever holds the newest key. Rotation works the same way, which means an identity does not
+survive rotation; that is a real limitation and the simple behaviour is the right starting point.
+
+**Private keys are stored unencrypted with restricted file permissions.** A passphrase would
+mean no agent could start unattended, which defeats the purpose. The key is exactly as sensitive
+as the machine it sits on.
+
 ### Attribution
 
 Each client is named at enrollment — "alex-desktop", "ci-runner", "laptop" — and the server
@@ -356,29 +400,35 @@ records that name against every write it accepts: creation, promotion, status ma
 edits, merges, deletions. The `revisions` table already stores prior bodies, so adding the
 client id there yields a full "who changed what, when" history at nearly no cost.
 
-The name must be a *display field*, never the identity. Attribution keys on the credential's
-`client_id`; renaming a machine then leaves history intact, and two people picking "laptop" is
-harmless. This is the same rule as memory slugs, for the same reason.
-
-A self-asserted name is trustworthy here only because the server issues the credential and
-stores the name beside it, so a client cannot write under someone else's identity. This is why
-attribution requires per-client credentials and cannot be retrofitted onto a shared token.
+The name must be a *display field*, never the identity. Attribution keys on the credential;
+renaming a machine leaves history intact, and two people picking "laptop" is harmless. This is
+the same rule as memory slugs, for the same reason.
 
 Naming is a setup decision made by a person, defaulting to the hostname — not something an
 agent invents per session, which would scatter history across names that identify nothing.
+
+**Attribution records the key fingerprint, not only the name.** This is what makes it mean
+anything across servers. A display name is issued by one server and unverifiable anywhere else:
+`bob-laptop` on the team server and `bob-laptop` somewhere else are two unrelated rows that
+happen to share a string. A fingerprint is the same everywhere, because it is derived from a key
+only Bob can use.
+
+So the honest reading of provenance is two-layered, and the UI should show both:
+
+| Shown | Means | Trust |
+|---|---|---|
+| `bob-laptop` | what that server calls this client | one server's word |
+| `SHA256:kP3f…` | the key that signed the write | verifiable, and the same everywhere |
+
+Without keys, the only safe rule was "reply where you met them" — you could never tell whether a
+name on another server was the same person. With them, Alice can recognise Bob's fingerprint on
+a second server and know it is the same actor, with no authority vouching for either of them.
+That is the property that makes federated identity work at all, and it costs one column.
 
 Where it surfaces: always in the UI, and in `get_memory` detail. Not in every `recall` hit,
 where it would spend context on provenance the agent usually does not need. It earns its place
 on the detail view — knowing a memory came from someone else's machine is exactly the context
 that explains why it describes a build command yours doesn't have.
-
-**Joining** must not send the real credential over chat or email:
-
-1. An admin creates a client in the UI and receives a short code, valid 15 minutes, single use.
-2. The new machine runs the join command with the server address and that code.
-3. It generates its own replica UUID and sends it with the code.
-4. The server burns the code, creates the client row, and returns a long-lived token.
-5. The client stores the token with restricted file permissions.
 
 A leaked code after use is worthless; before use its window is fifteen minutes and one attempt.
 
@@ -499,6 +549,12 @@ what enforces it.
 - **Federation weakens no-longer-true.** A memory corrected on one server stays wrong on
   another. Nothing propagates a correction across sources, by design — which is the cost of
   letting sources differ, and it is paid in stale answers rather than in conflicts.
+- **An identity does not survive key rotation.** A rotated or lost key enrolls as a new client,
+  so continuity across a laptop replacement is broken by design. Preserving it would mean one
+  key signing an assertion about another, which is a certificate chain and a much larger idea.
+- **Public-key crypto is the first hard dependency.** Ed25519 is not in the standard library.
+  Shelling out to `ssh-keygen -Y` avoids the dependency at the cost of requiring OpenSSH and
+  making every verification a subprocess; a library is the better trade, but it is a trade.
 
 ## Phases
 
@@ -511,9 +567,11 @@ what enforces it.
    alone: install, create a local database, install skills, write client config. Local-only by
    default, no network involved, no remote required. This is small and it comes before anything
    distributed, because it is what makes the rest reachable.
-10. **Per-client credentials.** Client table, named identity, roles, enrollment codes, project
-    scoping, revocation. Attribution on every write. Also where the hardcoded address is
-    removed, since clients then refer to servers by name.
+10. **Keypair identity and per-client credentials.** Ed25519 per client, generated locally
+    and never transmitted; signed requests for agents, sessions for the browser; enrollment
+    codes that carry a public key rather than issue a secret; roles, project scoping,
+    revocation; attribution recording the fingerprint alongside the name. Also where the
+    hardcoded address is removed, since clients then refer to servers by name.
 11. **Federation.** A remotes table, parallel fan-out with deadlines, rank fusion, the
     origin-tagged cache, the promotion outbox, and description-driven promotion routing.
 12. **Messaging, if a gap survives.** A question that lands with a specific client's human,
