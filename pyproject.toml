@@ -35,4 +35,4 @@ project-memory-mcp = "project_memory_mcp.cli:main"
 packages = ["project_memory_mcp"]
 
 [tool.setuptools.package-data]
-project_memory_mcp = ["templates/*", "skills/*/SKILL.md"]
+project_memory_mcp = ["templates/*", "skills/*/SKILL.md", "assets/*"]

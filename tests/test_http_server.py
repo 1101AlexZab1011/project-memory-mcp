@@ -129,31 +129,52 @@ class HttpServerTests(unittest.TestCase):
     def test_concurrent_requests_do_not_corrupt_the_connection(self):
         # ThreadingHTTPServer hands requests to arbitrary threads; SQLite
         # connections are not thread-safe, so this would fail without the lock.
-        # Failures are captured rather than raised inside the workers, so when
-        # this does fail it says what happened instead of only that a count was
-        # wrong. It has failed roughly one full-suite run in four on Windows -
-        # never in isolation - which points at load from the rest of the suite
-        # rather than at this server. Recording the cause is how that gets
-        # settled the next time it happens.
-        results: list[object] = []
+        #
+        # The barrier is the point. Started without one, four threads spawned in
+        # a loop can each finish before the next begins, and the test passes
+        # having never overlapped a single request - proving nothing about the
+        # thing it is named after. Releasing them together is what makes the
+        # contention real.
+        #
+        # Failures are captured per worker rather than raised, and sorted into
+        # two kinds, because they mean opposite things. A non-200 is the server
+        # getting it wrong - the lock. A transport error is this machine running
+        # out of sockets under the rest of the suite, which is not this server's
+        # defect and should not be read as one. Both still fail; only the
+        # message differs, because a test that hides one of them is worse than
+        # a test that occasionally reports the environment.
+        statuses: list[int] = []
+        transport: list[str] = []
         guard = threading.Lock()
+        ready = threading.Barrier(4, timeout=30)
 
         def hammer():
+            ready.wait()
             for _ in range(5):
                 try:
-                    outcome: object = self.call(
-                        "recall", {"query": "cache", "limit": 1, "full_count": 0})[0]
+                    status = self.call("recall", {"query": "cache", "limit": 1, "full_count": 0})[0]
                 except Exception as error:  # noqa: BLE001 - the point is to name it
-                    outcome = f"{type(error).__name__}: {error}"
-                with guard:
-                    results.append(outcome)
+                    with guard:
+                        transport.append(f"{type(error).__name__}: {error}")
+                else:
+                    with guard:
+                        statuses.append(status)
 
         threads = [threading.Thread(target=hammer) for _ in range(4)]
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=30)
+            t.join(timeout=60)
 
-        self.assertEqual(20, len(results), f"some workers did not finish: {results}")
-        bad = [r for r in results if r != 200]
-        self.assertEqual([], bad, f"{len(bad)} of 20 concurrent requests did not return 200: {bad}")
+        self.assertEqual(
+            [], transport,
+            f"{len(transport)} of 20 requests never reached the server. This is a connection "
+            f"failure, not a wrong answer - suspect socket exhaustion from the rest of the "
+            f"suite before suspecting the lock: {transport}")
+        self.assertEqual(20, len(statuses),
+                         f"only {len(statuses)} of 20 workers finished")
+        bad = [s for s in statuses if s != 200]
+        self.assertEqual(
+            [], bad,
+            f"{len(bad)} of 20 concurrent requests did not return 200: {bad}. A non-200 here "
+            f"means the store was touched from two threads at once.")

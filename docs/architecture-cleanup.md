@@ -229,6 +229,16 @@ gets most of the value for almost nothing.
 
 **Done when** renaming an element id in the HTML without updating the script fails the suite.
 
+### Outcome ✔
+
+`assets/app.js`, read at import and inlined at serve time. One self-contained document over the
+wire, exactly as before; the difference is that 175 lines are now a file a linter, an editor and
+a test can read. `ui.py` drops from 300 lines to 125.
+
+`tests/test_ui_assets.py` checks both directions — every `$('#id')` the script queries exists in
+the markup, and every id the markup defines is queried. Verified by renaming `id="publish"` to
+`id="publishBtn"`: both directions fail and name the id.
+
 ## Step 6 — Settle the flaky test
 
 No work to schedule, only a trigger. The instrumentation from `6038ba6` records the failing
@@ -241,6 +251,28 @@ the contention it claims to.
 
 **Do not** mark it skip or add a retry. A test that fails one run in four is reporting
 something.
+
+### Outcome — improved, not proven ✔
+
+The barrier is in, and it mattered more than expected: without it, four threads spawned in a
+loop could each finish before the next began, so the test could pass having never overlapped a
+single request. It was not reliably exercising the thing it is named after.
+
+Failures are now sorted into two kinds, because they mean opposite things. A non-200 is the
+server getting it wrong — the lock. A transport error is this machine running out of sockets
+under the rest of the suite, which is not this server's defect. Both still fail; only the
+message differs.
+
+**Nine consecutive clean full-suite runs.** At the historical rate of roughly one failure in
+four, nine clean runs would happen about 7% of the time — so this is evidence, not proof.
+
+A plausible mechanism exists and is worth recording: before step 1, `promote` opened outbound
+connections inline, and the federation tests promote repeatedly to dead addresses
+(`127.0.0.1:9`, `192.0.2.1:9`). Every one of those was a real connect attempt leaving a socket
+in `TIME_WAIT`. Moving promotion onto the outbox removed that traffic from the suite entirely,
+which fits the socket-exhaustion reading of the original failure. Fits — it does not confirm.
+
+The instrumentation stays. If it recurs, it now says which kind it was.
 
 ## Not doing
 
