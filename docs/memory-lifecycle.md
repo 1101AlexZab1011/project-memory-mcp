@@ -1,4 +1,4 @@
-# Memory Lifecycle and Distribution (0.5.0)
+# Memory Lifecycle and Distribution (0.6.0)
 
 ## Purpose
 
