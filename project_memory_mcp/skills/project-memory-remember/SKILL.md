@@ -131,6 +131,9 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
      both then surface for the same query and neither is authoritative.
    - Create a new memory only when the lesson is genuinely separate, not merely a new
      instance of a stored pattern - in that case extend the existing memory's `triggers`.
+   - **Keep these results.** The memories that ranked highest against the draft are the same
+     ones most likely to deserve a `related` link, so this one call answers both questions.
+     Step 7 reuses them rather than searching again.
 
 5. Write compact valid JSON.
    Use this structure (set `scope.project` to this project's name):
@@ -177,17 +180,26 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
 
 7. Cross-link related memories.
    - This step runs whenever a memory is created, or whenever an existing memory's `remembered_facts`, `solution_pattern`, or `pitfalls` change substantively. Skip it for pure status changes (e.g. marking something `stale` or `wrong`).
-   - Call `recall` with `related_to` set to the new/changed memory's id. It ranks the store by
-     degree of relatedness - authored links first, then memories reachable through the graph -
-     so you get ordered candidates instead of an unordered cluster to sift.
-   - Work down that ranking and stop when the candidates stop being genuinely related. The
-     scores are a prompt for judgment, not a threshold to apply mechanically.
-   - If MCP is unavailable, compare the new/changed memory's `labels` and `description` against the same fields in `.project-memory/active/*.json`. Read only those fields; do not study whole memories just to check relatedness.
+   - **Write links on one side only.** The store mirrors them: it copies each `{id, reason}`
+     onto the target memory automatically, with the identical reason string, and mirrors
+     `supersedes`/`superseded_by` too. Adding the back-reference by hand is not just redundant -
+     each one is another `update_memory`, and every write re-validates the whole store.
+   - **For a new memory**, take the candidates from step 4 and put the links straight into the
+     initial `create_memory` call. Do not call `recall` with `related_to` for a memory that does
+     not exist yet - it resolves the id and will fail.
+   - **For an existing memory**, call `recall` with `related_to` set to its id. That ranks the
+     store by degree of relatedness: authored links first, then memories reachable through the
+     graph.
+   - Work down the ranking and stop when candidates stop being genuinely related. Scores are a
+     prompt for judgment, not a threshold to apply mechanically. Check `why` before trusting a
+     result - a candidate carried by `graph` score is a neighbour of something relevant, and for
+     a brand-new memory it has no graph position at all, so text and label overlap are the only
+     real signals at creation time.
    - Apply a real quality bar: link only when there is genuine subsystem, error-mode, or file overlap, not superficial topical resemblance.
-   - For each memory judged related, author one `reason` string and reuse the identical string on both sides.
-   - Update the new/changed memory's own `relationships.related` with `{id, reason}` entries for every related memory found.
-   - For each related memory, add a matching `{id, reason}` entry pointing back at the new/changed memory.
+   - Author one `reason` string per pair, phrased to make sense read from either end, since both
+     sides get that same sentence.
    - `relationships.supersedes` / `relationships.superseded_by` stay plain memory-id arrays.
+   - If MCP is unavailable, compare the new/changed memory's `labels` and `description` against the same fields in `.project-memory/active/*.json`. Read only those fields; do not study whole memories just to check relatedness.
 
 8. Keep memories granular.
    - One memory = one reusable lesson.
