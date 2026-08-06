@@ -326,12 +326,19 @@ def outbox_status(store: Any, limit: int = 50) -> dict[str, Any]:
          "last_error": row["last_error"]} for row in rows]}
 
 
-def deliver_outbox(store: Any, private_key: Any = None, limit: int = 50) -> dict[str, Any]:
+def deliver_outbox(store: Any, private_key: Any = None, limit: int = 50,
+                   db_lock: Any = None) -> dict[str, Any]:
     """Send everything queued for publication. Safe to call as often as you like.
 
     The other half of the outbox. `promote` decides whether a memory may leave;
     this decides whether it can get there, which is the part that needs a
     network and therefore the part that must not run on a request thread.
+
+    ``db_lock`` is taken around each item's database work and released across
+    the send. Holding it for the whole drain would reproduce, in the background
+    worker, exactly the bug the outbox was built to fix: fifty queued items to a
+    dead server is fifty connect timeouts, and with the lock held that is
+    minutes in which no request for this project can be served.
 
     Bookkeeping happens against the store's connection rather than through store
     methods, because delivery is this module's job and giving the store an API
@@ -339,13 +346,14 @@ def deliver_outbox(store: Any, private_key: Any = None, limit: int = 50) -> dict
     """
     from . import secret_scan
 
-    rows = store.connection.execute(
-        "SELECT o.id, o.memory_id, o.remote, m.slug FROM outbox o "
-        "LEFT JOIN memories m ON m.project_id=o.project_id AND m.uuid=o.memory_id "
-        "WHERE o.project_id=? ORDER BY o.id LIMIT ?", (store.project, limit)).fetchall()
+    with _held(db_lock):
+        rows = store.connection.execute(
+            "SELECT o.id, o.memory_id, o.remote, m.slug FROM outbox o "
+            "LEFT JOIN memories m ON m.project_id=o.project_id AND m.uuid=o.memory_id "
+            "WHERE o.project_id=? ORDER BY o.id LIMIT ?", (store.project, limit)).fetchall()
+        by_name = {r.name: r for r in list_remotes(store.connection, enabled_only=True)}
     sent: list[str] = []
     held: list[str] = []
-    by_name = {r.name: r for r in list_remotes(store.connection, enabled_only=True)}
     for row in rows:
         remote = by_name.get(row["remote"])
         if remote is None:
@@ -353,27 +361,30 @@ def deliver_outbox(store: Any, private_key: Any = None, limit: int = 50) -> dict
         # Scanned again on the way out, not only on the way in: the body is
         # re-read here, so an edit made while the item sat in the queue would
         # otherwise ship unexamined.
-        body = store.get_memory(row["slug"])
-        findings = secret_scan.scan(body)
+        with _held(db_lock):
+            body = store.get_memory(row["slug"])
+            findings = secret_scan.scan(body)
+            if findings:
+                held.append(body["id"])
+                with store.connection:
+                    store.connection.execute(
+                        "UPDATE outbox SET last_error=? WHERE id=?",
+                        ("held: " + "; ".join(f.describe() for f in findings), row["id"]))
         if findings:
-            held.append(body["id"])
-            with store.connection:
-                store.connection.execute(
-                    "UPDATE outbox SET last_error=? WHERE id=?",
-                    ("held: " + "; ".join(f.describe() for f in findings), row["id"]))
             continue
         try:
+            # No lock here. This is the part that waits on somebody else.
             RemoteClient(remote, store.project, private_key).call(
                 "create_memory", {"memory": body, "visibility": "public",
                                   "uuid": row["memory_id"]})
         except Exception as error:  # noqa: BLE001 - any failure means "try again later"
-            with store.connection:
+            with _held(db_lock), store.connection:
                 store.connection.execute(
                     "UPDATE outbox SET attempts=attempts+1, last_error=? WHERE id=?",
                     (str(error), row["id"]))
             continue
         sent.append(body["id"])
-        with store.connection:
+        with _held(db_lock), store.connection:
             store.connection.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
             # Recorded here because this is the only place a delivery succeeds,
             # so it is the only place that learns the remote is up.

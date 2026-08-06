@@ -82,7 +82,7 @@ class QueueTests(ComputerCase):
     def test_a_failing_job_is_recorded_and_does_not_stop_the_worker(self):
         computer = self.computer()
         boom = Job(priority=1, key="boom:demo", project="demo", kind="boom",
-                   run=lambda store: (_ for _ in ()).throw(RuntimeError("job exploded")))
+                   run=lambda store, guard: (_ for _ in ()).throw(RuntimeError("job exploded")))
         result = computer.run_one(boom)
         self.assertEqual("failed", result["outcome"])
         self.assertIn("job exploded", computer.last_error)
@@ -282,3 +282,113 @@ class SchedulerTests(ComputerCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LockDisciplineTests(ComputerCase):
+    """A job holds the project lock for its database work and nothing else.
+
+    This was wrong in a way that hid: run_one took the lock around the whole
+    job, so the slicing meant nothing - a sliced job slept between slices while
+    still holding it, which is worse than not sleeping at all, and the outbox
+    job waited on other people's servers with it held. Chunking a job cannot fix
+    that; only handing the lock to the job can.
+    """
+
+    def seed(self, n, label_pool=("area:x",)):
+        store = SqliteMemoryStore(self.db, "demo", create=False)
+        for i in range(n):
+            body = memory(f"mem-{i:03d}", f"{CACHE} variation {i}")
+            body["scope"]["files"] = ["Source/Cache.cpp"]
+            store.create_memory(body)
+        store.close()
+
+    def contention(self, kind, **kwargs):
+        """Run a job and measure the longest an outsider waited for the lock.
+
+        Counting successful grabs is not enough - a watcher running before and
+        after the job grabs it freely either way, which made an earlier version
+        of this pass against the very bug it was written for. The question is
+        how long a request would have been stalled, so that is what is measured.
+        """
+        from project_memory_mcp.computer import make_job
+
+        lock = threading.Lock()
+        waits: list[float] = []
+        stop = threading.Event()
+
+        def outsider():
+            while not stop.is_set():
+                started = time.perf_counter()
+                if lock.acquire(timeout=30):
+                    waits.append(time.perf_counter() - started)
+                    lock.release()
+                time.sleep(0.002)
+
+        computer = Computer(open_store=self.open_store, lock_for=lambda _p: lock)
+        watcher = threading.Thread(target=outsider, daemon=True)
+        watcher.start()
+        try:
+            began = time.perf_counter()
+            result = computer.run_one(make_job(kind, "demo", **kwargs))
+            elapsed = time.perf_counter() - began
+        finally:
+            stop.set()
+            watcher.join(timeout=10)
+        return result, max(waits, default=0.0), elapsed
+
+    def test_a_sliced_dedup_lets_requests_through_while_it_runs(self):
+        self.seed(60)
+        result, longest_wait, elapsed = self.contention("dedup", chunk=5)
+        self.assertEqual("ok", result["outcome"])
+        self.assertLess(
+            longest_wait, elapsed / 2,
+            f"a request waited {longest_wait:.2f}s of a {elapsed:.2f}s dedup - the job is "
+            "holding the project lock across its slices instead of between them")
+
+    def test_dedup_examines_every_pair_across_slices(self):
+        # Slicing must not lose pairs: a stable ordering and a moving offset are
+        # what make one pass over the edge set add up.
+        self.seed(30)
+        store = self.open_store("demo")
+        try:
+            # A limit high enough that neither side truncates, or this
+            # compares a capped list against an uncapped one.
+            whole = maintenance.duplicate_candidates(store, limit=10_000)
+            sliced, offset, seen = [], 0, 0
+            while True:
+                page = maintenance.duplicate_candidates(
+                    store, limit=10_000, offset=offset, scan=4)
+                sliced.extend(page["candidates"])
+                seen += page["examined"]
+                offset = page["next_offset"]
+                if not page["remaining"]:
+                    break
+        finally:
+            store.close()
+        self.assertEqual(whole["examined"], seen)
+        self.assertEqual(
+            sorted(tuple(sorted(m["id"] for m in p["memories"])) for p in whole["candidates"]),
+            sorted(tuple(sorted(m["id"] for m in p["memories"])) for p in sliced))
+
+    def test_the_outbox_does_not_hold_the_lock_while_waiting_on_a_remote(self):
+        # The step-1 bug, in the worker rather than the request path. A queue of
+        # promotions to a dead server is a queue of connect timeouts.
+        from project_memory_mcp import federation
+
+        self.seed(1)
+        store = self.open_store("demo")
+        try:
+            federation.add_remote(store.connection, "blackhole", "http://192.0.2.1:9/", "down")
+            store.set_visibility("mem-000", "public")
+            federation.promote(store, "mem-000", "blackhole", force=True)
+        finally:
+            store.close()
+
+        result, longest_wait, elapsed = self.contention("outbox")
+        self.assertEqual("ok", result["outcome"])
+        # Nearly all of `elapsed` is the connect timeout. None of it should be
+        # time anybody else spent waiting for this project.
+        self.assertLess(
+            longest_wait, elapsed / 2,
+            f"a request waited {longest_wait:.2f}s of a {elapsed:.2f}s outbox drain - the "
+            "lock is held across the network call")

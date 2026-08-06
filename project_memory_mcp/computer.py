@@ -75,7 +75,7 @@ class Job:
     key: str = field(compare=False)
     project: str = field(compare=False)
     kind: str = field(compare=False)
-    run: Callable[[Any], dict[str, Any]] = field(compare=False, repr=False)
+    run: Callable[[Any, Any], dict[str, Any]] = field(compare=False, repr=False)
 
 
 class Budget:
@@ -164,8 +164,13 @@ class Computer:
         store = None
         try:
             store = self.open_store(job.project)
-            with self.lock_for(job.project):
-                detail = job.run(store)
+            # The lock is handed to the job, not held around it. Holding it for
+            # the whole run is what the chunking was supposed to avoid, and it
+            # silently defeated it: a sliced job slept between slices while
+            # still holding the lock, which is worse than not sleeping, and the
+            # outbox job waited on other people's servers with it held. A job
+            # takes this for its database work and drops it for everything else.
+            detail = job.run(store, self.lock_for(job.project))
             outcome, self.completed = "ok", self.completed + 1
         except Exception as error:  # noqa: BLE001 - a job may fail any number of ways
             detail = {"error": str(error), "traceback": traceback.format_exc(limit=3)}
@@ -202,45 +207,82 @@ class Computer:
 
 # ------------------------------------------------------------------------ jobs
 #
-# Each takes an open store and returns what it did. They are ordinary functions
-# so they can be called directly in a test or from the CLI without a worker.
+# Each takes an open store and a `guard` - the project lock - and returns what it
+# did. A job holds the guard only while it touches the database and drops it for
+# anything else: waiting on a remote, or simply pausing between slices. Holding
+# it for the whole run is the mistake this signature exists to prevent.
+#
+# They are ordinary functions, so a test or the CLI can call one directly by
+# passing any lock (or `threading.Lock()` if there is nothing to serialise).
 
 
-def audit_job(store: Any, apply: bool = True, policy: Any = None) -> dict[str, Any]:
-    """Tier, archive and clean one project."""
+def audit_job(store: Any, guard: Any, apply: bool = True, policy: Any = None) -> dict[str, Any]:
+    """Tier, archive and clean one project.
+
+    Held for the whole sweep, deliberately: a verdict is computed from counters
+    that a concurrent write could change underneath it, and half an audit is
+    worse than a slow one. This is the job to slice first if a project ever
+    grows large enough for the hold to be felt.
+    """
     from .audit import AuditPolicy, run_audit
 
-    report = run_audit(store, policy=policy or AuditPolicy(), apply=apply)
+    with guard:
+        report = run_audit(store, policy=policy or AuditPolicy(), apply=apply)
     return report.summary()
 
 
-def outbox_job(store: Any) -> dict[str, Any]:
+def outbox_job(store: Any, guard: Any) -> dict[str, Any]:
     """Deliver everything queued for publication.
 
     Not a retry path but the only path: `promote` never sends, so this is how a
     memory reaches a remote at all. That is why it runs first among jobs -
     somebody is waiting on the far end of a promotion and nobody is waiting on
     a sweep.
+
+    `deliver_outbox` takes the guard per item and releases it across each send,
+    so a queue of promotions to a dead server costs its connect timeouts without
+    blocking a single read.
     """
     from .federation import deliver_outbox
 
-    return deliver_outbox(store)
+    return deliver_outbox(store, db_lock=guard)
 
 
-def dedup_job(store: Any, threshold: float = 0.6, limit: int = 25) -> dict[str, Any]:
+def dedup_job(store: Any, guard: Any, threshold: float = 0.6, limit: int = 25,
+              chunk: int = 200) -> dict[str, Any]:
     """Find near-duplicate pairs and record how many are waiting for a decision.
 
     Nominates only. Deciding whether two memories are one lesson is a reading
     comprehension question, and this is the wrong place to answer it.
+
+    Sliced because it is the most expensive job by a wide margin: every
+    candidate pair means two body reads and two tokenisations, and the pair
+    count grows with the edge count. Measured at 46ms for 200 memories and
+    1.6s for 800 - which as one unbroken hold would stall every request for
+    that project for the whole of it.
     """
     from .maintenance import duplicate_candidates
 
-    found = duplicate_candidates(store, limit=limit, threshold=threshold)
-    return {"candidates": found["count"],
-            "pairs": [[m["id"] for m in pair["memories"]] for pair in found["candidates"][:limit]]}
+    best: list[dict[str, Any]] = []
+    offset, examined = 0, 0
+    while True:
+        with guard:
+            found = duplicate_candidates(store, limit=limit, threshold=threshold,
+                                         offset=offset, scan=chunk)
+        examined += found["examined"]
+        # Trimmed every slice rather than accumulated: only the strongest
+        # candidates are ever reported, and holding every body in memory to
+        # throw most of them away at the end would be its own problem.
+        best = sorted(best + found["candidates"], key=lambda p: -p["score"])[:limit]
+        offset = found["next_offset"]
+        if not found["remaining"]:
+            break
+        time.sleep(YIELD_SECONDS)  # lock released above; this is a real yield
+    return {"candidates": len(best), "examined": examined,
+            "pairs": [[m["id"] for m in pair["memories"]] for pair in best]}
 
 
-def reindex_job(store: Any, chunk: int = 500) -> dict[str, Any]:
+def reindex_job(store: Any, guard: Any, chunk: int = 500) -> dict[str, Any]:
     """Rebuild the similarity graph in bounded slices.
 
     Derived edges are computed per write, which means the graph reflects
@@ -250,15 +292,16 @@ def reindex_job(store: Any, chunk: int = 500) -> dict[str, Any]:
     """
     offset, rebuilt = 0, 0
     while True:
-        result = store.rebuild_derived_edges(limit=chunk, offset=offset)
+        with guard:
+            result = store.rebuild_derived_edges(limit=chunk, offset=offset)
         rebuilt += result["rebuilt"]
         offset = result["next_offset"]
         if not result["remaining"] or not result["rebuilt"]:
             return {"rebuilt": rebuilt}
-        time.sleep(YIELD_SECONDS)  # hand the interpreter back between slices
+        time.sleep(YIELD_SECONDS)  # lock released above; this is a real yield
 
 
-def rebase_job(store: Any, mark_stale: bool = False) -> dict[str, Any]:
+def rebase_job(store: Any, guard: Any, mark_stale: bool = False) -> dict[str, Any]:
     """Re-anchor memories to the code as it is now.
 
     A memory naming files that no longer exist is describing something that has
@@ -272,7 +315,8 @@ def rebase_job(store: Any, mark_stale: bool = False) -> dict[str, Any]:
     """
     from .maintenance import check_anchors
 
-    return check_anchors(store, mark_stale=mark_stale)
+    with guard:
+        return check_anchors(store, mark_stale=mark_stale)
 
 
 JOB_KINDS: dict[str, Callable[..., dict[str, Any]]] = {
@@ -294,7 +338,7 @@ def make_job(kind: str, project: str, **kwargs: Any) -> Job:
     run = JOB_KINDS[kind]
     return Job(priority=PRIORITIES.get(kind, 50), key=f"{kind}:{project}",
                project=project, kind=kind,
-               run=lambda store: run(store, **kwargs))
+               run=lambda store, guard: run(store, guard, **kwargs))
 
 
 class Scheduler:

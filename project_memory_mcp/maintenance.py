@@ -42,8 +42,8 @@ def text_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
     return len(a & b) / len(a | b)
 
 
-def duplicate_candidates(store: Any, limit: int = 25,
-                         threshold: float = 0.6) -> dict[str, Any]:
+def duplicate_candidates(store: Any, limit: int = 25, threshold: float = 0.6,
+                         offset: int = 0, scan: int | None = None) -> dict[str, Any]:
     """Pairs that look like the same lesson written twice.
 
     Similarity nominates; it never decides. A score is good at finding pairs
@@ -53,6 +53,12 @@ def duplicate_candidates(store: Any, limit: int = 25,
     Candidates come from the derived edges already materialised on write - the
     memories that share labels or files - so this costs one pass over a capped
     edge set rather than comparing every pair.
+
+    ``scan`` bounds how many pairs one call examines, and ``offset`` continues
+    where the last one stopped. This is the most expensive thing the Computer
+    does - every pair is two body reads and two tokenisations - so it has to be
+    possible to do it a slice at a time and hand the lock back in between. The
+    ordering is stable so that slicing sees every pair exactly once.
     """
     # The CASE is what makes a pair canonical, and it is load-bearing: derived
     # edges are not mirrored, so a plain `e.src < e.dst` filter silently drops
@@ -68,7 +74,9 @@ def duplicate_candidates(store: Any, limit: int = 25,
         "  AND ma.archived_at IS NULL "
         "JOIN memories mb ON mb.project_id=e.project_id AND mb.uuid=e.dst "
         "  AND mb.archived_at IS NULL "
-        "WHERE e.project_id=? AND e.kind='derived'", (store.project,)
+        "WHERE e.project_id=? AND e.kind='derived' "
+        "ORDER BY a, b" + ("" if scan is None else " LIMIT ? OFFSET ?"),
+        (store.project,) if scan is None else (store.project, scan, offset)
     ).fetchall()
 
     pairs = []
@@ -78,7 +86,12 @@ def duplicate_candidates(store: Any, limit: int = 25,
         if score >= threshold:
             pairs.append({"score": round(score, 3), "memories": [left, right]})
     pairs.sort(key=lambda p: -p["score"])
-    return {"count": len(pairs), "threshold": threshold, "candidates": pairs[:limit]}
+    return {"count": len(pairs), "threshold": threshold, "candidates": pairs[:limit],
+            "examined": len(rows), "next_offset": offset + len(rows),
+            # A short slice means the edge set is exhausted. Counting the total
+            # first would be a second full scan to learn what this one already
+            # knows.
+            "remaining": scan is not None and len(rows) == scan}
 
 
 def check_anchors(store: Any, mark_stale: bool = False) -> dict[str, Any]:
