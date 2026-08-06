@@ -64,6 +64,14 @@ TOOLS = [
                 "type": ["object", "string", "null"],
                 "additionalProperties": True,
             },
+            "before": {
+                "type": ["string", "null"],
+                "description": "With order='recent': the memories stored immediately BEFORE this one, nearest first. Walks the timeline outward from a memory you already have.",
+            },
+            "after": {
+                "type": ["string", "null"],
+                "description": "With order='recent': the memories stored immediately AFTER this one, nearest first.",
+            },
             "related_to": {
                 "type": ["string", "null"],
                 "description": "Anchor the walk at this memory id to rank the store by degree of relatedness to it - authored links first, then memories reachable through the graph. Combines with query to bias toward one part of its neighbourhood.",
@@ -209,6 +217,8 @@ class McpServer:
                     query=args.get("query") or "",
                     label_query=args.get("label_query"),
                     related_to=args.get("related_to"),
+                    before=args.get("before"),
+                    after=args.get("after"),
                     status_filter=args.get("status_filter"),
                     limit=args.get("limit") if args.get("limit") is not None else 8,
                     offset=args.get("offset") or 0,

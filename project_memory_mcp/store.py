@@ -13,6 +13,8 @@ from __future__ import annotations
 import copy
 import json
 import os
+import bisect
+import contextlib
 import re
 import time
 from collections import deque
@@ -230,6 +232,8 @@ class MemoryStore:
         self._cache_signature: tuple[tuple[str, int, int], ...] | None = None
         self._cache_records: dict[str, dict[str, Any]] | None = None
         self._cache_contexts: dict[bool, RankingContext] = {}
+        self._cache_timeline: list[tuple[str, str]] | None = None
+        self._store_is_stable = False
         self._usage_pending: dict[str, dict[str, Any]] = {}
         self._usage_last_flush = 0.0
 
@@ -316,11 +320,31 @@ class MemoryStore:
                     queue.append((target_id, current_depth + 1))
         return {"root": memory_id, "depth": depth, "nodes": list(nodes.values()), "edges": edges}
 
+
+    @contextlib.contextmanager
+    def _stable_store(self):
+        """Check the store's signature once for the duration of one operation.
+
+        A single recall reaches load_memories through several paths, and each
+        check is a scandir over every memory file. Validating once per call
+        instead of once per path is what keeps anchored traversal proportional
+        to the walk rather than to the store.
+        """
+        outer = self._store_is_stable
+        self.load_memories()
+        self._store_is_stable = True
+        try:
+            yield
+        finally:
+            self._store_is_stable = outer
+
     def recall(
         self,
         query: str = "",
         label_query: Any = None,
         related_to: str | None = None,
+        before: str | None = None,
+        after: str | None = None,
         status_filter: list[str] | str | None = None,
         limit: int = 8,
         offset: int = 0,
@@ -343,6 +367,24 @@ class MemoryStore:
         uniform, which makes this ordinary PageRank: the most structurally
         central memories, i.e. a reasonable "orient me in this store" answer.
         """
+        with self._stable_store():
+            return self._recall(query, label_query, related_to, before, after,
+                                status_filter, limit, offset, full_count, include_derived, order)
+
+    def _recall(
+        self,
+        query: str,
+        label_query: Any,
+        related_to: str | None,
+        before: str | None,
+        after: str | None,
+        status_filter: list[str] | str | None,
+        limit: int,
+        offset: int,
+        full_count: int,
+        include_derived: bool,
+        order: str,
+    ) -> dict[str, Any]:
         if limit < 1:
             raise StoreError("limit must be >= 1.")
         if offset < 0:
@@ -351,6 +393,13 @@ class MemoryStore:
             raise StoreError("full_count must be >= 0.")
         if order not in ("relevance", "recent"):
             raise StoreError("order must be 'relevance' or 'recent'.")
+        if before and after:
+            raise StoreError("Pass before or after, not both.")
+        if (before or after) and order != "recent":
+            raise StoreError("before/after anchors require order='recent'.")
+        for anchor in (before, after):
+            if anchor is not None:
+                self._find_memory_path(anchor)  # raises on unknown id
         if related_to is not None:
             self._find_memory_path(related_to)  # raises on unknown id
         known = set(self.list_labels()["labels"].keys())
@@ -361,7 +410,7 @@ class MemoryStore:
             return {"query": query, "considered": 0, "count": 0, "memories": []}
 
         if order == "recent":
-            return self._recall_recent(expression, statuses, limit, offset, full_count)
+            return self._recall_recent(expression, statuses, limit, offset, full_count, before, after)
 
         context = self.ranking_context(include_derived=include_derived)
         memories = context.memories
@@ -504,6 +553,52 @@ class MemoryStore:
         self.flush_usage()
 
 
+
+    def timeline(self) -> list[tuple[str, str]]:
+        """(creation key, id) for every memory, oldest first, cached with the store.
+
+        Sorting once per store revision instead of per call turns anchored
+        traversal into a binary search plus a slice - the same O(log N + K) a
+        linked list would give, without pointers to maintain across files.
+        """
+        records = self.load_memories()
+        if self._cache_timeline is not None:
+            return self._cache_timeline
+        rows = sorted((creation_order_key(r["memory"]), mid) for mid, r in records.items())
+        self._cache_timeline = rows
+        return rows
+
+    def _walk_timeline(
+        self,
+        anchor: str,
+        forward: bool,
+        expression: LabelExpression,
+        statuses: set[str] | None,
+        limit: int,
+        offset: int,
+    ) -> list[str]:
+        """Ids adjacent to ``anchor`` in creation order, nearest first."""
+        records = self.load_memories()
+        rows = self.timeline()
+        position = bisect.bisect_left(rows, (creation_order_key(records[anchor]["memory"]), anchor))
+        indices = range(position + 1, len(rows)) if forward else range(position - 1, -1, -1)
+        picked: list[str] = []
+        skipped = 0
+        for index in indices:
+            memory_id = rows[index][1]
+            memory = records[memory_id]["memory"]
+            if statuses is not None and memory.get("status") not in statuses:
+                continue
+            if not expression.matches(memory.get("labels") or []):
+                continue
+            if skipped < offset:
+                skipped += 1
+                continue
+            picked.append(memory_id)
+            if len(picked) >= limit:
+                break
+        return picked
+
     def _recall_recent(
         self,
         expression: LabelExpression,
@@ -511,6 +606,8 @@ class MemoryStore:
         limit: int,
         offset: int,
         full_count: int,
+        before: str | None = None,
+        after: str | None = None,
     ) -> dict[str, Any]:
         """Newest memories first, skipping ranking entirely.
 
@@ -520,17 +617,22 @@ class MemoryStore:
         this the cheapest way into the store.
         """
         records = self.load_memories()
-        rows = []
-        for memory_id, record in records.items():
-            memory = record["memory"]
-            if statuses is not None and memory.get("status") not in statuses:
-                continue
-            if not expression.matches(memory.get("labels") or []):
-                continue
-            rows.append((creation_order_key(memory), memory_id, record))
-        rows.sort(key=lambda row: (row[0], row[1]), reverse=True)
-
-        window = rows[offset : offset + limit]
+        if before or after:
+            anchor = before or after
+            ids = self._walk_timeline(anchor, forward=bool(after), expression=expression,
+                                      statuses=statuses, limit=limit, offset=offset)
+            window = [(creation_order_key(records[i]["memory"]), i, records[i]) for i in ids]
+        else:
+            rows = []
+            for memory_id, record in records.items():
+                memory = record["memory"]
+                if statuses is not None and memory.get("status") not in statuses:
+                    continue
+                if not expression.matches(memory.get("labels") or []):
+                    continue
+                rows.append((creation_order_key(memory), memory_id, record))
+            rows.sort(key=lambda row: (row[0], row[1]), reverse=True)
+            window = rows[offset : offset + limit]
         results: list[dict[str, Any]] = []
         for position, (created, memory_id, record) in enumerate(window):
             result = self._light_record(memory_id, record["path"], record["memory"])
@@ -539,10 +641,12 @@ class MemoryStore:
                 result["memory"] = record["memory"]
             results.append(result)
         self._record_usage([entry["id"] for entry in results], "surfaced")
+        payload_extra = {"before": before} if before else ({"after": after} if after else {})
         return {
             "order": "recent",
+            **payload_extra,
             "label_query_labels": sorted(expression.used_labels),
-            "considered": len(rows),
+            "considered": len(records),
             "offset": offset,
             "count": len(results),
             "memories": results,
@@ -878,6 +982,11 @@ class MemoryStore:
         The cache key is the name, size and mtime of each memory file, so an
         edit made outside this process still invalidates it.
         """
+        if self._cache_records is not None and self._store_is_stable:
+            # Already checked once during this operation; the filesystem cannot
+            # have changed underneath a read that is still in progress in any
+            # way we care about, and re-checking costs a full scandir sweep.
+            return self._cache_records
         signature = self._store_signature()
         if self._cache_records is not None and self._cache_signature == signature:
             return self._cache_records
@@ -885,6 +994,7 @@ class MemoryStore:
         self._cache_signature = signature
         self._cache_records = records
         self._cache_contexts.clear()
+        self._cache_timeline = None
         return records
 
     def ranking_context(self, include_derived: bool = True) -> RankingContext:

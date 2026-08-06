@@ -459,3 +459,31 @@ class RecentOrderTests(unittest.TestCase):
             self.store.recall(order="sideways")
         with self.assertRaises(StoreError):
             self.store.recall(offset=-1)
+
+    def test_before_and_after_walk_the_timeline(self):
+        self.assertEqual(["m-1", "m-0"],
+                         [m["id"] for m in self.store.recall(order="recent", before="m-2", full_count=0)["memories"]][:2])
+        self.assertEqual(["m-1", "m-2"],
+                         [m["id"] for m in self.store.recall(order="recent", after="m-0", full_count=0)["memories"]][:2])
+
+    def test_anchors_are_nearest_first_and_exclude_the_anchor(self):
+        result = self.store.recall(order="recent", before="m-2", limit=3, full_count=0)
+        ids = [m["id"] for m in result["memories"]]
+        self.assertNotIn("m-2", ids)
+        self.assertEqual("m-1", ids[0])          # nearest neighbour, not oldest
+        self.assertEqual("m-2", result["before"])
+
+    def test_anchor_walk_respects_filters(self):
+        result = self.store.recall(order="recent", before="m-2", label_query="area:z", full_count=0)
+        self.assertEqual(["legacy"], [m["id"] for m in result["memories"]])
+
+    def test_anchor_at_the_end_returns_nothing(self):
+        self.assertEqual(0, self.store.recall(order="recent", after="m-2", full_count=0)["count"])
+
+    def test_anchors_require_recent_order_and_reject_both(self):
+        with self.assertRaises(StoreError):
+            self.store.recall(before="m-1")
+        with self.assertRaises(StoreError):
+            self.store.recall(order="recent", before="m-1", after="m-0")
+        with self.assertRaises(StoreError):
+            self.store.recall(order="recent", before="no-such-memory")
