@@ -124,6 +124,40 @@ TOOLS = [
     ),
     _tool("get_memory", "Return the full JSON for a memory id.", {"id": {"type": "string"}}, ["id"]),
     _tool(
+        "list_remotes",
+        "Servers this machine federates with, each with a description of what it is for. Use "
+        "before promoting a memory: the description says which store a lesson belongs in, and "
+        "a remote you actually consulted while solving the task is usually the right home even "
+        "if another describes itself better.",
+        {},
+    ),
+    _tool(
+        "promotion_targets",
+        "Rank the remotes as destinations for one memory, with the reasoning shown, so you can "
+        "choose. Private memories have no targets - they are private because of who they are "
+        "for, not because they are unproven.",
+        {"id": {"type": "string"},
+         "consulted": {"type": "array", "items": {"type": "string"},
+                       "description": "Remotes you queried while solving this task."}},
+        ["id"],
+    ),
+    _tool(
+        "promote_memory",
+        "Publish one public memory to one named remote. Never publish to every remote: the same "
+        "lesson on several servers then diverges independently. If the remote is unreachable the "
+        "work is queued and retried, and you are told so rather than failing.",
+        {"id": {"type": "string"}, "remote": {"type": "string"}},
+        ["id", "remote"],
+    ),
+    _tool(
+        "set_memory_visibility",
+        "Change whether a memory is private to this machine or shareable. Private is for what "
+        "only helps here - facts about this user, this machine, these habits - and no amount of "
+        "usage should ever push those into a shared store.",
+        {"id": {"type": "string"}, "visibility": {"type": "string", "enum": ["private", "public"]}},
+        ["id", "visibility"],
+    ),
+    _tool(
         "find_duplicate_memories",
         "Return pairs of memories that look like the same lesson written twice, with both bodies "
         "in full. A similarity score is good at finding pairs worth reading and bad at telling "
@@ -168,9 +202,26 @@ TOOLS = [
     ),
     _tool(
         "create_memory",
-        "Create a memory JSON file, synchronize bidirectional relationships, and validate the store.",
+        "Store a memory, synchronize bidirectional relationships, and validate it. Decide "
+        "`visibility` when you write it: this is a judgment about audience, not about quality, "
+        "and no statistic can make it later.",
         {
             "memory": {"type": "object", "additionalProperties": True},
+            "visibility": {
+                "type": ["string", "null"],
+                "enum": ["private", "public", None],
+                "default": "private",
+                "description": "'public' when the lesson would help anyone working on this "
+                               "project: a subsystem fact, a build procedure, a failure mode. "
+                               "'private' when it only helps here - facts about this user, this "
+                               "machine, their habits or their other work. Defaults to private, "
+                               "because over-sharing is the harder mistake to undo.",
+            },
+            "uuid": {
+                "type": ["string", "null"],
+                "description": "Internal: set only when publishing an existing memory to another "
+                               "server, so one lesson keeps one identity everywhere it lives.",
+            },
             "related_label_query": {
                 "type": ["object", "string", "null"],
                 "additionalProperties": True,
@@ -264,6 +315,14 @@ class McpServer:
                 )
             elif name == "record_memory_use":
                 payload = self.store.record_use(args["memory_ids"])
+            elif name == "list_remotes":
+                payload = {"remotes": [r.describe() for r in self.store.remotes()]}
+            elif name == "promotion_targets":
+                payload = self.store.promotion_targets(args["id"], args.get("consulted"))
+            elif name == "promote_memory":
+                payload = self.store.promote(args["id"], args["remote"])
+            elif name == "set_memory_visibility":
+                payload = self.store.set_visibility(args["id"], args["visibility"])
             elif name == "find_duplicate_memories":
                 payload = self.store.duplicate_candidates(
                     limit=args.get("limit", 25), threshold=args.get("threshold", 0.6))
@@ -279,7 +338,9 @@ class McpServer:
                     max_nodes=args.get("max_nodes", 25),
                 )
             elif name == "create_memory":
-                payload = self.store.create_memory(args["memory"], args.get("related_label_query"))
+                payload = self.store.create_memory(
+                    args["memory"], args.get("related_label_query"), args.get("visibility"),
+                    args.get("uuid"))
             elif name == "update_memory":
                 payload = self.store.update_memory(args["id"], args["patch"], args.get("related_label_query"))
             elif name == "add_label":

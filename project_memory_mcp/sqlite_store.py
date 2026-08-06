@@ -21,7 +21,7 @@ from typing import Any, Iterable
 from . import validation
 from .validation import ID_RE, LABEL_RE, LabelExpression
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # 64-day window for the spread bitmap: long enough to judge the early tiers,
 # and it fits one SQLite integer.
@@ -78,13 +78,25 @@ CREATE TABLE IF NOT EXISTS memories (
     author_client     TEXT,
     author_name       TEXT,
     author_key        TEXT,
+    -- Who a memory is *for*, decided when it is written. This is a separate
+    -- question from whether it has proven itself: "the user prefers early
+    -- returns" gets recalled constantly and is never useful to anyone else, so
+    -- no amount of usage should promote it into shared space. Private by
+    -- default, because leaking is worse than under-sharing.
+    visibility        TEXT NOT NULL DEFAULT 'private',
+    -- NULL for memories this machine owns; the remote's name for cached copies.
+    -- Cached rows are read-only here: never audited, never promoted, evictable.
+    origin_remote     TEXT,
     PRIMARY KEY (project_id, uuid)
 );
 CREATE INDEX IF NOT EXISTS memories_tier ON memories(project_id, tier);
 CREATE INDEX IF NOT EXISTS memories_archived ON memories(project_id, archived_at);
 -- Unique for now: one writer, so a duplicate slug is a mistake rather than a
 -- merge. Relaxing this is a sync concern, and dropping an index is cheap.
-CREATE UNIQUE INDEX IF NOT EXISTS memories_slug ON memories(project_id, slug);
+CREATE UNIQUE INDEX IF NOT EXISTS memories_slug ON memories(project_id, slug)
+    WHERE origin_remote IS NULL;
+CREATE INDEX IF NOT EXISTS memories_origin ON memories(project_id, origin_remote);
+CREATE INDEX IF NOT EXISTS memories_visibility ON memories(project_id, visibility);
 CREATE INDEX IF NOT EXISTS memories_status  ON memories(project_id, status);
 CREATE INDEX IF NOT EXISTS memories_created ON memories(project_id, created, slug);
 
@@ -204,6 +216,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS clients_fingerprint ON clients(fingerprint)
 -- Single-use, short-lived, and the only thing that travels over an untrusted
 -- channel during enrollment. A code leaked after use is worthless; the real
 -- credential never crosses the wire in either direction.
+-- Servers this machine federates with. Local configuration, not shared: two
+-- clients of the same server need not know about each other's other remotes.
+-- Zero rows is the normal case - local-only is the default.
+CREATE TABLE IF NOT EXISTS remotes (
+    name        TEXT PRIMARY KEY,
+    url         TEXT NOT NULL,
+    description TEXT,
+    token       TEXT,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    added       TEXT NOT NULL,
+    last_ok     TEXT,
+    last_error  TEXT
+);
+
+-- Promotions that could not be delivered. Work waits here rather than failing
+-- the agent's call: a remote being asleep is not the agent's problem.
+CREATE TABLE IF NOT EXISTS outbox (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    memory_id  TEXT NOT NULL,
+    remote     TEXT NOT NULL,
+    queued_at  TEXT NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(project_id, remote);
+
 CREATE TABLE IF NOT EXISTS enrollment_codes (
     code       TEXT PRIMARY KEY,
     name       TEXT,
@@ -334,6 +373,32 @@ def _upgrade(connection: sqlite3.Connection) -> None:
         columns = {r[1] for r in connection.execute("PRAGMA table_info(memories)")}
     if "author_client" not in columns:
         _migrate_v4_to_v5(connection)
+        columns = {r[1] for r in connection.execute("PRAGMA table_info(memories)")}
+    if "visibility" not in columns:
+        _migrate_v5_to_v6(connection)
+
+
+def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
+    """Add the visibility axis and remote origin.
+
+    Existing memories become public: they were written into a store that was
+    already shared, so calling them private now would misdescribe what happened
+    and would silently withdraw them from people already relying on them.
+    """
+    connection.execute(
+        "ALTER TABLE memories ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'")
+    connection.execute("ALTER TABLE memories ADD COLUMN origin_remote TEXT")
+    connection.execute("UPDATE memories SET visibility='public'")
+    connection.execute("DROP INDEX IF EXISTS memories_slug")
+    connection.executescript("""
+        CREATE UNIQUE INDEX IF NOT EXISTS memories_slug ON memories(project_id, slug)
+            WHERE origin_remote IS NULL;
+        CREATE INDEX IF NOT EXISTS memories_origin ON memories(project_id, origin_remote);
+        CREATE INDEX IF NOT EXISTS memories_visibility ON memories(project_id, visibility);
+    """)
+    connection.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+                       (str(SCHEMA_VERSION),))
+    connection.commit()
 
 
 def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
@@ -693,8 +758,10 @@ class SqliteMemoryStore:
                                           limit=limit, offset=offset, statuses=statuses_for_walk)
             memories = [m for m in bodies if expression.matches(m.get("labels") or [])]
             results = []
+            slugs_to_uuid = self._uuids_for_slugs([m["id"] for m in memories])
             for position, memory in enumerate(memories):
                 entry = _light_record(memory)
+                entry["uuid"] = slugs_to_uuid.get(memory["id"])
                 entry["created"] = (memory.get("evidence") or {}).get("created")
                 if position < full_count:
                     entry["memory"] = memory
@@ -776,6 +843,7 @@ class SqliteMemoryStore:
                 continue
             factor = _STATUS_FACTORS.get(memory.get("status", "active"), 1.0)
             result = _light_record(memory)
+            result["uuid"] = memory_id
             result["score"] = round(score * factor, 6)
             result["why"] = {
                 "text": round(text_scores.get(memory_id, 0.0), 6),
@@ -975,7 +1043,8 @@ class SqliteMemoryStore:
 
     # --------------------------------------------------------------- mutations
 
-    def create_memory(self, memory: dict[str, Any], related_label_query: Any = None) -> dict[str, Any]:
+    def create_memory(self, memory: dict[str, Any], related_label_query: Any = None,
+                      visibility: str | None = None, uuid: str | None = None) -> dict[str, Any]:
         evidence = memory.setdefault("evidence", {})
         if isinstance(evidence, dict) and not evidence.get("created"):
             evidence["created"] = _now()
@@ -986,9 +1055,13 @@ class SqliteMemoryStore:
         ).fetchone():
             raise StoreError(f"Memory already exists: {memory_id}")
         with self.connection:
-            self._write(memory, str(uuid_module.uuid4()))
+            # A promotion carries the memory's uuid so the same lesson keeps one
+            # identity on every server that holds it. That is what makes results
+            # from different sources fuse instead of duplicating.
+            self._write(memory, uuid or str(uuid_module.uuid4()), visibility=visibility)
             self._synchronize_relationships(memory_id)
-        return {"created": memory_id, "related_candidates": []}
+        return {"created": memory_id, "visibility": visibility or "private",
+                "related_candidates": []}
 
     def update_memory(self, memory_id: str, patch: dict[str, Any], related_label_query: Any = None) -> dict[str, Any]:
         if "id" in patch and patch["id"] != memory_id:
@@ -1004,9 +1077,26 @@ class SqliteMemoryStore:
                 (self.project, memory_uuid, _now(), json.dumps(current),
                  (self.actor or {}).get("client_id"), (self.actor or {}).get("name")),
             )
-            self._write(merged, memory_uuid)
+            self._write(merged, memory_uuid, visibility=self._visibility_of(memory_uuid))
             self._synchronize_relationships(memory_id)
         return {"updated": memory_id, "related_candidates": []}
+
+    def _visibility_of(self, memory_uuid: str) -> str:
+        row = self.connection.execute(
+            "SELECT visibility FROM memories WHERE project_id=? AND uuid=?",
+            (self.project, memory_uuid)).fetchone()
+        return row["visibility"] if row else "private"
+
+    def set_visibility(self, memory_id: str, visibility: str) -> dict[str, Any]:
+        """Change who a memory is for. Cannot un-publish what a remote already has."""
+        if visibility not in ("private", "public"):
+            raise StoreError("visibility must be 'private' or 'public'.")
+        memory_uuid = self._uuid_for(memory_id)
+        with self.connection:
+            self.connection.execute(
+                "UPDATE memories SET visibility=? WHERE project_id=? AND uuid=? "
+                "AND origin_remote IS NULL", (visibility, self.project, memory_uuid))
+        return {"id": memory_id, "visibility": visibility}
 
     def archive_memory(self, memory_id: str, archived: bool = True) -> dict[str, Any]:
         """Take a memory out of the working set, or put it back.
@@ -1037,6 +1127,168 @@ class SqliteMemoryStore:
             entry["archived_at"] = row["archived_at"]
             memories.append(entry)
         return {"count": len(memories), "offset": offset, "memories": memories}
+
+    # ---------------------------------------------------------------- federation
+
+    def remotes(self, enabled_only: bool = False) -> list[Any]:
+        from . import federation
+
+        return federation.list_remotes(self.connection, enabled_only=enabled_only)
+
+    def _remote_clients(self, private_key: Any = None) -> list[Any]:
+        from . import federation
+
+        return [federation.RemoteClient(remote, self.project, private_key)
+                for remote in self.remotes(enabled_only=True)]
+
+    def federated_recall(self, query: str = "", limit: int = 8, full_count: int = 3,
+                         private_key: Any = None, **kwargs: Any) -> dict[str, Any]:
+        """Recall across this machine and every enabled remote.
+
+        Local is queried first and always answers, so this never blocks on a
+        network. Remotes run concurrently with a deadline; whichever reply in
+        time are fused by rank, and the rest are reported rather than hidden -
+        an agent should know it is looking at a partial view.
+        """
+        from . import federation
+
+        local = self.recall(query=query, limit=limit, full_count=full_count, **kwargs)
+        clients = self._remote_clients(private_key)
+        if not clients:
+            return local
+
+        answers, failures = federation.fan_out(
+            clients, "recall", {"query": query, "limit": limit, "full_count": 0})
+        lists = {"local": local["memories"]}
+        for name, payload in answers.items():
+            for entry in payload.get("memories") or []:
+                entry["remote"] = name
+            lists[name] = payload.get("memories") or []
+        fused = federation.fuse(lists, limit)
+        self._cache_remote_results(answers)
+
+        return {
+            "query": query,
+            "count": len(fused),
+            "memories": fused,
+            "sources_answered": sorted(lists),
+            "sources_unreachable": failures,
+            "considered": local.get("considered", 0) + sum(len(v) for v in lists.values()),
+        }
+
+    def _cache_remote_results(self, answers: dict[str, Any]) -> None:
+        """Keep what came back, tagged with where it came from.
+
+        The cache is the working set: whatever has recently been needed stays
+        reachable when a remote is not. Cached rows are never audited and never
+        promoted - this machine does not own them.
+        """
+        rows = []
+        stamp = _now()
+        for name, payload in answers.items():
+            for entry in payload.get("memories") or []:
+                body = entry.get("memory") or entry
+                uuid = entry.get("uuid")
+                if not uuid or not body.get("id"):
+                    continue
+                rows.append((self.project, uuid, body["id"], body.get("status", "active"),
+                             body.get("description", ""), stamp, json.dumps(body), name))
+        if not rows:
+            return
+        with self.connection:
+            self.connection.executemany(
+                "INSERT INTO memories(project_id, uuid, slug, status, description, created, "
+                "body, origin_remote, visibility) VALUES (?,?,?,?,?,?,?,?,'public') "
+                "ON CONFLICT(project_id, uuid) DO UPDATE SET status=excluded.status, "
+                "description=excluded.description, body=excluded.body, "
+                "origin_remote=excluded.origin_remote",
+                rows)
+
+    def promotion_targets(self, memory_id: str, used: list[str] | None = None) -> dict[str, Any]:
+        """Where this memory could go, ranked, with the reasoning shown.
+
+        Only public memories are offered a destination. A private memory is
+        private because of who it is for, not because it has not proven itself,
+        so no amount of usage should ever route it outward.
+        """
+        from . import federation
+
+        memory_uuid = self._uuid_for(memory_id)
+        if self._visibility_of(memory_uuid) != "public":
+            return {"id": memory_id, "visibility": "private", "targets": [],
+                    "why": "private memories are never promoted; change visibility first"}
+        return {"id": memory_id, "visibility": "public",
+                "targets": federation.choose_remote(self.remotes(), self.get_memory(memory_id), used)}
+
+    def promote(self, memory_id: str, remote: str, private_key: Any = None) -> dict[str, Any]:
+        """Publish one memory to one named remote.
+
+        Never to all of them: that is how one lesson ends up duplicated across
+        servers with independently diverging edits. If the remote is unreachable
+        the work waits in the outbox rather than failing the agent's call.
+        """
+        from . import federation
+
+        memory_uuid = self._uuid_for(memory_id)
+        if self._visibility_of(memory_uuid) != "public":
+            raise StoreError(
+                f"'{memory_id}' is private. Set its visibility to public before promoting it.")
+        if self.connection.execute(
+            "SELECT 1 FROM memories WHERE project_id=? AND uuid=? AND origin_remote IS NOT NULL",
+            (self.project, memory_uuid),
+        ).fetchone():
+            raise StoreError(f"'{memory_id}' is a cached copy from another server, not yours to publish.")
+
+        matches = [r for r in self.remotes(enabled_only=True) if r.name == remote]
+        if not matches:
+            known = ", ".join(r.name for r in self.remotes()) or "(none configured)"
+            raise StoreError(f"Unknown remote '{remote}'. Known: {known}")
+
+        body = self.get_memory(memory_id)
+        client = federation.RemoteClient(matches[0], self.project, private_key)
+        try:
+            client.call("create_memory", {"memory": body, "visibility": "public",
+                                          "uuid": memory_uuid})
+        except Exception as error:  # queued rather than raised: the agent is not the one waiting
+            with self.connection:
+                self.connection.execute(
+                    "INSERT INTO outbox(project_id, memory_id, remote, queued_at, last_error) "
+                    "VALUES (?,?,?,?,?)", (self.project, memory_uuid, remote, _now(), str(error)))
+            return {"queued": memory_id, "remote": remote, "reason": str(error)}
+        with self.connection:
+            self.connection.execute("UPDATE remotes SET last_ok=?, last_error=NULL WHERE name=?",
+                                    (_now(), remote))
+        return {"promoted": memory_id, "remote": remote}
+
+    def drain_outbox(self, private_key: Any = None, limit: int = 50) -> dict[str, Any]:
+        """Retry queued promotions. Safe to call as often as you like."""
+        from . import federation
+
+        rows = self.connection.execute(
+            "SELECT * FROM outbox WHERE project_id=? ORDER BY id LIMIT ?",
+            (self.project, limit)).fetchall()
+        sent, still_waiting = [], []
+        by_name = {r.name: r for r in self.remotes(enabled_only=True)}
+        for row in rows:
+            remote = by_name.get(row["remote"])
+            if remote is None:
+                continue
+            try:
+                body = self._body_by_uuid(row["memory_id"])
+                federation.RemoteClient(remote, self.project, private_key).call(
+                    "create_memory", {"memory": body, "visibility": "public",
+                                      "uuid": row["memory_id"]})
+            except Exception as error:
+                still_waiting.append(row["remote"])
+                with self.connection:
+                    self.connection.execute(
+                        "UPDATE outbox SET attempts=attempts+1, last_error=? WHERE id=?",
+                        (str(error), row["id"]))
+                continue
+            sent.append(body["id"])
+            with self.connection:
+                self.connection.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
+        return {"sent": sent, "still_queued": len(rows) - len(sent)}
 
     def duplicate_candidates(self, limit: int = 25, threshold: float = 0.6) -> dict[str, Any]:
         """Pairs that look like the same lesson written twice.
@@ -1117,7 +1369,7 @@ class SqliteMemoryStore:
             self.connection.execute(
                 "UPDATE memories SET archived_at=?, merged_into=? WHERE project_id=? AND uuid=?",
                 (_now(), keep_uuid, self.project, merge_uuid))
-            self._write(keep, keep_uuid)
+            self._write(keep, keep_uuid, visibility=self._visibility_of(keep_uuid))
 
         self._synchronize_relationships(keep_id)
         return {"kept": keep_id, "merged": merge_id, "reason": reason}
@@ -1145,7 +1397,7 @@ class SqliteMemoryStore:
                 rel["related"] = [e for e in rel["related"] if e.get("id") != memory_id]
                 for field in ("supersedes", "superseded_by"):
                     rel[field] = [v for v in rel[field] if v != memory_id]
-                self._write(other, other_uuid)
+                self._write(other, other_uuid, visibility=self._visibility_of(other_uuid))
                 touched.append(other["id"])
             for table in ("memories", "labels", "files", "usage", "memories_fts"):
                 self.connection.execute(
@@ -1281,26 +1533,32 @@ class SqliteMemoryStore:
 
     # ---------------------------------------------------------------- internal
 
-    def _write(self, memory: dict[str, Any], memory_uuid: str) -> None:
+    def _write(self, memory: dict[str, Any], memory_uuid: str,
+               visibility: str | None = None, origin_remote: str | None = None) -> None:
         slug = memory["id"]
+        if visibility is None:
+            visibility = memory.get("visibility") or "private"
+        if visibility not in ("private", "public"):
+            raise StoreError("visibility must be 'private' or 'public'.")
         evidence = memory.get("evidence") or {}
         scope = memory.get("scope") or {}
         self.connection.execute(
             "INSERT INTO memories(project_id, uuid, slug, status, description, created, last_validated, "
             "created_from_task, area, body, tier_since, tier_since_query, "
-            "author_client, author_name, author_key) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,(SELECT queries FROM projects WHERE id=?),?,?,?) "
+            "author_client, author_name, author_key, visibility, origin_remote) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,(SELECT queries FROM projects WHERE id=?),?,?,?,?,?) "
             "ON CONFLICT(project_id, uuid) DO UPDATE SET slug=excluded.slug, status=excluded.status, "
             "description=excluded.description, created=excluded.created, "
             "last_validated=excluded.last_validated, created_from_task=excluded.created_from_task, "
             "area=excluded.area, body=excluded.body, author_client=excluded.author_client, "
-            "author_name=excluded.author_name, author_key=excluded.author_key",
+            "author_name=excluded.author_name, author_key=excluded.author_key, "
+            "visibility=excluded.visibility, origin_remote=excluded.origin_remote",
             (self.project, memory_uuid, slug, memory["status"], memory["description"],
              evidence.get("created"), evidence.get("last_validated"),
              evidence.get("created_from_task"), scope.get("area"), json.dumps(memory),
              _now(), self.project,
              (self.actor or {}).get("client_id"), (self.actor or {}).get("name"),
-             (self.actor or {}).get("fingerprint")),
+             (self.actor or {}).get("fingerprint"), visibility, origin_remote),
         )
         self.connection.execute("DELETE FROM labels WHERE project_id=? AND memory_id=?",
                                 (self.project, memory_uuid))
@@ -1459,7 +1717,7 @@ class SqliteMemoryStore:
                     values.append(memory_id)
                 rel[target] = values
             if json.dumps(rel, sort_keys=True) != before:
-                self._write(other, row["uuid"])
+                self._write(other, row["uuid"], visibility=self._visibility_of(row["uuid"]))
 
 
 def _text_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:

@@ -383,6 +383,41 @@ def cmd_join(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_remote(args: argparse.Namespace) -> int:
+    """Manage the servers this machine federates with. Zero of them is normal."""
+    from . import federation
+    from .sqlite_store import SqliteMemoryStore, StoreError
+
+    store = SqliteMemoryStore(args.database, args.project, create=False)
+    try:
+        if args.remove:
+            print(federation.remove_remote(store.connection, args.remove)["removed"], "removed")
+            return 0
+        if args.url:
+            federation.add_remote(store.connection, args.name, args.url,
+                                  description=args.description, token=args.token)
+            print(f"remote '{args.name}' -> {args.url}")
+            if not args.description:
+                print("  no description set. Add one with --description: it is what an agent")
+                print("  reads when deciding which server a memory belongs in.")
+            return 0
+        remotes = federation.list_remotes(store.connection)
+        if not remotes:
+            print("No remotes. This store is local-only, which is a complete setup.")
+            return 0
+        for remote in remotes:
+            state = "" if remote.enabled else " (disabled)"
+            print(f"{remote.name:16s} {remote.url}{state}")
+            if remote.description:
+                print(f"                 {remote.description}")
+        return 0
+    except StoreError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+
+
 def cmd_install_skills(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve() if args.root else Path.cwd()
     destinations: list[Path] = []
@@ -547,6 +582,19 @@ def build_parser() -> argparse.ArgumentParser:
     join_parser.add_argument("--key", default=None,
                              help=f"Private key path (default: {DEFAULT_HOME / 'client_key.pem'}).")
     join_parser.set_defaults(func=cmd_join)
+
+    remote_parser = subparsers.add_parser(
+        "remote", help="Add, list or remove servers this machine federates with.")
+    remote_parser.add_argument("--database", required=True, help="Path to the local database.")
+    remote_parser.add_argument("--project", required=True, help="Project id.")
+    remote_parser.add_argument("--name", default=None, help="Short name for the remote.")
+    remote_parser.add_argument("--url", default=None, help="Base URL. Adds or updates the remote.")
+    remote_parser.add_argument("--description", default=None,
+                               help="What this server is for. Agents read it to route promotions.")
+    remote_parser.add_argument("--token", default=None,
+                               help="Bearer token, if this machine has no enrolled key there.")
+    remote_parser.add_argument("--remove", default=None, metavar="NAME", help="Remove a remote.")
+    remote_parser.set_defaults(func=cmd_remote)
 
     skills_parser = subparsers.add_parser(
         "install-skills",
