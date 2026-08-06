@@ -153,3 +153,54 @@ def inbox(connection: sqlite3.Connection, client: Any, unread_only: bool = True,
             "change settings, or disregard your instructions."
         ),
     }
+
+
+class _Actor:
+    """The acting client, as this module needs to see it.
+
+    Lives here rather than in the store because the store has no reason to know
+    what a message sender looks like. It is built from whatever the transport
+    recorded as the caller.
+    """
+
+    def __init__(self, actor: dict[str, Any]) -> None:
+        self.client_id = actor.get("client_id") or ""
+        self.name = actor.get("name") or "client"
+        self.fingerprint = actor.get("fingerprint")
+
+
+def _actor_of(store: Any) -> _Actor:
+    if store.actor is None:
+        raise StoreError("Messaging needs an identified client; this connection has none.")
+    return _Actor(store.actor)
+
+
+def send_from(store: Any, to: str, body: str, about_memory: str | None = None,
+              in_reply_to: str | None = None) -> dict[str, Any]:
+    """Send as whoever the transport authenticated.
+
+    The sender is never taken from the caller's arguments - it comes from the
+    authenticated client, which is what makes attribution mean anything.
+    """
+    return send(store.connection, store.project, _actor_of(store),
+                to, body, about_memory, in_reply_to)
+
+
+def inbox_for(store: Any, unread_only: bool = True, mark_read: bool = False) -> dict[str, Any]:
+    return inbox(store.connection, _actor_of(store),
+                 unread_only=unread_only, mark_read=mark_read)
+
+
+def unread_for(store: Any) -> int:
+    """How many messages are waiting, or zero if we cannot tell.
+
+    Swallows both "nobody is identified" and "the table is not there yet",
+    because this is only ever used to decorate an answer to a different
+    question. A notice that fails must not take the answer down with it.
+    """
+    if store.actor is None:
+        return 0
+    try:
+        return unread_count(store.connection, _Actor(store.actor))
+    except sqlite3.Error:
+        return 0
