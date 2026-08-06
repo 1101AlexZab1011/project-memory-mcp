@@ -1493,17 +1493,53 @@ class SqliteMemoryStore:
             [(self.project, memory_id, other) for _, other in scored[:DERIVED_MAX_NEIGHBOURS]],
         )
 
+    #: Edge kinds that mirror onto the other memory. Everything else - notably
+    #: 'derived' - is computed from content and is nobody's reverse link.
+    _MIRRORED_KINDS = ("related", "supersedes", "superseded_by")
+
     def _synchronize_relationships(self, memory_id: str) -> None:
-        """Mirror this memory's links onto their targets, as the file backend does."""
+        """Mirror this memory's links onto their targets, as the file backend does.
+
+        Only two kinds of memory can possibly change: the ones this memory now
+        points at, and the ones that currently point back at it - the latter
+        because a link that has just been removed leaves a stale mirror that has
+        to be cleaned up. Both are small sets, and the second is an indexed
+        lookup because the edges table already records exactly that.
+
+        This used to load and JSON-parse *every other memory in the project* on
+        every write, to adjust a handful of links. That was 71% of the cost of a
+        write and the reason write time grew with store size - which is to say,
+        the reason building a store was quadratic.
+        """
         current = self.get_memory(memory_id)
+        memory_uuid = self._uuid_for(memory_id)
         related_map = {e["id"]: e["reason"] for e in current["relationships"]["related"]}
         for target_id in related_map:
             if not self.connection.execute(
                 "SELECT 1 FROM memories WHERE project_id=? AND slug=?", (self.project, target_id)
             ).fetchone():
                 raise StoreError(f"relationships.related references unknown memory: {target_id}")
+
+        # Where this memory's links now point.
+        targets = set(related_map)
+        for field in ("supersedes", "superseded_by"):
+            targets.update(current["relationships"].get(field) or [])
+        affected = set(self._uuids_for_slugs(targets).values())
+        # And whoever still points back at it, so a removed link is un-mirrored.
+        # The memory's own edges were rewritten just before this, so these rows
+        # are the old state - which is exactly what needs correcting.
+        placeholders = ",".join("?" * len(self._MIRRORED_KINDS))
+        affected.update(row["src"] for row in self.connection.execute(
+            f"SELECT src FROM edges WHERE project_id=? AND dst=? AND kind IN ({placeholders})",
+            (self.project, memory_uuid, *self._MIRRORED_KINDS)))
+        affected.discard(memory_uuid)
+        if not affected:
+            return
+
+        ordered = sorted(affected)
         for row in self.connection.execute(
-            "SELECT uuid, body FROM memories WHERE project_id=? AND slug<>?", (self.project, memory_id)
+            f"SELECT uuid, body FROM memories WHERE project_id=? "
+            f"AND uuid IN ({','.join('?' * len(ordered))})", (self.project, *ordered)
         ).fetchall():
             other = json.loads(row["body"])
             before = json.dumps(other["relationships"], sort_keys=True)

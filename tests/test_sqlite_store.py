@@ -90,6 +90,43 @@ class SqliteStoreTests(unittest.TestCase):
         self.assertEqual(["b"], [e["id"] for e in back])
         self.assertEqual("They share a subsystem.", back[0]["reason"])
 
+    def test_removing_a_link_removes_the_mirror_of_it(self):
+        # The case the reverse lookup exists for. A write only visits the
+        # memories it links to plus the ones that link back at it; if the second
+        # half were missed, dropping a link would leave the mirror behind
+        # forever and the graph would keep an edge nobody asked for.
+        self.store.create_memory(memory("a", FIRST, ["area:x"]))
+        self.store.create_memory(memory("b", SECOND, ["area:x"], related=["a"]))
+        self.assertEqual(["b"], [e["id"] for e in
+                                 self.store.get_memory("a")["relationships"]["related"]])
+
+        self.store.update_memory("b", {"relationships": {
+            "related": [], "supersedes": [], "superseded_by": []}})
+        self.assertEqual([], self.store.get_memory("a")["relationships"]["related"],
+                         "the mirrored link outlived the link it mirrored")
+
+    def test_a_write_visits_only_the_memories_its_links_touch(self):
+        # This used to load and parse every memory in the project on every
+        # write. Counting bodies read is how that stays fixed: the cost of a
+        # write must depend on its links, not on the size of the store.
+        for i in range(30):
+            self.store.create_memory(memory(f"bystander-{i}", f"{FIRST} number {i}", ["area:x"]))
+        self.store.create_memory(memory("target", SECOND, ["area:x"]))
+
+        seen: list[str] = []
+        self.store.connection.set_trace_callback(seen.append)
+        try:
+            self.store.create_memory(
+                memory("linker", "Links to exactly one thing.", ["area:x"], related=["target"]))
+        finally:
+            self.store.connection.set_trace_callback(None)
+
+        scans = [sql for sql in seen
+                 if "FROM memories" in sql and "body" in sql and "slug<>" in sql]
+        self.assertEqual(
+            [], scans,
+            "a write is scanning every other memory in the project to mirror its links")
+
     def test_update_keeps_the_previous_body_as_a_revision(self):
         self.store.create_memory(memory("a", FIRST, ["area:x"]))
         self.store.update_memory("a", {"status": "stale"})
