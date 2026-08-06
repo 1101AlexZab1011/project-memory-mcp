@@ -290,6 +290,99 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_enroll(args: argparse.Namespace) -> int:
+    """Mint an enrollment code, or list and revoke clients. Run on the server."""
+    import sqlite3
+
+    from . import clients
+    from .sqlite_store import SqliteMemoryStore
+    from .validation import StoreError
+
+    database = Path(args.database)
+    if not database.is_file():
+        print(f"error: no database at {database}", file=sys.stderr)
+        return 1
+    SqliteMemoryStore(database, "bootstrap", create=True).close()  # ensures the tables exist
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    try:
+        if args.list:
+            rows = clients.list_clients(connection)
+            if not rows:
+                print("No clients enrolled. The shared token is still the only credential.")
+                return 0
+            for row in rows:
+                state = "revoked" if row["revoked_at"] else row["auth"]
+                print(f"{row['name']:24s} {row['role']:12s} {state:8s} "
+                      f"{row['fingerprint'] or '-'}  {row['client_id']}")
+            return 0
+        if args.revoke:
+            print(clients.revoke(connection, args.revoke)["revoked"], "revoked")
+            return 0
+
+        result = clients.create_code(
+            connection, name=args.name, role=args.role,
+            projects=args.project or None)
+    except StoreError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    finally:
+        connection.close()
+
+    print(f"enrollment code: {result['code']}")
+    print(f"  role     {result['role']}")
+    print(f"  projects {result['projects']}")
+    print(f"  expires  in {result['valid_for_minutes']} minutes, single use")
+    print("\nOn the other machine:")
+    print(f"  project-memory-mcp join --server <url> --code {result['code']} --name <machine>")
+    print("\nThe code is the only thing that has to travel. It is worthless once used,")
+    print("and no secret is sent back - the client keeps its private key.")
+    return 0
+
+
+def cmd_join(args: argparse.Namespace) -> int:
+    """Enroll this machine with a server, using a code. Run on the client."""
+    import urllib.error
+    import urllib.request
+
+    from . import identity
+
+    key_path = Path(args.key) if args.key else DEFAULT_HOME / "client_key.pem"
+    try:
+        private_key = identity.load_or_create(key_path)
+    except identity.IdentityError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    public = identity.public_bytes(private_key)
+
+    payload = json.dumps({
+        "code": args.code,
+        "name": args.name or Path.home().name,
+        "public_key": identity.encode_public(public),
+    }).encode()
+    url = args.server.rstrip("/") + "/enroll"
+    request = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")
+        print(f"error: server refused enrollment: {detail}", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"error: cannot reach {url}: {error}", file=sys.stderr)
+        return 1
+
+    print(f"enrolled with {args.server} as '{result['name']}' ({result['role']})")
+    print(f"  fingerprint {identity.fingerprint(public)}")
+    print(f"  private key {key_path}")
+    print(f"  projects    {result['projects']}")
+    print("\nThe private key never left this machine. The same key enrolled elsewhere")
+    print("is verifiably the same client, which is how identity works across servers.")
+    return 0
+
+
 def cmd_install_skills(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve() if args.root else Path.cwd()
     destinations: list[Path] = []
@@ -433,6 +526,27 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--token", default=None,
                               help="Shared bearer token. Falls back to PROJECT_MEMORY_TOKEN.")
     serve_parser.set_defaults(func=cmd_serve)
+
+    enroll_parser = subparsers.add_parser(
+        "enroll", help="Mint an enrollment code, or list and revoke clients. Run on the server.")
+    enroll_parser.add_argument("--database", required=True, help="Path to the SQLite database.")
+    enroll_parser.add_argument("--name", default=None, help="Suggested name for the new client.")
+    enroll_parser.add_argument("--role", default="contributor", choices=("contributor", "admin"))
+    enroll_parser.add_argument("--project", action="append", default=None,
+                               help="Restrict to this project. Repeatable; default is every project.")
+    enroll_parser.add_argument("--list", action="store_true", help="List enrolled clients instead.")
+    enroll_parser.add_argument("--revoke", default=None, metavar="CLIENT_ID",
+                               help="Revoke a client instead. Its writes keep their attribution.")
+    enroll_parser.set_defaults(func=cmd_enroll)
+
+    join_parser = subparsers.add_parser(
+        "join", help="Enroll this machine with a server using a code. Run on the client.")
+    join_parser.add_argument("--server", required=True, help="Base URL, e.g. http://host:8765")
+    join_parser.add_argument("--code", required=True, help="Enrollment code from the server admin.")
+    join_parser.add_argument("--name", default=None, help="How this machine should be listed.")
+    join_parser.add_argument("--key", default=None,
+                             help=f"Private key path (default: {DEFAULT_HOME / 'client_key.pem'}).")
+    join_parser.set_defaults(func=cmd_join)
 
     skills_parser = subparsers.add_parser(
         "install-skills",

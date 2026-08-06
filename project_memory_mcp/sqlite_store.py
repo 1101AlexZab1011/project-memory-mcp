@@ -21,7 +21,7 @@ from typing import Any, Iterable
 from . import validation
 from .validation import ID_RE, LABEL_RE, LabelExpression
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # 64-day window for the spread bitmap: long enough to judge the early tiers,
 # and it fits one SQLite integer.
@@ -72,6 +72,12 @@ CREATE TABLE IF NOT EXISTS memories (
     -- a judgment call, and keeping the loser archived with a pointer makes a
     -- wrong one visible and reversible instead of silently destructive.
     merged_into       TEXT,
+    -- Who wrote this last. The name is one server's word for a client; the
+    -- fingerprint is the same everywhere, because it is derived from a key only
+    -- that client can use. Both are kept: one is readable, one is verifiable.
+    author_client     TEXT,
+    author_name       TEXT,
+    author_key        TEXT,
     PRIMARY KEY (project_id, uuid)
 );
 CREATE INDEX IF NOT EXISTS memories_tier ON memories(project_id, tier);
@@ -130,7 +136,8 @@ CREATE TABLE IF NOT EXISTS usage (
 
 CREATE TABLE IF NOT EXISTS revisions (
     project_id TEXT NOT NULL, memory_id TEXT NOT NULL,
-    revised_at TEXT NOT NULL, body TEXT NOT NULL
+    revised_at TEXT NOT NULL, body TEXT NOT NULL,
+    author_client TEXT, author_name TEXT
 );
 CREATE INDEX IF NOT EXISTS revisions_memory ON revisions(project_id, memory_id, revised_at);
 
@@ -174,6 +181,39 @@ CREATE TABLE IF NOT EXISTS audit_findings (
     evidence   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS audit_findings_run ON audit_findings(run_id);
+
+-- Server-wide, not per project: a client is an actor, and `project_scope` says
+-- which projects it may touch. Nothing in this table is confidential - a public
+-- key is publishable and a token is stored only as a hash - which matters
+-- because this server ships scheduled snapshots and JSON exports.
+CREATE TABLE IF NOT EXISTS clients (
+    client_id     TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    public_key    TEXT,
+    fingerprint   TEXT,
+    token_hash    TEXT,
+    role          TEXT NOT NULL DEFAULT 'contributor',
+    project_scope TEXT,
+    created       TEXT NOT NULL,
+    last_seen     TEXT,
+    revoked_at    TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS clients_fingerprint ON clients(fingerprint)
+    WHERE fingerprint IS NOT NULL;
+
+-- Single-use, short-lived, and the only thing that travels over an untrusted
+-- channel during enrollment. A code leaked after use is worthless; the real
+-- credential never crosses the wire in either direction.
+CREATE TABLE IF NOT EXISTS enrollment_codes (
+    code       TEXT PRIMARY KEY,
+    name       TEXT,
+    role       TEXT NOT NULL DEFAULT 'contributor',
+    project_scope TEXT,
+    expires_at TEXT NOT NULL,
+    created    TEXT NOT NULL,
+    used_at    TEXT,
+    used_by    TEXT
+);
 """
 
 # bm25() column weights, in the column order above (the two UNINDEXED columns
@@ -291,6 +331,25 @@ def _upgrade(connection: sqlite3.Connection) -> None:
         columns = {r[1] for r in connection.execute("PRAGMA table_info(memories)")}
     if "archived_at" not in columns:
         _migrate_v3_to_v4(connection)
+        columns = {r[1] for r in connection.execute("PRAGMA table_info(memories)")}
+    if "author_client" not in columns:
+        _migrate_v4_to_v5(connection)
+
+
+def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+    """Add authorship. Additive; existing rows have no recorded author.
+
+    They are left null rather than credited to whoever runs the migration -
+    attribution is a record of what happened, and inventing it would make the
+    history less trustworthy than admitting the gap.
+    """
+    for column in ("author_client", "author_name", "author_key"):
+        connection.execute(f"ALTER TABLE memories ADD COLUMN {column} TEXT")
+    for column in ("author_client", "author_name"):
+        connection.execute(f"ALTER TABLE revisions ADD COLUMN {column} TEXT")
+    connection.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+                       (str(SCHEMA_VERSION),))
+    connection.commit()
 
 
 def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
@@ -417,6 +476,9 @@ class SqliteMemoryStore:
             (str(SCHEMA_VERSION),),
         )
         self.replica_id = _ensure_replica_id(self.connection)
+        #: Who the current caller is, set by the HTTP layer for the duration of
+        #: one request. None means a local write with no authenticated client.
+        self.actor: dict[str, Any] | None = None
         known = self.connection.execute(
             "SELECT 1 FROM projects WHERE id=?", (project,)
         ).fetchone()
@@ -937,8 +999,10 @@ class SqliteMemoryStore:
         self._require_valid(merged)
         with self.connection:
             self.connection.execute(
-                "INSERT INTO revisions(project_id, memory_id, revised_at, body) VALUES (?,?,?,?)",
-                (self.project, memory_uuid, _now(), json.dumps(current)),
+                "INSERT INTO revisions(project_id, memory_id, revised_at, body, author_client, author_name) "
+                "VALUES (?,?,?,?,?,?)",
+                (self.project, memory_uuid, _now(), json.dumps(current),
+                 (self.actor or {}).get("client_id"), (self.actor or {}).get("name")),
             )
             self._write(merged, memory_uuid)
             self._synchronize_relationships(memory_id)
@@ -1066,8 +1130,10 @@ class SqliteMemoryStore:
         touched: list[str] = []
         with self.connection:
             self.connection.execute(
-                "INSERT INTO revisions(project_id, memory_id, revised_at, body) VALUES (?,?,?,?)",
-                (self.project, memory_uuid, _now(), json.dumps(body)),
+                "INSERT INTO revisions(project_id, memory_id, revised_at, body, author_client, author_name) "
+                "VALUES (?,?,?,?,?,?)",
+                (self.project, memory_uuid, _now(), json.dumps(body),
+                 (self.actor or {}).get("client_id"), (self.actor or {}).get("name")),
             )
             referrers = self.connection.execute(
                 "SELECT DISTINCT src FROM edges WHERE project_id=? AND dst=?", (self.project, memory_uuid)
@@ -1221,16 +1287,20 @@ class SqliteMemoryStore:
         scope = memory.get("scope") or {}
         self.connection.execute(
             "INSERT INTO memories(project_id, uuid, slug, status, description, created, last_validated, "
-            "created_from_task, area, body, tier_since, tier_since_query) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,(SELECT queries FROM projects WHERE id=?)) "
+            "created_from_task, area, body, tier_since, tier_since_query, "
+            "author_client, author_name, author_key) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,(SELECT queries FROM projects WHERE id=?),?,?,?) "
             "ON CONFLICT(project_id, uuid) DO UPDATE SET slug=excluded.slug, status=excluded.status, "
             "description=excluded.description, created=excluded.created, "
             "last_validated=excluded.last_validated, created_from_task=excluded.created_from_task, "
-            "area=excluded.area, body=excluded.body",
+            "area=excluded.area, body=excluded.body, author_client=excluded.author_client, "
+            "author_name=excluded.author_name, author_key=excluded.author_key",
             (self.project, memory_uuid, slug, memory["status"], memory["description"],
              evidence.get("created"), evidence.get("last_validated"),
              evidence.get("created_from_task"), scope.get("area"), json.dumps(memory),
-             _now(), self.project),
+             _now(), self.project,
+             (self.actor or {}).get("client_id"), (self.actor or {}).get("name"),
+             (self.actor or {}).get("fingerprint")),
         )
         self.connection.execute("DELETE FROM labels WHERE project_id=? AND memory_id=?",
                                 (self.project, memory_uuid))

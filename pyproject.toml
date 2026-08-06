@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "project-memory-mcp"
-version = "0.4.0"
-description = "File-based, git-friendly project memory for coding agents: a JSON memory store with a label graph, served over MCP, with matching agent skills."
+version = "0.5.0"
+description = "Project memory for coding agents: a SQLite store with a label graph and retention audit, served over MCP, with matching agent skills."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Alexey Zabolotniy" }]
 requires-python = ">=3.10"
+# Ed25519 client identity. The only runtime dependency, and the reason is that
+# hand-rolling a signature scheme to avoid one is the wrong trade.
+dependencies = ["cryptography>=41"]
 keywords = ["mcp", "model-context-protocol", "agent", "memory", "claude-code", "codex", "llm"]
 classifiers = [
     "Development Status :: 4 - Beta",

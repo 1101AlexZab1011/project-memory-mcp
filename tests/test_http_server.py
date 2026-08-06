@@ -74,7 +74,7 @@ class HttpServerTests(unittest.TestCase):
     def test_missing_authorization_is_rejected(self):
         status, body = self.call("list_labels", {}, token=None)
         self.assertEqual(401, status)
-        self.assertIn("missing Authorization", body["error"])
+        self.assertIn("Authenticate with a signature", body["error"])
 
     def test_wrong_token_is_rejected(self):
         status, body = self.call("list_labels", {}, token="nope")

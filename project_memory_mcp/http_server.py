@@ -20,6 +20,7 @@ from __future__ import annotations
 import hmac
 import json
 import secrets
+import sqlite3
 import sys
 import threading
 import time
@@ -29,6 +30,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote_plus, urlparse
 
 from . import __version__
+from . import clients
 from . import ui
 from .server import TOOLS, McpServer
 from .sqlite_store import SqliteMemoryStore, StoreError
@@ -53,6 +55,19 @@ class _StoreRegistry:
         self._stores: dict[str, SqliteMemoryStore] = {}
         self._locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
+        self._control: sqlite3.Connection | None = None
+
+    def control(self) -> sqlite3.Connection:
+        """Connection for the server-wide tables - clients and enrollment codes.
+
+        Those are not scoped to a project, so they cannot ride on a project
+        store, and authentication has to work before any project is known.
+        """
+        with self._guard:
+            if self._control is None:
+                self._control = sqlite3.connect(self.database, check_same_thread=False)
+                self._control.row_factory = sqlite3.Row
+            return self._control
 
     def get(self, project: str) -> tuple[SqliteMemoryStore, threading.Lock]:
         with self._guard:
@@ -67,6 +82,9 @@ class _StoreRegistry:
             for store in self._stores.values():
                 store.close()
             self._stores.clear()
+            if self._control is not None:
+                self._control.close()
+                self._control = None
 
 
 class _Sessions:
@@ -111,6 +129,7 @@ class _Handler(BaseHTTPRequestHandler):
     token: str
     sessions: _Sessions
     ui_enabled: bool = True
+    client: clients.Client | None = None
 
     def log_message(self, fmt: str, *args: Any) -> None:  # quieter than the default
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -163,26 +182,35 @@ class _Handler(BaseHTTPRequestHandler):
             raise StoreError("missing project")
         return self.registry.get(project)
 
-    def _authorized(self) -> bool:
-        header = self.headers.get("Authorization", "")
-        if not header:
-            self._send(401, {"error": "missing Authorization header; expected 'Bearer <token>'"})
+    def _identify(self, method: str, path: str, body: bytes = b"") -> bool:
+        """Authenticate the caller and remember who it is for this request.
+
+        A signature is checked first: it proves possession of a key without
+        putting anything reusable on the wire, which is what makes it worth
+        having when the deployment has no TLS. Per-client tokens come next, and
+        the shared token last, so an existing setup keeps working while clients
+        are enrolled one at a time.
+        """
+        self.client = None
+        try:
+            self.client = clients.authenticate(
+                self.registry.control(), self.headers, method, path, body, self.token)
+            return True
+        except StoreError as error:
+            self._send(401, {"error": str(error)})
             return False
-        if not header.startswith("Bearer "):
-            self._send(401, {"error": "Authorization header must use the Bearer scheme"})
-            return False
-        presented = header[len("Bearer "):].strip()
-        if presented.startswith("${") and presented.endswith("}"):
-            # A client sent the literal placeholder, so its config was never
-            # expanded. Saying so turns a baffling auth failure into a one-line
-            # fix; it leaks nothing, since the value is the client's own text.
-            self._send(401, {"error": f"token was sent unexpanded as {presented!r} - the environment "
-                                      "variable is not set where the MCP client starts"})
-            return False
-        if not hmac.compare_digest(presented, self.token):
-            self._send(401, {"error": "invalid token"})
-            return False
-        return True
+
+    def _require_admin(self) -> bool:
+        if self.client is not None and self.client.is_admin:
+            return True
+        self._send(403, {"error": "this needs an admin client"})
+        return False
+
+    def _require_project(self, project: str) -> bool:
+        if self.client is None or self.client.may_access(project):
+            return True
+        self._send(403, {"error": f"this client has no access to project '{project}'"})
+        return False
 
     # ------------------------------------------------------------------ routes
 
@@ -310,13 +338,24 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def _api_post(self, path: str) -> None:
+        # Read the body up front, always. Responding to a POST without consuming
+        # it leaves bytes in the socket, and the next thing the client does on
+        # that connection fails - which showed up as two UI tests that failed
+        # roughly one run in ten and looked like flakiness.
+        raw = self._read_body()
+
         if path == "/api/login":
             presented = ""
-            for pair in self._read_body().decode("utf-8", "replace").split("&"):
+            for pair in raw.decode("utf-8", "replace").split("&"):
                 key, _, value = pair.partition("=")
                 if key == "token":
                     presented = unquote_plus(value)
-            if not hmac.compare_digest(presented, self.token):
+            accepted = bool(self.token) and hmac.compare_digest(presented, self.token)
+            if not accepted:
+                # A per-client token works here too: whoever holds a credential
+                # for this server can read it in a browser.
+                accepted = clients.token_is_valid(self.registry.control(), presented)
+            if not accepted:
                 self._send_html(401, ui.login_page("That token was not accepted."))
                 return
             sid = self.sessions.create()
@@ -335,7 +374,10 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._has_session():
             self._send(401, {"error": "not signed in"})
             return
-        payload = self._json_body()
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = {}
         try:
             store, lock = self._store_for(payload.get("project") or "")
             memory_id = payload.get("id") or ""
@@ -365,23 +407,40 @@ class _Handler(BaseHTTPRequestHandler):
         if self.ui_enabled and parsed.path.startswith("/api/"):
             self._api_post(parsed.path)
             return
+
+        # The body is read before authenticating, because a signature covers it:
+        # that is what makes a signature authorise one request rather than one
+        # endpoint. Size is bounded first so an oversized body cannot be used to
+        # make the server read forever before it has decided who is calling.
+        length = int(self.headers.get("Content-Length") or 0)
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._send(400, {"error": "oversized request body"})
+            return
+        raw = self.rfile.read(length) if length else b""
+
+        if parsed.path == "/enroll":
+            self._enroll(raw)
+            return
         if parsed.path != "/mcp":
             self._send(404, {"error": "not found; POST JSON-RPC to /mcp?project=<project-id>"})
             return
-        if not self._authorized():
+        # Sign over the full request target, query included: the project lives
+        # in the query string, so a signature that omitted it could be replayed
+        # against a different project.
+        if not self._identify("POST", self.path, raw):
             return
 
         project = (parse_qs(parsed.query).get("project") or [""])[0]
         if not project:
             self._send(400, {"error": "missing ?project=<project-id> in the URL"})
             return
-
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0 or length > MAX_BODY_BYTES:
-            self._send(400, {"error": "missing or oversized request body"})
+        if not self._require_project(project):
+            return
+        if not raw:
+            self._send(400, {"error": "missing request body"})
             return
         try:
-            message = json.loads(self.rfile.read(length).decode("utf-8"))
+            message = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             self._send(400, {"error": f"invalid JSON: {exc}"})
             return
@@ -394,12 +453,38 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         with lock:
-            response = McpServer(store).handle(message)
+            # Set while the lock is held, so the attribution recorded by any
+            # write belongs to the caller that triggered it and to nobody else.
+            store.actor = self.client.describe() if self.client else None
+            try:
+                response = McpServer(store).handle(message)
+            finally:
+                store.actor = None
         if response is None:
             self.send_response(204)
             self.end_headers()
             return
         self._send(200, response)
+
+    def _enroll(self, raw: bytes) -> None:
+        """Redeem an enrollment code. The only unauthenticated write there is.
+
+        It has to be: a machine enrolling has no credential yet. The code is what
+        stands in for one - single use, short lived, and worthless afterwards.
+        """
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._send(400, {"error": f"invalid JSON: {exc}"})
+            return
+        try:
+            result = clients.redeem_code(
+                self.registry.control(), str(payload.get("code") or ""),
+                str(payload.get("name") or ""), payload.get("public_key"))
+        except StoreError as exc:
+            self._send(400, {"error": str(exc)})
+            return
+        self._send(200, result)
 
 
 def run_http_server(database: Path | str, bind: str, port: int, token: str,
