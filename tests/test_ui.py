@@ -179,6 +179,42 @@ class UiTests(unittest.TestCase):
         self.assertTrue(payload["archived_at"])
         self.assertEqual(1, payload["tier"])
 
+    def counters(self):
+        store, lock = self.registry.get("demo")
+        with lock:
+            usage = store.load_usage()["memories"]
+            queries = store.connection.execute(
+                "SELECT queries FROM projects WHERE id='demo'").fetchone()["queries"]
+        return usage, queries
+
+    def test_browsing_does_not_change_the_data_an_audit_reads(self):
+        # A human reading the store must not alter the counters the audit judges
+        # on, or reviewing a report changes the thing being reviewed. The UI
+        # deliberately calls recall with record=False; nothing checked that until
+        # a mutation run removed it and the whole suite still passed.
+        self.login()
+        before_usage, before_queries = self.counters()
+
+        self.get("/api/memories?project=demo&q=cache+invalidation&limit=5")  # ranked path
+        self.get("/api/memories?project=demo&limit=5")                       # listing path
+        self.get("/api/memory?project=demo&id=cache-race")
+        self.get("/api/memories?project=demo&status=archived&limit=5")
+
+        after_usage, after_queries = self.counters()
+        self.assertEqual(before_usage, after_usage,
+                         "browsing the UI recorded usage against memories it showed")
+        self.assertEqual(before_queries, after_queries,
+                         "browsing the UI spent the exposure the audit measures gates in")
+
+    def test_an_agent_recall_does_still_record(self):
+        # The negative above is only meaningful if recording works at all -
+        # otherwise deleting the feature would satisfy it.
+        store, lock = self.registry.get("demo")
+        with lock:
+            store.recall("cache invalidation", limit=5)
+        _, queries = self.counters()
+        self.assertEqual(1, queries)
+
     def test_the_audit_endpoint_reports_the_last_run(self):
         self.login()
         status, body = self.get("/api/audit?project=demo")

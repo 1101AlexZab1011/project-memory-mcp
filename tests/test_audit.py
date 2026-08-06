@@ -210,6 +210,30 @@ class SafetyTests(AuditCase):
         held = [f for f in report.findings if f.verdict == VERDICT_HOLD]
         self.assertTrue(all("cap" in f.reason for f in held))
 
+    def test_the_cap_also_scales_with_the_size_of_the_store(self):
+        # The test above pins max_actions_per_run by setting the fraction to
+        # 1.0, which switches the fraction off - so nothing exercised it, and
+        # removing it entirely left the suite green. The fraction is the half
+        # that matters on a small store: an absolute cap of 50 would let one run
+        # archive a ten-memory project outright.
+        for i in range(10):
+            self.store.create_memory(memory(f"note-{i}", f"{CACHE} number {i}", ["area:x"]))
+            self.age(f"note-{i}", queries=0)
+        self.serve(6)
+        policy = AuditPolicy(gates=self.policy.gates,
+                             max_actions_per_run=50, max_action_fraction=0.2)
+        report = run_audit(self.store, policy)
+        self.assertEqual(2, report.archived, "one run touched more than its share of the store")
+        self.assertEqual(8, report.capped)
+
+    def test_the_cap_is_whichever_limit_is_tighter(self):
+        self.assertEqual(2, AuditPolicy(max_actions_per_run=50,
+                                        max_action_fraction=0.2).cap_for(10))
+        self.assertEqual(5, AuditPolicy(max_actions_per_run=5,
+                                        max_action_fraction=0.2).cap_for(100))
+        # Never zero: a store too small for the fraction still makes progress.
+        self.assertEqual(1, AuditPolicy(max_action_fraction=0.1).cap_for(1))
+
     def test_the_run_and_its_findings_are_recorded(self):
         self.store.create_memory(memory("quiet-note", CACHE, ["area:x"]))
         self.age("quiet-note", queries=0)

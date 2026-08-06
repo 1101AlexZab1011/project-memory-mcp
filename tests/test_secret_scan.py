@@ -91,10 +91,28 @@ class ScanTests(unittest.TestCase):
                 "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU")
         self.assertEqual(set(), self.rules(text))
 
-    def test_the_author_key_field_is_skipped_outright(self):
+    def test_key_material_fields_are_skipped_outright(self):
+        # Named for SKIP_FIELDS but it has to actually depend on it. With a
+        # SHA256: fingerprint this passed either way, because ALLOWED strips
+        # those before any rule sees them - so the test proved the allowlist
+        # worked and said nothing about the field skip. A vendor-prefixed value
+        # trips a rule that needs no name nearby, so only the skip can save it.
+        # Field names spelled out rather than read from SKIP_FIELDS. Iterating
+        # the constant under test meant emptying it produced an empty loop and a
+        # passing test - the same mistake one layer down.
+        skipped = ("author_key", "fingerprint", "public_key", "uuid")
+        self.assertTrue(set(skipped) <= set(secret_scan.SKIP_FIELDS))
+        for field in skipped:
+            with self.subTest(field=field):
+                body = memory("m", "A normal memory.")
+                body[field] = "ghp_" + "16C7e42F292c6912E7710c838347Ae178B4a"
+                self.assertEqual([], secret_scan.scan(body))
+
+    def test_the_same_value_in_an_ordinary_field_is_still_caught(self):
+        # The other half: skipping is scoped to those fields and nothing else.
         body = memory("m", "A normal memory.")
-        body["author_key"] = "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU"
-        self.assertEqual([], secret_scan.scan(body))
+        body["remembered_facts"] = ["ghp_" + "16C7e42F292c6912E7710c838347Ae178B4a"]
+        self.assertEqual(["github token"], [f.rule for f in secret_scan.scan(body)])
 
     # -------------------------------------------------------------- reporting
 
