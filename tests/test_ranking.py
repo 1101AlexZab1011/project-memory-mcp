@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from project_memory_mcp.ranking import (
+    DERIVED_MAX_NEIGHBOURS,
     build_adjacency,
     personalized_pagerank,
     rank_memories,
@@ -85,6 +86,45 @@ class AdjacencyTests(unittest.TestCase):
         self.assertIn("b", derived["a"])
         self.assertLess(derived["a"]["b"], 1.0)
         self.assertEqual(build_adjacency(memories, include_derived=False)["a"], {})
+
+    def test_total_derived_edges_stay_linear_in_store_size(self):
+        # Without a cap every memory sharing labels links to every other, so
+        # edges - and every PageRank iteration - grow as N^2. The cap bounds
+        # the total; individual degree can still exceed it, because connect()
+        # is symmetric and a memory chosen by many others keeps those edges.
+        # This fixture is the worst case for that: identical labels means every
+        # similarity ties, so all 40 pick the same first ten.
+        shared = ["area:x", "kind:bug"]
+        memories = {f"m-{i:03d}": memory(f"m-{i:03d}", f"A memory number {i} about caching.", shared)
+                    for i in range(40)}
+        adjacency = build_adjacency(memories, include_derived=True)
+
+        edges = sum(len(v) for v in adjacency.values()) // 2
+        self.assertLessEqual(edges, len(memories) * DERIVED_MAX_NEIGHBOURS)
+        self.assertLess(edges, len(memories) * (len(memories) - 1) // 2)  # far below complete
+        self.assertGreater(edges, 0)
+
+    def test_a_label_on_most_of_the_store_generates_no_candidates(self):
+        # A label that broad carries no relatedness signal, like a stopword.
+        # Below the floor it still counts, so small stores are unaffected.
+        big = {f"m-{i:04d}": memory(f"m-{i:04d}", f"Memory {i} with an ubiquitous label.", ["area:x"])
+               for i in range(300)}
+        self.assertEqual(0, sum(len(v) for v in build_adjacency(big, include_derived=True).values()))
+
+        small = {f"m-{i:03d}": memory(f"m-{i:03d}", f"Memory {i} with a shared label.", ["area:x"])
+                 for i in range(20)}
+        self.assertGreater(sum(len(v) for v in build_adjacency(small, include_derived=True).values()), 0)
+
+    def test_curated_links_survive_the_derived_cap(self):
+        shared = ["area:x", "kind:bug"]
+        memories = {f"m-{i:03d}": memory(f"m-{i:03d}", f"A memory number {i} about caching.", shared)
+                    for i in range(40)}
+        memories["m-000"]["relationships"]["related"] = [
+            {"id": "m-039", "reason": "They describe the same failure."}
+        ]
+        adjacency = build_adjacency(memories, include_derived=True)
+
+        self.assertEqual(1.0, adjacency["m-000"]["m-039"])
 
     def test_dangling_reference_is_ignored(self):
         memories = {"a": memory("a", "a memory referencing a ghost", ["area:x"], related=["gone"])}

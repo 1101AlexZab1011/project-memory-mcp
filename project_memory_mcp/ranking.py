@@ -46,6 +46,19 @@ DERIVED_LABEL_WEIGHT = 0.7
 DERIVED_FILE_WEIGHT = 0.3
 DERIVED_THRESHOLD = 0.34
 
+# Keep only a memory's strongest derived neighbours. Without this the derived
+# edge count grows as N^2, which makes both the build and every PageRank
+# iteration quadratic. It is also a quality bound: a memory with two hundred
+# derived neighbours is not meaningfully related to any of them.
+DERIVED_MAX_NEIGHBOURS = 10
+
+# A label or file shared by most of the store says nothing about relatedness -
+# the same reasoning that gives common words a near-zero IDF. Such groups are
+# skipped as candidate sources. The floor keeps small stores behaving exactly
+# as before, where even a broad label is still informative.
+DERIVED_MAX_GROUP_FRACTION = 0.25
+DERIVED_MIN_GROUP_FLOOR = 50
+
 PAGERANK_ALPHA = 0.15
 PAGERANK_MAX_ITER = 100
 PAGERANK_TOLERANCE = 1e-8
@@ -224,13 +237,42 @@ def build_adjacency(
         memory_id: set((memory.get("scope") or {}).get("files") or [])
         for memory_id, memory in memories.items()
     }
-    ids = sorted(memories)
-    for index, left in enumerate(ids):
-        for right in ids[index + 1 :]:
-            similarity = DERIVED_LABEL_WEIGHT * _jaccard(label_sets[left], label_sets[right])
-            similarity += DERIVED_FILE_WEIGHT * _jaccard(file_sets[left], file_sets[right])
-            if similarity >= DERIVED_THRESHOLD:
-                connect(left, right, DERIVED_EDGE_MAX_WEIGHT * similarity)
+
+    # Only pairs sharing a label or a file can clear the threshold, so generate
+    # candidates from an inverted index rather than comparing all N^2 pairs.
+    groups: dict[tuple[str, str], list[str]] = {}
+    for memory_id in sorted(memories):
+        for label in label_sets[memory_id]:
+            groups.setdefault(("label", label), []).append(memory_id)
+        for path in file_sets[memory_id]:
+            groups.setdefault(("file", path), []).append(memory_id)
+
+    group_limit = max(DERIVED_MIN_GROUP_FLOOR, int(len(memories) * DERIVED_MAX_GROUP_FRACTION))
+    scored: dict[str, list[tuple[float, str]]] = {}
+    compared: set[tuple[str, str]] = set()
+    for members in groups.values():
+        if len(members) < 2 or len(members) > group_limit:
+            continue
+        for index, left in enumerate(members):
+            for right in members[index + 1 :]:
+                pair = (left, right)
+                if pair in compared:
+                    continue
+                compared.add(pair)
+                similarity = DERIVED_LABEL_WEIGHT * _jaccard(label_sets[left], label_sets[right])
+                similarity += DERIVED_FILE_WEIGHT * _jaccard(file_sets[left], file_sets[right])
+                if similarity >= DERIVED_THRESHOLD:
+                    scored.setdefault(left, []).append((similarity, right))
+                    scored.setdefault(right, []).append((similarity, left))
+
+    # Keep each memory's strongest neighbours. connect() is symmetric, so a
+    # memory can end up with more than DERIVED_MAX_NEIGHBOURS edges if others
+    # chose it - that is the usual way a k-nearest-neighbour graph is made
+    # undirected, and it keeps a genuinely central memory reachable.
+    for memory_id, candidates in scored.items():
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        for similarity, other in candidates[:DERIVED_MAX_NEIGHBOURS]:
+            connect(memory_id, other, DERIVED_EDGE_MAX_WEIGHT * similarity)
     return adjacency
 
 
