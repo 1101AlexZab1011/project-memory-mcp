@@ -377,6 +377,14 @@ def run_http_server(database: Path | str, bind: str, port: int, token: str,
         projects = SqliteMemoryStore.list_projects(connection)
     finally:
         connection.close()
+
+    # Open every project now rather than on its first request. Opening is what
+    # applies a pending schema migration, and doing that inside a request means
+    # one client pays for it, and a failure surfaces as somebody's 500 instead
+    # of as a server that refused to start.
+    for name in projects:
+        registry.get(name)
+
     browser = f"http://{bind}:{port}/" if ui_enabled else "(disabled)"
     print(
         "\n".join([

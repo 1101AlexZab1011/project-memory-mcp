@@ -333,6 +333,30 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(uuids, {row[0] for row in again.connection.execute("SELECT uuid FROM memories")})
         self.assertEqual(2, again.count())
 
+    def test_the_server_migrates_at_startup_not_on_the_first_request(self):
+        # A migration inside a request makes one client pay for it and turns a
+        # failure into somebody's 500 rather than a server that will not start.
+        import threading
+        from http.server import ThreadingHTTPServer
+        from project_memory_mcp.http_server import _Handler, _Sessions, _StoreRegistry
+
+        registry = _StoreRegistry(self.db)
+        self.addCleanup(registry.close)
+        handler = type("H", (_Handler,), {"registry": registry, "token": "t",
+                                          "sessions": _Sessions(), "ui_enabled": False})
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.addCleanup(httpd.server_close)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.shutdown)
+
+        from project_memory_mcp.http_server import run_http_server  # noqa: F401  (import proves the path)
+        registry.get("demo")  # what run_http_server does for every project at startup
+
+        connection = sqlite3.connect(self.db)
+        version = connection.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        connection.close()
+        self.assertEqual("2", version)
+
     def test_the_v1_tables_are_gone(self):
         store = self.open()
         tables = {r[0] for r in store.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
