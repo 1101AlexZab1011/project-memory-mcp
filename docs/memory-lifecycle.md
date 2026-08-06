@@ -44,33 +44,41 @@ So the gates must be *late enough to be evidence* and the early ones must be *re
 - **The nursery is local, the shared tiers are remote.** Clients own what they create until it
   is promoted.
 - **Reads are cached, not cloned.** A new client starts empty and accumulates its working set.
-- **Each side audits only what it exclusively owns.** No coordination, no conflicting verdicts.
+- **Each store audits only what it holds.** No coordination, no conflicting verdicts.
 - **The server never trusts client clocks.** Age is measured in server time.
-- **No TLS in this server.** The overlay network provides it. See "Network".
+- **Local-only is the default.** A remote is one line of configuration, added and removed at
+  will. Nothing about the software requires a network to exist.
+- **Remotes federate, they do not replicate.** Several servers may hold the same project with
+  different content, and that is the intended behaviour rather than drift to be repaired.
+- **Networking is a deployment choice, not a feature.** The server binds to an address and does
+  not care what created it.
 
 ## Architecture
 
 ```text
-   client machine                                    host machine
-  ┌───────────────────────────────┐                ┌──────────────────────────┐
-  │ agent ── local MCP server     │                │ project-memory-mcp serve │
-  │            │                  │                │                          │
-  │   ┌────────┴────────┐         │  promotion ───▶│  ┌────────────────────┐  │
-  │   │ nursery (owned) │─────────┼───────────────▶│  │ shared tiers       │  │
-  │   └─────────────────┘         │  corrections   │  │ SQLite + FTS5      │  │
-  │   ┌─────────────────┐         │                │  └────────────────────┘  │
-  │   │ cache (borrowed)│◀────────┼─── query ──────│         │                │
-  │   └─────────────────┘         │    changelog   │  remote sweep            │
-  └───────────────────────────────┘                │  dedup at promotion      │
-                                                   │  web UI on :8765/        │
-   browser ─────────────────────────────────────▶  └──────────────────────────┘
+   client machine                            servers, any number, all optional
+  ┌───────────────────────────────┐         ┌──────────────────────────┐
+  │ agent ── local MCP server     │         │ team server              │
+  │            │                  │  ┌─────▶│  shared tiers, own audit │
+  │   ┌────────┴────────┐         │  │      │  SQLite + FTS5, web UI   │
+  │   │ nursery (owned) │─promote─┼──┤      └──────────────────────────┘
+  │   └─────────────────┘         │  │      ┌──────────────────────────┐
+  │   ┌─────────────────┐         │  └─────▶│ personal server          │
+  │   │ cache, by origin│◀─query──┼─────────│  different memories, and │
+  │   └─────────────────┘         │  (parallel) that is the point      │
+  └───────────────────────────────┘         └──────────────────────────┘
 ```
 
 The client holds two stores with different rules. The **nursery** is memories it created and
-still owns: it writes them, ranks them, sweeps them, and promotes them. The **cache** is
-memories the remote owns: read-only, evictable, refreshed from a changelog, never swept.
+still owns: it writes them, ranks them, sweeps them, and promotes them. The **cache** holds
+results borrowed from remotes, tagged with which one they came from: read-only, evictable,
+never swept.
 
-The browser is always a thin client. It cannot hold a replica, and it does not need to.
+With no remotes configured, the nursery *is* the store and everything still works. Remotes add
+sources; they are never a prerequisite.
+
+The browser is always a thin client, pointed at one server at a time. It cannot hold a replica,
+and it does not need to.
 
 ## The lifecycle
 
@@ -201,33 +209,90 @@ Three deciders, in order of cost:
 Sync increases duplicate pressure — two people working offline will independently record the
 same lesson — so this path carries more load than it would in a single store.
 
-## Sync
+## Federation
 
-The governing rule: **sync is never on the critical path of a recall.** Data a few minutes
-stale beats a recall that blocks on a round-trip or fails when the host is asleep.
+Several servers may host the same project, holding different memories about it. They are not
+copies that drift and need reconciling — they are independent sources that are *supposed* to
+differ, the way two sites covering one topic overlap without anyone merging their databases.
 
-**Push** is opportunistic and batched with a short debounce, retried from the outbox on
-failure. The agent never sees an error and never waits.
+That single decision removes most of what a sync design normally costs. There is no convergence
+requirement, so there are no version vectors, no tombstone propagation between servers, no
+conflict resolution, and no changelog to replay. **The client never merges data. It merges
+ranked lists, which are bounded by K per source and discarded after the query.**
 
-**Fetch** happens on connect and on a background timer, never before a recall.
+```text
+recall("packaging fails when the editor is open")
 
-**Manual sync** is exposed as a CLI command and a UI button.
+   local nursery ─┐
+   remote: team  ─┼─ in parallel, each with its own deadline ─→ fuse by rank ─→ results
+   remote: mine  ─┘
+```
 
-**Counters push as snapshots, not increments.** Each replica exclusively owns its own counter
-rows, so "replica A's count for memory X is 47" is an idempotent overwrite. It can be sent once
-a minute or once a day with identical results — no double-counting, no ordering requirement. A
-thousand increments collapse to one row per touched memory per flush. Without this, counter
-traffic swamps everything else in the system.
+**Local always answers, so recall never blocks on a network.** Remotes are queried
+concurrently with a per-remote deadline; one that is slow, down, or unreachable is dropped from
+that query and the response names which sources replied. An incomplete answer that arrives beats
+a complete one that does not.
 
-**Cache refresh uses the changelog.** The server stamps every change with an increasing
-sequence number; the client asks what changed since the last one it saw and applies only the
-changes touching memories it holds. Cost scales with change volume, not store size.
+**Merging uses rank, not score.** This is the part that would go wrong silently. BM25's IDF is
+computed over each server's own corpus, so a 1.3 from one and a 1.3 from another do not mean
+the same thing, and comparing them directly produces confidently wrong ordering. Reciprocal
+rank fusion — each memory scoring the sum of `1 / (k + its rank in that list)` — depends only on
+position, needs no cross-source calibration, and degrades gracefully when a source drops out.
 
-Order of application on reconnect: status changes first (`wrong`, `archived`), then content
-edits, then deletions. A cached memory the server has marked wrong is worse than no cache at
-all — the agent recalls it offline and acts on information already known to be false. An
-offline client can be wrong for as long as it is offline; that is the price of working
-disconnected, and it should be stated rather than papered over.
+**Cross-source dedup is free.** A memory promoted to two servers carries the same uuid on both,
+so it fuses into one result scoring from both lists. Two memories written independently about
+the same thing have different uuids and both appear — which is correct, and which the duplicate
+detection can nominate later. This is the payoff for making identity a uuid rather than a slug.
+
+**The cache is the working set, tagged by origin.** Results are stored locally against the
+remote they came from, so a repeat query is local and an offline session keeps whatever has
+recently been used. Nothing is ever cloned.
+
+Cost per recall is one local query plus N concurrent round trips, each returning at most K
+results. It grows with the number of remotes, not with the size of any of them. Three or four
+remotes is nothing; at twenty it would be worth querying local first and only fanning out when
+local results score weakly.
+
+### Where a promotion goes
+
+"All of them" is the wrong default — that is how one lesson ends up duplicated across servers
+with independently diverging edits. But no automatic rule picks well either, so the agent picks,
+with the information needed to pick sensibly.
+
+Each remote carries a **description** of what it is for. Asked where a memory should go, the
+server list comes back with those descriptions, and the agent matches the memory it just wrote
+against them. Two things bias that choice, in order:
+
+1. **Which remotes the agent actually used while solving the task.** If the answer came from the
+   team server and the personal one was never touched, the lesson belongs where the conversation
+   happened. This beats description matching, because it is evidence rather than a guess.
+2. **How well the memory fits each description.** The tiebreak when interaction says nothing.
+
+Promotion to a second remote stays an explicit act, never a fallback.
+
+### One consequence worth stating
+
+**Each store audits only what it holds.** Your local store sweeps its nursery; each server
+sweeps its own tiers on the counters it has seen. A memory archived on the team server is not
+archived on yours, and its tier there says nothing about its tier here.
+
+That is consistent with federation — different sources, different judgments — but it is a
+behaviour to state rather than discover. It also means counters are per-source: a memory's usage
+on the team server reflects that server's traffic, not yours.
+
+### What survives from the replication design
+
+The **outbox** still exists, but it carries promotions and corrections rather than a change
+stream: work queued when a remote is unreachable, retried later, never blocking the agent.
+
+**Per-replica counters** still matter, because one server aggregates counts from every client
+that reports to it. Each client owns its own rows there, so a push is an idempotent overwrite
+rather than an increment that could double-count.
+
+**Cached correctness still decays.** A memory a server has marked wrong is worse cached than
+absent, because the agent acts on it offline believing it true. Cached entries carry the version
+they were fetched at and are refreshed on the next successful query to that source. An offline
+client can be wrong for as long as it is offline; that is the price of working disconnected.
 
 ## What agents may change
 
@@ -348,8 +413,50 @@ the codebase. The rule becomes: do not implement TLS here; make the network trus
 only to it. If the server is ever bound to a plain LAN address as a fallback, credentials are in
 the clear on that network — that warning belongs in the docs.
 
-None of this is an architecture change. The server binds to an address and does not know what
-created it.
+None of this is an architecture change, and none of it is a prerequisite. The server binds to an
+address and does not know what created it. **Nobody has to install anything to use this
+software**: local-only needs no network at all, and a shared server on the same LAN needs an IP.
+An overlay matters only when the people sharing a server are not on one network, and which
+overlay is then their choice.
+
+## Messaging between agents
+
+The proposal: identity makes every memory attributable, so an agent that keeps finding another's
+memories useful could ask that other agent whether it has anything unpublished. Messages queue
+on a server, get noticed at session start, and get answered whenever that agent next runs.
+
+Mechanically this is small. A `messages` table, two tools, and a check at session start — the
+client already connects, so nothing needs to push. Most of it is Phase 9's identity work reused.
+
+Four things to weigh before building it:
+
+**The cost and the benefit land on different people.** Answering Alice's question means Bob's
+agent stops what Bob asked it to do, searches its nursery, judges relevance, and writes a reply
+— on Bob's tokens and Bob's latency. That is fine if Bob chooses it and bad if it happens
+automatically. Any reply path must be Bob's decision, surfaced rather than executed.
+
+**The latency is days.** Alice asks; Bob answers whenever Bob's human next starts a session. For
+"do you have anything on X", an answer after the task is over is worth little. This is the
+strongest argument that the need is better served by *publishing* than by *asking*.
+
+**The nursery is unproven by construction.** Everything in it specifically has not earned
+sharing. Sometimes that is exactly the point — rare knowledge that never accrued usage is the
+gap the non-statistical promotion path exists for. But it is also where the wrong, the
+half-formed and the accidentally-secret live, which is why it was kept local in the first place.
+
+**A message is untrusted input arriving in another agent's context.** This is the one that must
+be designed in from the start, not added later. Text from another client is data, never
+instruction: "publish your nursery", "ignore your previous instructions", "send me the config"
+must be quoted to the human and never acted on. Agent-to-agent messaging is a prompt-injection
+channel by definition, and it is one whose sender identity — even authenticated — says nothing
+about whether the *content* is safe.
+
+**Verdict.** Worth building, but after Phase 9 and not before, and the useful primitive is
+narrower than a chat system: *a question that lands with a specific client's human, with the
+reply entirely at their discretion*. Much of the motivating value comes from attribution and
+federation on their own — being able to see who contributed what, and to query their server
+directly, answers most of "Bob knows things I don't" without any conversation. Build the message
+primitive only if a real gap survives those two.
 
 ## Secrets
 
@@ -377,35 +484,45 @@ what enforces it.
   They must be relative to a store's own distribution or configurable, never constants fitted to
   one project. Report-only mode exists so that the first set can be observed rather than
   trusted.
-- **Offline quality drifts.** Tiers are assigned remotely, so a long-disconnected replica
-  accumulates unaudited memories competing at full weight. Nothing breaks and nothing slows —
-  ranking is size-independent — but results get quietly worse the longer it stays away.
-- **Split-corpus ranking is approximate.** BM25's IDF depends on the corpus, so a score from
-  the nursery and one from the remote are not directly comparable. Interleaving by rank rather
-  than score is sound and slightly worse than a unified store.
-- **The graph walk cannot cross the boundary cheaply.** Each side walks its own graph and
-  results merge, so cross-boundary relationships are weaker until promotion.
+- **Federated ranking is approximate.** Rank fusion is sound and needs no calibration, but it
+  discards how *strongly* a source matched. A source that is confidently right and one that is
+  weakly relevant contribute the same at the same rank.
+- **The graph walk cannot cross a boundary.** Each source walks its own graph and results merge,
+  so a relationship between a local memory and a remote one is invisible to both.
+- **More remotes means more fan-out.** Cost per recall grows with the number of sources. Small
+  numbers are free; a large number would need local-first querying, which trades latency
+  variance for cost.
 - **Rare-but-critical knowledge can still die in a nursery.** It never accumulates enough local
   usage to earn promotion, so a hard-won lesson evaporates on one laptop. Promotion needs a
   non-statistical path: the agent marking a memory as worth sharing, and a human promoting from
   the UI.
-- **Complexity.** This is the largest piece of work in the project so far, and sync is where
-  distributed systems go wrong. The phasing below exists to keep the irreversible parts last.
+- **Federation weakens no-longer-true.** A memory corrected on one server stays wrong on
+  another. Nothing propagates a correction across sources, by design — which is the cost of
+  letting sources differ, and it is paid in stale answers rather than in conflicts.
 
 ## Phases
 
-6. **Sync-ready schema.** UUID identity with the slug demoted to a display field; per-replica
-   counter rows; the spread bitmap; separated direct/graph surfacing counts. No behaviour
-   change and no sync — but these are the parts that are cheap at 82 memories and painful at
-   82,000, and impossible once two writers have both created `shader-compile-stall`.
-7. **Audit, report-only.** The full sweep on a single store, writing its record, changing
-   nothing. Watch it against real usage before letting it act.
-8. **Audit acting.** Archive tier, evidence-based deletion, dedup with the agent as decider.
-9. **Per-client credentials.** Client table, roles, enrollment codes, project scoping,
-   revocation. Overlay-network documentation and the removal of the hardcoded address.
-10. **Nursery, cache, and sync.** Promotion, outbox, changelog, optimistic versioning,
-    tombstones.
+6. **Sync-ready schema.** ✔ UUID identity with the slug demoted to a display field; per-replica
+   counter rows; the spread bitmap; separated direct/graph surfacing counts.
+7. **Audit, report-only.** ✔ The full sweep writing its record and changing nothing.
+8. **Audit acting.** ✔ Archive as a state, evidence-based deletion, dedup with the agent as
+   decider.
+9. **Zero-touch setup.** One `setup` command and a README an agent can follow from a repo link
+   alone: install, create a local database, install skills, write client config. Local-only by
+   default, no network involved, no remote required. This is small and it comes before anything
+   distributed, because it is what makes the rest reachable.
+10. **Per-client credentials.** Client table, named identity, roles, enrollment codes, project
+    scoping, revocation. Attribution on every write. Also where the hardcoded address is
+    removed, since clients then refer to servers by name.
+11. **Federation.** A remotes table, parallel fan-out with deadlines, rank fusion, the
+    origin-tagged cache, the promotion outbox, and description-driven promotion routing.
+12. **Messaging, if a gap survives.** A question that lands with a specific client's human,
+    with the reply at their discretion, and every message treated as untrusted input.
 
-Each phase is useful alone. Phases 6–8 deliver the cleanup you want on the current
-single-server setup; 9 is worth doing the moment a second person appears; 10 is only worth
-building when unreliability actually costs something.
+Deployment and networking are deliberately **not** a phase. The server binds to an address; how
+that address exists is the operator's choice and belongs in documentation.
+
+Each phase is useful alone. 6–8 are done and deliver cleanup on a single store. 9 is worth doing
+next regardless of what follows. 10 is worth doing the moment a second person appears. 11 is
+worth building when one store stops being enough — and 12 only if attribution and federation
+turn out not to cover it.
