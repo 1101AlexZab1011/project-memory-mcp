@@ -88,6 +88,21 @@ class _StoreRegistry:
                 self._control = None
 
 
+def _talks_to_other_machines(message: dict[str, Any]) -> bool:
+    """Whether this request will wait on a remote server.
+
+    Exactly one tool does, and only when asked to. Deciding here rather than
+    inside the dispatcher is deliberate: the transport owns the lock, so the
+    transport is what gets to say which calls run under it.
+    """
+    if message.get("method") != "tools/call":
+        return False
+    params = message.get("params") or {}
+    if params.get("name") != "recall":
+        return False
+    return bool((params.get("arguments") or {}).get("include_remotes"))
+
+
 class _Sessions:
     """Browser sessions for the UI.
 
@@ -488,14 +503,25 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": str(exc)})
             return
 
-        with lock:
-            # Set while the lock is held, so the attribution recorded by any
-            # write belongs to the caller that triggered it and to nobody else.
-            store.actor = self.client.describe() if self.client else None
-            try:
-                response = McpServer(store).handle(message)
-            finally:
-                store.actor = None
+        if _talks_to_other_machines(message):
+            # Run outside the project lock, and hand the lock down instead. A
+            # federated recall waits on other people's servers; holding this
+            # project's lock across that would stall every other request for it,
+            # reads included. recall_across takes the lock for its two database
+            # phases and drops it for the fan-out.
+            #
+            # No actor is set: the only tool routed here is a read, and
+            # attribution exists for writes.
+            response = McpServer(store, db_lock=lock).handle(message)
+        else:
+            with lock:
+                # Set while the lock is held, so the attribution recorded by any
+                # write belongs to the caller that triggered it and to nobody else.
+                store.actor = self.client.describe() if self.client else None
+                try:
+                    response = McpServer(store).handle(message)
+                finally:
+                    store.actor = None
         if response is None:
             self.send_response(204)
             self.end_headers()

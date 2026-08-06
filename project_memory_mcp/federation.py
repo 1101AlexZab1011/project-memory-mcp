@@ -31,6 +31,7 @@ import json
 import sqlite3
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -387,8 +388,18 @@ def deliver_outbox(store: Any, private_key: Any = None, limit: int = 50) -> dict
     return result
 
 
+@contextmanager
+def _held(lock: Any):
+    """Hold a lock if there is one. There is not, outside the HTTP server."""
+    if lock is None:
+        yield
+        return
+    with lock:
+        yield
+
+
 def recall_across(store: Any, query: str = "", limit: int = 8, full_count: int = 3,
-                  private_key: Any = None, **kwargs: Any) -> dict[str, Any]:
+                  private_key: Any = None, db_lock: Any = None, **kwargs: Any) -> dict[str, Any]:
     """Recall on this machine and every enabled remote, fused by rank.
 
     This lives here rather than on the store because it opens sockets, and the
@@ -398,11 +409,17 @@ def recall_across(store: Any, query: str = "", limit: int = 8, full_count: int =
 
     The order matters and is the point of the function. Local is queried first
     and always answers, so a machine with unreachable remotes still gets its own
-    memories. The fan-out happens with no lock held. Caching what came back is a
-    short local write, which is why it is safe to hand back to the store.
+    memories.
+
+    ``db_lock`` is the caller's per-project lock, and this takes it for the two
+    database phases only - never across the fan-out. That is the whole reason
+    this function exists rather than a store method: the lock protects SQLite,
+    the network is not SQLite, and holding one for the other is what turns a
+    slow remote into a stalled server.
     """
-    local = store.recall(query=query, limit=limit, full_count=full_count, **kwargs)
-    remotes = list_remotes(store.connection, enabled_only=True)
+    with _held(db_lock):
+        local = store.recall(query=query, limit=limit, full_count=full_count, **kwargs)
+        remotes = list_remotes(store.connection, enabled_only=True)
     if not remotes:
         return local
 
@@ -415,7 +432,8 @@ def recall_across(store: Any, query: str = "", limit: int = 8, full_count: int =
             entry["remote"] = name
         lists[name] = payload.get("memories") or []
     fused = fuse(lists, limit)
-    store.cache_remote_results(answers)
+    with _held(db_lock):
+        store.cache_remote_results(answers)
 
     return {
         "query": query,

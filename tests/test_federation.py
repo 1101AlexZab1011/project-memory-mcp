@@ -7,6 +7,7 @@ never takes down a query the others can serve.
 
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import time
@@ -17,6 +18,7 @@ from pathlib import Path
 from project_memory_mcp import federation
 from project_memory_mcp.federation import Remote, choose_remote, fuse
 from project_memory_mcp.http_server import _Handler, _Sessions, _StoreRegistry
+from project_memory_mcp.server import McpServer
 from project_memory_mcp.sqlite_store import SqliteMemoryStore
 from project_memory_mcp.validation import StoreError
 
@@ -314,6 +316,84 @@ class TwoServerTests(TierCase):
         self.assertEqual(["cache-race"], result["sent"])
         self.assertEqual(0, self.store.connection.execute(
             "SELECT COUNT(*) AS n FROM outbox").fetchone()["n"])
+
+
+class ToolSurfaceTests(TierCase):
+    """recall over the real tool dispatch, local and federated."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = SqliteMemoryStore(Path(self.tmp.name) / "local.db", "demo")
+        self.addCleanup(self.store.close)
+        self.store.add_label("area:x", "x")
+        self.store.create_memory(memory("cache-race", CACHE), visibility="public")
+
+    def call(self, arguments, db_lock=None):
+        response = McpServer(self.store, db_lock=db_lock).handle({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "recall", "arguments": arguments}})
+        return json.loads(response["result"]["content"][0]["text"])
+
+    def test_recall_is_local_unless_asked_otherwise(self):
+        # The default must not put the network on the hottest path in the system.
+        federation.add_remote(self.store.connection, "team", "http://127.0.0.1:9/", "down")
+        found = self.call({"query": "cache invalidation", "limit": 3})
+        self.assertEqual(["cache-race"], [m["id"] for m in found["memories"]])
+        self.assertNotIn("sources_answered", found)
+
+    def test_include_remotes_reports_a_source_that_did_not_answer(self):
+        federation.add_remote(self.store.connection, "team", "http://127.0.0.1:9/", "down")
+        found = self.call({"query": "cache invalidation", "limit": 3, "include_remotes": True})
+        # A partial answer, not a failure: local still replied.
+        self.assertEqual(["cache-race"], [m["id"] for m in found["memories"]])
+        self.assertEqual(["local"], found["sources_answered"])
+        self.assertIn("team", found["sources_unreachable"])
+
+    def test_include_remotes_with_none_configured_is_just_a_local_recall(self):
+        found = self.call({"query": "cache invalidation", "limit": 3, "include_remotes": True})
+        self.assertEqual(["cache-race"], [m["id"] for m in found["memories"]])
+
+    def test_the_lock_is_free_while_a_remote_is_being_waited_on(self):
+        # The point of step 2 and 3 together. A remote that never answers must
+        # not stall every other request for this project.
+        federation.add_remote(self.store.connection, "slow", "http://192.0.2.1:9/", "black hole")
+        lock = threading.Lock()
+        seen = []
+
+        def watcher():
+            # Give the fan-out time to be in flight, then check the lock is free.
+            time.sleep(0.3)
+            seen.append(lock.acquire(timeout=2.0))
+            if seen[-1]:
+                lock.release()
+
+        thread = threading.Thread(target=watcher)
+        thread.start()
+        self.call({"query": "cache invalidation", "limit": 3, "include_remotes": True},
+                  db_lock=lock)
+        thread.join(timeout=10)
+        self.assertEqual([True], seen,
+                         "the project lock was held while waiting on a remote")
+
+
+class LayeringGuardTests(unittest.TestCase):
+    def test_the_transport_only_unlocks_the_call_that_needs_it(self):
+        # If this ever returns True for a write, that write runs unserialised
+        # against SQLite, which is the bug this routing could introduce.
+        from project_memory_mcp.http_server import _talks_to_other_machines
+
+        def call(name, arguments=None):
+            return {"method": "tools/call",
+                    "params": {"name": name, "arguments": arguments or {}}}
+
+        self.assertTrue(_talks_to_other_machines(
+            call("recall", {"include_remotes": True})))
+        self.assertFalse(_talks_to_other_machines(call("recall", {})))
+        self.assertFalse(_talks_to_other_machines(call("create_memory", {"memory": {}})))
+        self.assertFalse(_talks_to_other_machines(
+            call("promote_memory", {"include_remotes": True})))
+        self.assertFalse(_talks_to_other_machines({"method": "tools/list"}))
 
 
 if __name__ == "__main__":

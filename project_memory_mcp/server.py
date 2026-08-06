@@ -106,6 +106,11 @@ TOOLS = [
                 "default": True,
                 "description": "Also walk low-weight edges derived from label/file overlap, not just authored links.",
             },
+            "include_remotes": {
+                "type": ["boolean", "null"],
+                "default": False,
+                "description": "Also ask every configured remote and merge the answers by rank. Off by default because it adds network latency to the most common call. A partial answer is normal, not an error: the result names which sources replied and which did not, and local always replies.",
+            },
         },
     ),
     _tool(
@@ -303,9 +308,14 @@ TOOLS = [
 
 
 class McpServer:
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: Any, db_lock: Any = None) -> None:
         # Any backend exposing the store API: file or SQLite.
         self.store = store
+        # Only set by a transport that serialises store access. It is handed to
+        # the one call that talks to other machines, so that call can hold it for
+        # its database work and drop it for the network. Every other tool runs
+        # entirely under the caller's lock and never sees this.
+        self.db_lock = db_lock
 
     def handle(self, message: dict[str, Any]) -> dict[str, Any] | None:
         if "id" not in message:
@@ -341,7 +351,7 @@ class McpServer:
                     limit=args.get("limit"),
                 )
             elif name == "recall":
-                payload = self.store.recall(
+                options = dict(
                     query=args.get("query") or "",
                     label_query=args.get("label_query"),
                     related_to=args.get("related_to"),
@@ -356,6 +366,14 @@ class McpServer:
                         True if args.get("include_derived") is None else bool(args["include_derived"])
                     ),
                 )
+                if args.get("include_remotes"):
+                    # recall_across queries local first and always, so this
+                    # degrades to a local answer rather than failing when every
+                    # remote is unreachable.
+                    payload = federation.recall_across(
+                        self.store, db_lock=self.db_lock, **options)
+                else:
+                    payload = self.store.recall(**options)
             elif name == "record_memory_use":
                 payload = self.store.record_use(args["memory_ids"])
             elif name == "list_remotes":
