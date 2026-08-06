@@ -200,6 +200,235 @@ def fuse(ranked_lists: dict[str, list[dict[str, Any]]], limit: int) -> list[dict
     return fused[:limit]
 
 
+#: A memory must have survived at least this tier before it can be published.
+#: Otherwise "earn your way into the shared store" is decorative: anything
+#: written thirty seconds ago could be pushed to everyone. Overridable for the
+#: rare-but-critical lesson that will never accrue usage on its own.
+MIN_PROMOTION_TIER = 2
+
+
+def promotion_targets(store: Any, memory_id: str,
+                      used: list[str] | None = None) -> dict[str, Any]:
+    """Where this memory could go, ranked, with the reasoning shown.
+
+    Only public memories are offered a destination. A private memory is private
+    because of who it is for, not because it has not proven itself, so no amount
+    of usage should ever route it outward.
+    """
+    from . import secret_scan
+
+    if store.publication_state(memory_id)["visibility"] != "public":
+        return {"id": memory_id, "visibility": "private", "targets": [],
+                "why": "private memories are never promoted; change visibility first"}
+    body = store.get_memory(memory_id)
+    result: dict[str, Any] = {
+        "id": memory_id, "visibility": "public",
+        "targets": choose_remote(list_remotes(store.connection), body, used)}
+    # Reported here as well as enforced at promotion, so the hold is something
+    # an agent can see coming and fix rather than run into.
+    findings = secret_scan.scan(body)
+    if findings:
+        result["blocked"] = "looks like it contains a secret"
+        result["secret_findings"] = [f.describe() for f in findings]
+    return result
+
+
+def promote(store: Any, memory_id: str, remote: str,
+            force: bool = False, allow_secrets: bool = False) -> dict[str, Any]:
+    """Queue one memory for publication to one named remote.
+
+    Never to all of them: that is how one lesson ends up duplicated across
+    servers with independently diverging edits.
+
+    **This does not touch the network.** Everything checkable locally is checked
+    here, and then the work goes in the outbox for the Computer to deliver.
+    Publishing inline would put a remote's availability on the request path: one
+    promotion to an unreachable server would hold this project's lock for the
+    whole connect timeout, stalling every other request including reads.
+
+    So the answer is always "queued", never "published". An agent gets an
+    immediate, honest answer about whether the memory is *allowed* out, and finds
+    out separately whether it got there - see ``outbox_status``.
+
+    ``force`` overrides the tier requirement; ``allow_secrets`` overrides the
+    credential scan. They are separate arguments because they are separate
+    judgments - "this matters more than its usage shows" and "that string is not
+    a secret" are not the same claim, and one should never imply the other.
+    """
+    from . import secret_scan
+
+    state = store.publication_state(memory_id)
+    if state["visibility"] != "public":
+        raise StoreError(
+            f"'{memory_id}' is private. Set its visibility to public before promoting it.")
+    if state["borrowed"]:
+        raise StoreError(
+            f"'{memory_id}' is a cached copy from another server, not yours to publish.")
+    if state["tier"] < MIN_PROMOTION_TIER and not force:
+        raise StoreError(
+            f"'{memory_id}' is still tier {state['tier']} and has not earned publication "
+            f"(needs tier {MIN_PROMOTION_TIER}). Pass force=true only for a lesson that "
+            f"matters more than its usage will ever show.")
+
+    known = list_remotes(store.connection)
+    if remote not in {r.name for r in known if r.enabled}:
+        names = ", ".join(r.name for r in known) or "(none configured)"
+        raise StoreError(f"Unknown remote '{remote}'. Known: {names}")
+
+    body = store.get_memory(memory_id)
+    # Last gate before the memory leaves this machine. A secret in a local
+    # memory sits on the host that already has it; this is the crossing. Checked
+    # here as well as at delivery so the refusal reaches whoever can act on it,
+    # rather than only a job log nobody reads.
+    if not allow_secrets:
+        findings = secret_scan.scan(body)
+        if findings:
+            raise StoreError(secret_scan.explain(memory_id, findings))
+
+    memory_uuid = state["uuid"]
+    with store.connection:
+        # Queueing the same memory for the same remote twice would deliver it
+        # twice. Re-queueing is a legitimate thing to ask for - after an edit, or
+        # after a failure - so it refreshes the existing row instead of refusing,
+        # and clears the stale error with it.
+        existing = store.connection.execute(
+            "SELECT id FROM outbox WHERE project_id=? AND memory_id=? AND remote=?",
+            (store.project, memory_uuid, remote)).fetchone()
+        if existing:
+            store.connection.execute(
+                "UPDATE outbox SET queued_at=?, last_error=NULL WHERE id=?",
+                (_now(), existing["id"]))
+        else:
+            store.connection.execute(
+                "INSERT INTO outbox(project_id, memory_id, remote, queued_at) VALUES (?,?,?,?)",
+                (store.project, memory_uuid, remote, _now()))
+    waiting = store.connection.execute(
+        "SELECT COUNT(*) n FROM outbox WHERE project_id=?", (store.project,)).fetchone()["n"]
+    return {"queued": memory_id, "remote": remote, "waiting": waiting,
+            "note": "delivery happens in the background; check outbox_status"}
+
+
+def outbox_status(store: Any, limit: int = 50) -> dict[str, Any]:
+    """What is waiting to be published, and why it has not gone yet.
+
+    The receipt for a queued promotion. Without it "queued" is a promise with
+    nothing to check it against.
+    """
+    rows = store.connection.execute(
+        "SELECT o.memory_id, o.remote, o.queued_at, o.attempts, o.last_error, m.slug "
+        "FROM outbox o LEFT JOIN memories m "
+        "  ON m.project_id=o.project_id AND m.uuid=o.memory_id "
+        "WHERE o.project_id=? ORDER BY o.id LIMIT ?", (store.project, limit)).fetchall()
+    return {"count": len(rows), "queued": [
+        {"id": row["slug"] or row["memory_id"], "remote": row["remote"],
+         "queued_at": row["queued_at"], "attempts": row["attempts"],
+         "last_error": row["last_error"]} for row in rows]}
+
+
+def deliver_outbox(store: Any, private_key: Any = None, limit: int = 50) -> dict[str, Any]:
+    """Send everything queued for publication. Safe to call as often as you like.
+
+    The other half of the outbox. `promote` decides whether a memory may leave;
+    this decides whether it can get there, which is the part that needs a
+    network and therefore the part that must not run on a request thread.
+
+    Bookkeeping happens against the store's connection rather than through store
+    methods, because delivery is this module's job and giving the store an API
+    for each step would put the outbox back inside it.
+    """
+    from . import secret_scan
+
+    rows = store.connection.execute(
+        "SELECT o.id, o.memory_id, o.remote, m.slug FROM outbox o "
+        "LEFT JOIN memories m ON m.project_id=o.project_id AND m.uuid=o.memory_id "
+        "WHERE o.project_id=? ORDER BY o.id LIMIT ?", (store.project, limit)).fetchall()
+    sent: list[str] = []
+    held: list[str] = []
+    by_name = {r.name: r for r in list_remotes(store.connection, enabled_only=True)}
+    for row in rows:
+        remote = by_name.get(row["remote"])
+        if remote is None:
+            continue
+        # Scanned again on the way out, not only on the way in: the body is
+        # re-read here, so an edit made while the item sat in the queue would
+        # otherwise ship unexamined.
+        body = store.get_memory(row["slug"])
+        findings = secret_scan.scan(body)
+        if findings:
+            held.append(body["id"])
+            with store.connection:
+                store.connection.execute(
+                    "UPDATE outbox SET last_error=? WHERE id=?",
+                    ("held: " + "; ".join(f.describe() for f in findings), row["id"]))
+            continue
+        try:
+            RemoteClient(remote, store.project, private_key).call(
+                "create_memory", {"memory": body, "visibility": "public",
+                                  "uuid": row["memory_id"]})
+        except Exception as error:  # noqa: BLE001 - any failure means "try again later"
+            with store.connection:
+                store.connection.execute(
+                    "UPDATE outbox SET attempts=attempts+1, last_error=? WHERE id=?",
+                    (str(error), row["id"]))
+            continue
+        sent.append(body["id"])
+        with store.connection:
+            store.connection.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
+            # Recorded here because this is the only place a delivery succeeds,
+            # so it is the only place that learns the remote is up.
+            store.connection.execute(
+                "UPDATE remotes SET last_ok=?, last_error=NULL WHERE name=?",
+                (_now(), row["remote"]))
+    result: dict[str, Any] = {"sent": sent, "still_queued": len(rows) - len(sent)}
+    if held:
+        # Named separately from a delivery failure: retrying will not help,
+        # somebody has to edit the memory.
+        result["held_for_secrets"] = held
+    return result
+
+
+def recall_across(store: Any, query: str = "", limit: int = 8, full_count: int = 3,
+                  private_key: Any = None, **kwargs: Any) -> dict[str, Any]:
+    """Recall on this machine and every enabled remote, fused by rank.
+
+    This lives here rather than on the store because it opens sockets, and the
+    store must not. A store method that blocks on a remote is a store method
+    that can hold the project lock for a connect timeout - the same defect the
+    outbox fixed for promotion.
+
+    The order matters and is the point of the function. Local is queried first
+    and always answers, so a machine with unreachable remotes still gets its own
+    memories. The fan-out happens with no lock held. Caching what came back is a
+    short local write, which is why it is safe to hand back to the store.
+    """
+    local = store.recall(query=query, limit=limit, full_count=full_count, **kwargs)
+    remotes = list_remotes(store.connection, enabled_only=True)
+    if not remotes:
+        return local
+
+    clients = [RemoteClient(remote, store.project, private_key) for remote in remotes]
+    answers, failures = fan_out(clients, "recall",
+                                {"query": query, "limit": limit, "full_count": 0})
+    lists = {"local": local["memories"]}
+    for name, payload in answers.items():
+        for entry in payload.get("memories") or []:
+            entry["remote"] = name
+        lists[name] = payload.get("memories") or []
+    fused = fuse(lists, limit)
+    store.cache_remote_results(answers)
+
+    return {
+        "query": query,
+        "count": len(fused),
+        "memories": fused,
+        "sources_answered": sorted(lists),
+        # Reported rather than hidden: an agent should know it is looking at a
+        # partial view of what the network holds.
+        "sources_unreachable": failures,
+        "considered": local.get("considered", 0) + sum(len(v) for v in lists.values()),
+    }
+
+
 def choose_remote(remotes: list[Remote], memory: dict[str, Any],
                   used: list[str] | None = None) -> list[dict[str, Any]]:
     """Rank remotes as destinations for one memory, best first.

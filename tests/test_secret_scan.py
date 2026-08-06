@@ -139,7 +139,7 @@ class PromotionGateTests(unittest.TestCase):
             "leaky", "How to reach the billing sandbox.",
             facts=[f"Set STRIPE_KEY={STRIPE} before running it."]))
         with self.assertRaises(StoreError) as caught:
-            self.store.promote("leaky", "team", force=True)
+            federation.promote(self.store, "leaky", "team", force=True)
         self.assertIn("stripe key", str(caught.exception))
         # And the refusal does not leak what it refused.
         self.assertNotIn(STRIPE, str(caught.exception))
@@ -151,23 +151,23 @@ class PromotionGateTests(unittest.TestCase):
             "leaky", "Billing sandbox access.",
             facts=[f"STRIPE_KEY={STRIPE}"]))
         with self.assertRaises(StoreError):
-            self.store.promote("leaky", "team", force=True)
+            federation.promote(self.store, "leaky", "team", force=True)
         # With allow_secrets it passes every gate and reaches the outbox.
-        result = self.store.promote("leaky", "team", force=True, allow_secrets=True)
+        result = federation.promote(self.store, "leaky", "team", force=True, allow_secrets=True)
         self.assertEqual("leaky", result["queued"])
 
     def test_a_clean_memory_promotes(self):
         self._public("clean", memory(
             "clean", "Where the staging key lives.",
             facts=["It is STRIPE_KEY in .env.staging, rotated quarterly by the platform team."]))
-        result = self.store.promote("clean", "team", force=True)
+        result = federation.promote(self.store, "clean", "team", force=True)
         self.assertEqual("clean", result["queued"])
 
     def test_promotion_targets_warns_before_the_attempt(self):
         self._public("leaky", memory(
             "leaky", "Billing sandbox access.",
             facts=[f"STRIPE_KEY={STRIPE}"]))
-        targets = self.store.promotion_targets("leaky")
+        targets = federation.promotion_targets(self.store, "leaky")
         self.assertIn("secret", targets["blocked"])
         self.assertTrue(any("stripe key" in f for f in targets["secret_findings"]))
 
@@ -176,10 +176,10 @@ class PromotionGateTests(unittest.TestCase):
         self._public("clean", memory(
             "clean", "Where the staging key lives.",
             facts=["It is STRIPE_KEY in .env.staging."]))
-        self.store.promote("clean", "team", force=True)
+        federation.promote(self.store, "clean", "team", force=True)
         self.store.update_memory("clean", {
             "remembered_facts": [f"STRIPE_KEY={STRIPE}"]})
-        result = self.store.drain_outbox()
+        result = federation.deliver_outbox(self.store)
         self.assertEqual(["clean"], result["held_for_secrets"])
         self.assertEqual([], result["sent"])
 

@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, unquote_plus, urlparse
 
 from . import __version__
 from . import clients
+from . import federation
 from . import ui
 from .server import TOOLS, McpServer
 from .sqlite_store import SqliteMemoryStore, StoreError
@@ -327,7 +328,8 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/remotes":
                 with lock:
                     self._send(200, {"remotes": [r.describe()
-                                                 for r in store.remotes(enabled_only=True)]})
+                                                 for r in federation.list_remotes(
+                                                     store.connection, enabled_only=True)]})
                 return
 
             if path == "/api/audit":
@@ -427,8 +429,8 @@ class _Handler(BaseHTTPRequestHandler):
                 # waving a credential through is a decision for whoever can read
                 # the memory next to the code, not for a button in a browser.
                 with lock:
-                    self._send(200, store.promote(
-                        memory_id, str(payload.get("remote") or ""),
+                    self._send(200, federation.promote(
+                        store, memory_id, str(payload.get("remote") or ""),
                         force=bool(payload.get("force"))))
                 return
         except StoreError as exc:

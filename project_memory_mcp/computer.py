@@ -215,8 +215,16 @@ def audit_job(store: Any, apply: bool = True, policy: Any = None) -> dict[str, A
 
 
 def outbox_job(store: Any) -> dict[str, Any]:
-    """Retry promotions that could not be delivered when they were made."""
-    return store.drain_outbox()
+    """Deliver everything queued for publication.
+
+    Not a retry path but the only path: `promote` never sends, so this is how a
+    memory reaches a remote at all. That is why it runs first among jobs -
+    somebody is waiting on the far end of a promotion and nobody is waiting on
+    a sweep.
+    """
+    from .federation import deliver_outbox
+
+    return deliver_outbox(store)
 
 
 def dedup_job(store: Any, threshold: float = 0.6, limit: int = 25) -> dict[str, Any]:

@@ -113,8 +113,8 @@ class LocalStoreTests(TierCase):
 
     def test_local_only_is_a_complete_setup(self):
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
-        self.assertEqual([], self.store.remotes())
-        found = self.store.federated_recall("cache invalidation")
+        self.assertEqual([], federation.list_remotes(self.store.connection))
+        found = federation.recall_across(self.store, "cache invalidation")
         self.assertEqual(["cache-race"], [m["id"] for m in found["memories"]])
 
     def test_memories_are_private_unless_asked_otherwise(self):
@@ -127,7 +127,7 @@ class LocalStoreTests(TierCase):
     def test_a_private_memory_has_no_promotion_targets(self):
         federation.add_remote(self.store.connection, "team", "http://team", "everything")
         self.store.create_memory(memory("user-habit", "The user prefers early returns always."))
-        targets = self.store.promotion_targets("user-habit")
+        targets = federation.promotion_targets(self.store, "user-habit")
         self.assertEqual([], targets["targets"])
         self.assertIn("never promoted", targets["why"])
 
@@ -135,14 +135,14 @@ class LocalStoreTests(TierCase):
         federation.add_remote(self.store.connection, "team", "http://team", "everything")
         self.store.create_memory(memory("user-habit", "The user prefers early returns always."))
         with self.assertRaises(StoreError) as caught:
-            self.store.promote("user-habit", "team")
+            federation.promote(self.store, "user-habit", "team")
         self.assertIn("private", str(caught.exception))
 
     def test_visibility_can_be_changed_deliberately(self):
         self.store.create_memory(memory("cache-race", CACHE))
         self.store.set_visibility("cache-race", "public")
         federation.add_remote(self.store.connection, "team", "http://team", "everything")
-        self.assertTrue(self.store.promotion_targets("cache-race")["targets"])
+        self.assertTrue(federation.promotion_targets(self.store, "cache-race")["targets"])
 
     def test_a_memory_that_has_not_earned_a_tier_is_not_published(self):
         # Otherwise "earn your way into the shared store" is decorative: a
@@ -150,21 +150,21 @@ class LocalStoreTests(TierCase):
         federation.add_remote(self.store.connection, "team", "http://team", "everything")
         self.store.create_memory(memory("brand-new", CACHE), visibility="public")
         with self.assertRaises(StoreError) as caught:
-            self.store.promote("brand-new", "team")
+            federation.promote(self.store, "brand-new", "team")
         self.assertIn("has not earned publication", str(caught.exception))
 
     def test_a_rare_but_critical_lesson_can_be_published_deliberately(self):
         # Knowledge that will never accrue usage still needs a way out.
         federation.add_remote(self.store.connection, "team", "http://127.0.0.1:9/", "down")
         self.store.create_memory(memory("rare-lesson", CACHE), visibility="public")
-        result = self.store.promote("rare-lesson", "team", force=True)
+        result = federation.promote(self.store, "rare-lesson", "team", force=True)
         self.assertIn("queued", result)
 
     def test_an_unreachable_remote_queues_the_promotion_instead_of_failing(self):
         federation.add_remote(self.store.connection, "team", "http://127.0.0.1:9/", "nothing here")
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
         self.earn("cache-race")
-        result = self.store.promote("cache-race", "team")
+        result = federation.promote(self.store, "cache-race", "team")
         self.assertIn("queued", result)
         queued = self.store.connection.execute("SELECT COUNT(*) AS n FROM outbox").fetchone()["n"]
         self.assertEqual(1, queued)
@@ -172,7 +172,7 @@ class LocalStoreTests(TierCase):
     def test_recall_still_answers_when_a_remote_is_down(self):
         federation.add_remote(self.store.connection, "dead", "http://127.0.0.1:9/", "unreachable")
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
-        found = self.store.federated_recall("cache invalidation")
+        found = federation.recall_across(self.store, "cache invalidation")
         self.assertEqual(["cache-race"], [m["id"] for m in found["memories"]])
         self.assertIn("dead", found["sources_unreachable"])
         self.assertEqual(["local"], found["sources_answered"])
@@ -210,27 +210,27 @@ class TwoServerTests(TierCase):
 
     def test_recall_reaches_both_and_says_which_answered(self):
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
-        found = self.store.federated_recall("packaging fails editor open", limit=5)
+        found = federation.recall_across(self.store, "packaging fails editor open", limit=5)
         self.assertIn("packaging-editor-open", [m["id"] for m in found["memories"]])
         self.assertEqual(["local", "team"], found["sources_answered"])
         self.assertEqual({}, found["sources_unreachable"])
 
     def test_a_result_says_which_source_it_came_from(self):
-        found = self.store.federated_recall("packaging fails editor open", limit=5)
+        found = federation.recall_across(self.store, "packaging fails editor open", limit=5)
         entry = [m for m in found["memories"] if m["id"] == "packaging-editor-open"][0]
         self.assertEqual(["team"], entry["sources"])
 
     def test_what_came_back_is_cached_and_marked_as_borrowed(self):
-        self.store.federated_recall("packaging fails editor open", limit=5)
+        federation.recall_across(self.store, "packaging fails editor open", limit=5)
         row = self.store.connection.execute(
             "SELECT origin_remote, visibility FROM memories WHERE slug='packaging-editor-open'"
         ).fetchone()
         self.assertEqual("team", row["origin_remote"])
 
     def test_a_cached_copy_is_not_this_machine_s_to_publish(self):
-        self.store.federated_recall("packaging fails editor open", limit=5)
+        federation.recall_across(self.store, "packaging fails editor open", limit=5)
         with self.assertRaises(StoreError) as caught:
-            self.store.promote("packaging-editor-open", "team")
+            federation.promote(self.store, "packaging-editor-open", "team")
         self.assertIn("cached copy", str(caught.exception))
 
     def test_a_cached_slug_does_not_collide_with_a_local_one(self):
@@ -238,7 +238,7 @@ class TwoServerTests(TierCase):
         # copies - otherwise caching would fail the moment two servers happened
         # to name a lesson the same way.
         self.store.create_memory(memory("packaging-editor-open", "A different local lesson entirely."))
-        self.store.federated_recall("packaging fails editor open", limit=5)
+        federation.recall_across(self.store, "packaging fails editor open", limit=5)
         rows = self.store.connection.execute(
             "SELECT origin_remote FROM memories WHERE slug='packaging-editor-open'").fetchall()
         self.assertEqual({None, "team"}, {row["origin_remote"] for row in rows})
@@ -246,13 +246,13 @@ class TwoServerTests(TierCase):
     def test_promotion_publishes_to_the_named_remote(self):
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
         self.earn("cache-race")
-        result = self.store.promote("cache-race", "team")
+        result = federation.promote(self.store, "cache-race", "team")
         # Queued, not published: promote never speaks to the network. The
         # Computer's outbox job is what delivers.
         self.assertEqual("cache-race", result["queued"])
         self.assertNotIn("promoted", result)
-        self.store.drain_outbox()
-        found = self.store.federated_recall("cache invalidation races auth", limit=5)
+        federation.deliver_outbox(self.store)
+        found = federation.recall_across(self.store, "cache invalidation races auth", limit=5)
         entry = [m for m in found["memories"] if m["id"] == "cache-race"][0]
         self.assertEqual(["local", "team"], entry["sources"])
 
@@ -264,41 +264,41 @@ class TwoServerTests(TierCase):
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
         self.earn("cache-race")
         started = time.monotonic()
-        result = self.store.promote("cache-race", "blackhole")
+        result = federation.promote(self.store, "cache-race", "blackhole")
         self.assertLess(time.monotonic() - started, 1.0)
         self.assertEqual("cache-race", result["queued"])
 
     def test_queueing_the_same_memory_twice_does_not_send_it_twice(self):
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
         self.earn("cache-race")
-        self.store.promote("cache-race", "team")
-        self.store.promote("cache-race", "team")
+        federation.promote(self.store, "cache-race", "team")
+        federation.promote(self.store, "cache-race", "team")
         self.assertEqual(1, self.store.connection.execute(
             "SELECT COUNT(*) AS n FROM outbox").fetchone()["n"])
-        self.assertEqual(["cache-race"], self.store.drain_outbox()["sent"])
+        self.assertEqual(["cache-race"], federation.deliver_outbox(self.store)["sent"])
 
     def test_outbox_status_reports_what_is_waiting_and_why(self):
         federation.add_remote(self.store.connection, "flaky", "http://127.0.0.1:9/", "down")
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
         self.earn("cache-race")
-        self.store.promote("cache-race", "flaky")
+        federation.promote(self.store, "cache-race", "flaky")
 
-        queued = self.store.outbox_status()
+        queued = federation.outbox_status(self.store)
         self.assertEqual(1, queued["count"])
         self.assertEqual("cache-race", queued["queued"][0]["id"])
         self.assertEqual(0, queued["queued"][0]["attempts"])
         self.assertIsNone(queued["queued"][0]["last_error"])
 
-        self.store.drain_outbox()
-        after = self.store.outbox_status()
+        federation.deliver_outbox(self.store)
+        after = federation.outbox_status(self.store)
         self.assertEqual(1, after["queued"][0]["attempts"])
         self.assertTrue(after["queued"][0]["last_error"])
 
     def test_a_delivered_promotion_records_that_the_remote_is_up(self):
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
         self.earn("cache-race")
-        self.store.promote("cache-race", "team")
-        self.store.drain_outbox()
+        federation.promote(self.store, "cache-race", "team")
+        federation.deliver_outbox(self.store)
         row = self.store.connection.execute(
             "SELECT last_ok, last_error FROM remotes WHERE name='team'").fetchone()
         self.assertTrue(row["last_ok"])
@@ -308,9 +308,9 @@ class TwoServerTests(TierCase):
         federation.add_remote(self.store.connection, "flaky", "http://127.0.0.1:9/", "down")
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
         self.earn("cache-race")
-        self.store.promote("cache-race", "flaky")
+        federation.promote(self.store, "cache-race", "flaky")
         federation.add_remote(self.store.connection, "flaky", self.url, "back up", token=TOKEN)
-        result = self.store.drain_outbox()
+        result = federation.deliver_outbox(self.store)
         self.assertEqual(["cache-race"], result["sent"])
         self.assertEqual(0, self.store.connection.execute(
             "SELECT COUNT(*) AS n FROM outbox").fetchone()["n"])

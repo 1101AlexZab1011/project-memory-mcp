@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from . import federation
 from .validation import StoreError
 
 
@@ -358,15 +359,17 @@ class McpServer:
             elif name == "record_memory_use":
                 payload = self.store.record_use(args["memory_ids"])
             elif name == "list_remotes":
-                payload = {"remotes": [r.describe() for r in self.store.remotes()]}
+                payload = {"remotes": [r.describe()
+                                       for r in federation.list_remotes(self.store.connection)]}
             elif name == "promotion_targets":
-                payload = self.store.promotion_targets(args["id"], args.get("consulted"))
+                payload = federation.promotion_targets(
+                    self.store, args["id"], args.get("consulted"))
             elif name == "promote_memory":
-                payload = self.store.promote(args["id"], args["remote"],
+                payload = federation.promote(self.store, args["id"], args["remote"],
                                              force=bool(args.get("force")),
                                              allow_secrets=bool(args.get("allow_secrets")))
             elif name == "outbox_status":
-                payload = self.store.outbox_status(limit=args.get("limit") or 50)
+                payload = federation.outbox_status(self.store, limit=args.get("limit") or 50)
             elif name == "set_memory_visibility":
                 payload = self.store.set_visibility(args["id"], args["visibility"])
             elif name == "send_message":

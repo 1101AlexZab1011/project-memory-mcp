@@ -1256,53 +1256,27 @@ class SqliteMemoryStore:
 
     # ---------------------------------------------------------------- federation
 
-    def remotes(self, enabled_only: bool = False) -> list[Any]:
-        from . import federation
+    def publication_state(self, memory_id: str) -> dict[str, Any]:
+        """The facts publication depends on, in one read.
 
-        return federation.list_remotes(self.connection, enabled_only=enabled_only)
-
-    def _remote_clients(self, private_key: Any = None) -> list[Any]:
-        from . import federation
-
-        return [federation.RemoteClient(remote, self.project, private_key)
-                for remote in self.remotes(enabled_only=True)]
-
-    def federated_recall(self, query: str = "", limit: int = 8, full_count: int = 3,
-                         private_key: Any = None, **kwargs: Any) -> dict[str, Any]:
-        """Recall across this machine and every enabled remote.
-
-        Local is queried first and always answers, so this never blocks on a
-        network. Remotes run concurrently with a deadline; whichever reply in
-        time are fused by rank, and the rest are reported rather than hidden -
-        an agent should know it is looking at a partial view.
+        Federation decides whether a memory may leave; those decisions are about
+        stored state, so the store answers them. One method rather than four
+        accessors because they are always wanted together, and because a caller
+        that has to make four calls will eventually make three.
         """
-        from . import federation
+        memory_uuid = self._uuid_for(memory_id)
+        row = self.connection.execute(
+            "SELECT tier, visibility, origin_remote FROM memories "
+            "WHERE project_id=? AND uuid=?", (self.project, memory_uuid)).fetchone()
+        if row is None:
+            raise StoreError(f"Unknown memory: {memory_id}")
+        return {"uuid": memory_uuid, "tier": row["tier"], "visibility": row["visibility"],
+                # A cached copy belongs to the server it came from. Publishing it
+                # onward would make this machine a source for something it only
+                # borrowed.
+                "borrowed": row["origin_remote"] is not None}
 
-        local = self.recall(query=query, limit=limit, full_count=full_count, **kwargs)
-        clients = self._remote_clients(private_key)
-        if not clients:
-            return local
-
-        answers, failures = federation.fan_out(
-            clients, "recall", {"query": query, "limit": limit, "full_count": 0})
-        lists = {"local": local["memories"]}
-        for name, payload in answers.items():
-            for entry in payload.get("memories") or []:
-                entry["remote"] = name
-            lists[name] = payload.get("memories") or []
-        fused = federation.fuse(lists, limit)
-        self._cache_remote_results(answers)
-
-        return {
-            "query": query,
-            "count": len(fused),
-            "memories": fused,
-            "sources_answered": sorted(lists),
-            "sources_unreachable": failures,
-            "considered": local.get("considered", 0) + sum(len(v) for v in lists.values()),
-        }
-
-    def _cache_remote_results(self, answers: dict[str, Any]) -> None:
+    def cache_remote_results(self, answers: dict[str, Any]) -> None:
         """Keep what came back, tagged with where it came from.
 
         The cache is the working set: whatever has recently been needed stays
@@ -1329,185 +1303,6 @@ class SqliteMemoryStore:
                 "description=excluded.description, body=excluded.body, "
                 "origin_remote=excluded.origin_remote",
                 rows)
-
-    def promotion_targets(self, memory_id: str, used: list[str] | None = None) -> dict[str, Any]:
-        """Where this memory could go, ranked, with the reasoning shown.
-
-        Only public memories are offered a destination. A private memory is
-        private because of who it is for, not because it has not proven itself,
-        so no amount of usage should ever route it outward.
-        """
-        from . import federation, secret_scan
-
-        memory_uuid = self._uuid_for(memory_id)
-        if self._visibility_of(memory_uuid) != "public":
-            return {"id": memory_id, "visibility": "private", "targets": [],
-                    "why": "private memories are never promoted; change visibility first"}
-        body = self.get_memory(memory_id)
-        result: dict[str, Any] = {
-            "id": memory_id, "visibility": "public",
-            "targets": federation.choose_remote(self.remotes(), body, used)}
-        # Reported here as well as enforced at promotion, so the hold is
-        # something an agent can see coming and fix rather than run into.
-        findings = secret_scan.scan(body)
-        if findings:
-            result["blocked"] = "looks like it contains a secret"
-            result["secret_findings"] = [f.describe() for f in findings]
-        return result
-
-    #: A memory must have survived at least this tier before it can be published.
-    #: Otherwise "earn your way into the shared store" is decorative: anything
-    #: written thirty seconds ago could be pushed to everyone. Overridable for
-    #: the rare-but-critical lesson that will never accrue usage on its own.
-    MIN_PROMOTION_TIER = 2
-
-    def promote(self, memory_id: str, remote: str,
-                force: bool = False, allow_secrets: bool = False) -> dict[str, Any]:
-        """Queue one memory for publication to one named remote.
-
-        Never to all of them: that is how one lesson ends up duplicated across
-        servers with independently diverging edits.
-
-        **This does not touch the network.** Everything checkable here is checked
-        here, and then the work goes in the outbox for the Computer to deliver.
-        Publishing inline would put a remote's availability on the request path:
-        one promotion to an unreachable server would hold this project's lock for
-        the whole connect timeout, stalling every other request including reads.
-        The delivery machinery already exists and already runs first among jobs;
-        the only reason this used to send inline is that it predates the Computer.
-
-        So the answer is always "queued", never "published". An agent gets an
-        immediate, honest answer about whether the memory is *allowed* out, and
-        finds out separately whether it got there - see ``outbox_status``.
-
-        ``force`` overrides the tier requirement; ``allow_secrets`` overrides the
-        credential scan. They are separate arguments because they are separate
-        judgments - "this matters more than its usage shows" and "that string is
-        not a secret" are not the same claim, and one should never imply the other.
-        """
-        from . import secret_scan
-
-        memory_uuid = self._uuid_for(memory_id)
-        if self._visibility_of(memory_uuid) != "public":
-            raise StoreError(
-                f"'{memory_id}' is private. Set its visibility to public before promoting it.")
-        if self.connection.execute(
-            "SELECT 1 FROM memories WHERE project_id=? AND uuid=? AND origin_remote IS NOT NULL",
-            (self.project, memory_uuid),
-        ).fetchone():
-            raise StoreError(f"'{memory_id}' is a cached copy from another server, not yours to publish.")
-
-        tier = self.connection.execute(
-            "SELECT tier FROM memories WHERE project_id=? AND uuid=?",
-            (self.project, memory_uuid)).fetchone()["tier"]
-        if tier < self.MIN_PROMOTION_TIER and not force:
-            raise StoreError(
-                f"'{memory_id}' is still tier {tier} and has not earned publication "
-                f"(needs tier {self.MIN_PROMOTION_TIER}). Pass force=true only for a lesson that "
-                f"matters more than its usage will ever show.")
-
-        matches = [r for r in self.remotes(enabled_only=True) if r.name == remote]
-        if not matches:
-            known = ", ".join(r.name for r in self.remotes()) or "(none configured)"
-            raise StoreError(f"Unknown remote '{remote}'. Known: {known}")
-
-        body = self.get_memory(memory_id)
-        # Last gate before the memory leaves this machine. A secret in a local
-        # memory sits on the host that already has it; this is the crossing.
-        # Checked here as well as at delivery so the refusal reaches whoever can
-        # act on it, rather than only a job log nobody reads.
-        if not allow_secrets:
-            findings = secret_scan.scan(body)
-            if findings:
-                raise StoreError(secret_scan.explain(memory_id, findings))
-
-        with self.connection:
-            # Queueing the same memory for the same remote twice would deliver it
-            # twice. Re-queueing is a legitimate thing to ask for - after an edit,
-            # or after a failure - so it refreshes the existing row instead of
-            # refusing, and clears the stale error with it.
-            existing = self.connection.execute(
-                "SELECT id FROM outbox WHERE project_id=? AND memory_id=? AND remote=?",
-                (self.project, memory_uuid, remote)).fetchone()
-            if existing:
-                self.connection.execute(
-                    "UPDATE outbox SET queued_at=?, last_error=NULL WHERE id=?",
-                    (_now(), existing["id"]))
-            else:
-                self.connection.execute(
-                    "INSERT INTO outbox(project_id, memory_id, remote, queued_at) "
-                    "VALUES (?,?,?,?)", (self.project, memory_uuid, remote, _now()))
-        waiting = self.connection.execute(
-            "SELECT COUNT(*) n FROM outbox WHERE project_id=?", (self.project,)).fetchone()["n"]
-        return {"queued": memory_id, "remote": remote, "waiting": waiting,
-                "note": "delivery happens in the background; check outbox_status"}
-
-    def outbox_status(self, limit: int = 50) -> dict[str, Any]:
-        """What is waiting to be published, and why it has not gone yet.
-
-        The receipt for a queued promotion. Without it "queued" is a promise with
-        nothing to check it against.
-        """
-        rows = self.connection.execute(
-            "SELECT o.memory_id, o.remote, o.queued_at, o.attempts, o.last_error, m.slug "
-            "FROM outbox o LEFT JOIN memories m "
-            "  ON m.project_id=o.project_id AND m.uuid=o.memory_id "
-            "WHERE o.project_id=? ORDER BY o.id LIMIT ?", (self.project, limit)).fetchall()
-        return {"count": len(rows), "queued": [
-            {"id": row["slug"] or row["memory_id"], "remote": row["remote"],
-             "queued_at": row["queued_at"], "attempts": row["attempts"],
-             "last_error": row["last_error"]} for row in rows]}
-
-    def drain_outbox(self, private_key: Any = None, limit: int = 50) -> dict[str, Any]:
-        """Retry queued promotions. Safe to call as often as you like."""
-        from . import federation, secret_scan
-
-        rows = self.connection.execute(
-            "SELECT * FROM outbox WHERE project_id=? ORDER BY id LIMIT ?",
-            (self.project, limit)).fetchall()
-        sent, still_waiting, held = [], [], []
-        by_name = {r.name: r for r in self.remotes(enabled_only=True)}
-        for row in rows:
-            remote = by_name.get(row["remote"])
-            if remote is None:
-                continue
-            # Scanned again on the way out, not only on the way in: the body is
-            # re-read here, so an edit made while the item sat in the queue would
-            # otherwise ship unexamined.
-            body = self._body_by_uuid(row["memory_id"])
-            findings = secret_scan.scan(body)
-            if findings:
-                held.append(body["id"])
-                with self.connection:
-                    self.connection.execute(
-                        "UPDATE outbox SET last_error=? WHERE id=?",
-                        ("held: " + "; ".join(f.describe() for f in findings), row["id"]))
-                continue
-            try:
-                federation.RemoteClient(remote, self.project, private_key).call(
-                    "create_memory", {"memory": body, "visibility": "public",
-                                      "uuid": row["memory_id"]})
-            except Exception as error:
-                still_waiting.append(row["remote"])
-                with self.connection:
-                    self.connection.execute(
-                        "UPDATE outbox SET attempts=attempts+1, last_error=? WHERE id=?",
-                        (str(error), row["id"]))
-                continue
-            sent.append(body["id"])
-            with self.connection:
-                self.connection.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
-                # Recorded here because this is now the only place a delivery
-                # succeeds, so it is the only place that knows the remote is up.
-                self.connection.execute(
-                    "UPDATE remotes SET last_ok=?, last_error=NULL WHERE name=?",
-                    (_now(), row["remote"]))
-        result = {"sent": sent, "still_queued": len(rows) - len(sent)}
-        if held:
-            # Named separately from a delivery failure: retrying will not help,
-            # somebody has to edit the memory.
-            result["held_for_secrets"] = held
-        return result
 
     def duplicate_candidates(self, limit: int = 25, threshold: float = 0.6) -> dict[str, Any]:
         """Pairs that look like the same lesson written twice.
