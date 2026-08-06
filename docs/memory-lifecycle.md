@@ -52,6 +52,9 @@ So the gates must be *late enough to be evidence* and the early ones must be *re
   different content, and that is the intended behaviour rather than drift to be repaired.
 - **Networking is a deployment choice, not a feature.** The server binds to an address and does
   not care what created it.
+- **Visibility is decided when a memory is written**, and it is orthogonal to maturity. Private
+  is for what only helps here; no amount of usage promotes it. Private by default, because
+  over-sharing is the harder mistake to undo.
 
 ## Architecture
 
@@ -563,24 +566,29 @@ what enforces it.
 7. **Audit, report-only.** ✔ The full sweep writing its record and changing nothing.
 8. **Audit acting.** ✔ Archive as a state, evidence-based deletion, dedup with the agent as
    decider.
-9. **Zero-touch setup.** One `setup` command and a README an agent can follow from a repo link
+9. **Zero-touch setup.** ✔ One `setup` command and a README an agent can follow from a repo link
    alone: install, create a local database, install skills, write client config. Local-only by
    default, no network involved, no remote required. This is small and it comes before anything
    distributed, because it is what makes the rest reachable.
-10. **Keypair identity and per-client credentials.** Ed25519 per client, generated locally
+10. **Keypair identity and per-client credentials.** ✔ Ed25519 per client, generated locally
     and never transmitted; signed requests for agents, sessions for the browser; enrollment
     codes that carry a public key rather than issue a secret; roles, project scoping,
     revocation; attribution recording the fingerprint alongside the name. Also where the
     hardcoded address is removed, since clients then refer to servers by name.
-11. **Federation.** A remotes table, parallel fan-out with deadlines, rank fusion, the
+11. **Federation.** ✔ A remotes table, parallel fan-out with deadlines, rank fusion, the
     origin-tagged cache, the promotion outbox, and description-driven promotion routing.
-12. **Messaging, if a gap survives.** A question that lands with a specific client's human,
-    with the reply at their discretion, and every message treated as untrusted input.
+12. **Messaging.** ✔ A question that lands with a specific client's human, with the reply at
+    their discretion, and every message body returned labelled as untrusted input.
 
 Deployment and networking are deliberately **not** a phase. The server binds to an address; how
 that address exists is the operator's choice and belongs in documentation.
 
-Each phase is useful alone. 6–8 are done and deliver cleanup on a single store. 9 is worth doing
-next regardless of what follows. 10 is worth doing the moment a second person appears. 11 is
-worth building when one store stops being enough — and 12 only if attribution and federation
-turn out not to cover it.
+All phases are built. What remains is not more construction but use: every threshold in the
+audit is still a guess, `applied` is still zero everywhere, and no second client has yet
+enrolled against a real server. Those are answered by running it, not by writing more of it.
+
+On 12 being conditional: the plan said to build messaging only if attribution and federation
+left a real gap. They do leave one, and it is narrow. Federation answers "what does that server
+know"; attribution answers "who wrote this". Neither answers "why is this true", which is the
+question a memory's own text cannot contain and only its author can. That is the case messaging
+now serves, and it is the only one it should.
