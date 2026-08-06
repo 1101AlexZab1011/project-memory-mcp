@@ -619,27 +619,30 @@ the browser is given the first and never the second.
   one project. Report-only mode exists so that the first set can be observed rather than
   trusted. Reachability is now measured — see below — but whether the *verdicts* are right
   still is not.
-- **The upper tiers are calibrated for a busier project than most.** A gate needs exposure and
-  days, and whichever takes longer binds. Time for a memory to become reviewable:
+- **Very light use still cannot retire knowledge quickly, and that is correct.** A gate needs
+  exposure and days, and whichever takes longer binds. Exposure counts from entry to the tier,
+  so the totals compound. Days for a memory to become reviewable, after recalibrating tier 3:
 
-  | usage | tier 1 | tier 2 | tier 3 |
-  |---|---|---|---|
-  | daily, 20 recalls/day | 30d | 180d | 730d |
-  | weekdays, 8/day | 30d | 180d | 875d |
-  | 3 days a week, 10 | 30d | 180d | 1167d |
-  | weekly, 5 | 70d | 700d | 7000d |
-  | twice a month, 5 | 150d | 1500d | 15000d |
+  | usage | tier 1 | tier 2 | tier 3 | *(tier 3 was)* |
+  |---|---|---|---|---|
+  | daily, 20 recalls/day | 30d | 180d | 365d | *730d* |
+  | weekdays, 8/day | 30d | 180d | 365d | *875d* |
+  | 3 days a week, 10 | 30d | 180d | 365d | *1167d* |
+  | weekly, 5 | 70d | 700d | 840d | *7000d* |
+  | twice a month, 5 | 150d | 1500d | 1800d | *15000d* |
 
   Below **1.67 recalls/day** the query gate binds at tier 1 rather than the day gate; the
-  crossover is 2.78/day for tier 2 and 6.85/day for tier 3.
+  crossover is 2.78/day for tier 2 and 1.64/day for tier 3.
 
   Tier 1 is fine for anyone: 30 days at normal use, 70–150 days for occasional use, which is a
-  reasonable nursery period rather than a stall. **Tier 2 is what matters**, because publication
-  requires it, and at 30–150 days it is reachable. Tier 3 is effectively out of reach for a
-  light-use project — which mostly means a memory that reaches tier 2 and passes review is
-  never examined again. That is the limit of an escalating-review ladder rather than a bug, but
-  it is not what "tier 3" implies, and `min_queries = 5000` should be read as "not in practice"
-  rather than as a plan.
+  nursery period rather than a stall. Publication needs only tier 2, which means passing the
+  tier-1 gate, so it is reachable everywhere.
+
+  What remains is that a project used twice a month waits years before anything can be retired.
+  That is not a calibration failure — it is the honest consequence of having little evidence.
+  A store nobody queries has served no opportunities to be useful, and retiring knowledge on
+  that basis would be exactly the absence-of-evidence reasoning this design refuses. Reproduce
+  any of these numbers with `python tools/gate_reachability.py`, which runs the real `_judge`.
 - **Federated ranking is approximate.** Rank fusion is sound and needs no calibration, but it
   discards how *strongly* a source matched. A source that is confidently right and one that is
   weakly relevant contribute the same at the same rank.

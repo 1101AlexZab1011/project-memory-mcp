@@ -63,10 +63,40 @@ class TierGate:
 # in weeks; build knowledge surfaces when the build breaks, which might be twice
 # a year. A seven-day gate keeps only what is relevant to the task in front of
 # you - which is exactly the knowledge an agent could rediscover cheapest.
+#
+# `min_queries` is not a maturity requirement, it is a fairness one: it asks
+# whether there were enough opportunities for silence to mean anything. That has
+# an answer rather than a preference. If a memory is relevant to a fraction p of
+# queries, the chance it is never surfaced in Q of them is (1-p)^Q, so the Q at
+# which silence stops being luck is ln(0.05)/ln(1-p):
+#
+#     relevant to 1 query in  |   20    50   100   200   500
+#     queries needed          |   58   148   298   598  1496
+#
+# Read the other way, that is what each gate is really asking:
+#
+#     50 queries   -> would have caught anything relevant to 1 query in 17
+#     500 queries  -> ................................... 1 query in 167
+#     5000 queries -> ................................... 1 query in 1670
+#
+# The old tier-3 gate of 5000 was asking whether a memory relevant to one query
+# in 1,670 had surfaced. No decision here needs that resolution, and the cost of
+# asking for it was that the gate could not be reached: at weekly use it was
+# nineteen years away, so a memory reaching tier 3 was never reviewed again.
+#
+# Tier 3 now asks at the same statistical grain as tier 2 - roughly 1 in 200 -
+# because by then relevance is not in question. The memory already proved itself
+# at tier 2; tier 3 is asking whether it has since gone obsolete, and detecting
+# that a proven memory has stopped surfacing needs no finer a measure than
+# establishing it surfaced in the first place.
+#
+# The escalation between tiers is therefore in *time*, which is what actually
+# separates "unproven" from "proven" from "durable", rather than in a resolution
+# nobody needs.
 DEFAULT_GATES = (
     TierGate(tier=1, min_queries=50, min_days=30),
     TierGate(tier=2, min_queries=500, min_days=180),
-    TierGate(tier=3, min_queries=5000, min_days=730),
+    TierGate(tier=3, min_queries=600, min_days=365),
 )
 
 
