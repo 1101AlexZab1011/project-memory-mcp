@@ -251,12 +251,17 @@ class _Handler(BaseHTTPRequestHandler):
                         # The same ranking the agent gets, so a human searching
                         # sees what recall would have returned, not a different
                         # answer from a second search path.
+                        # record=False: a human reading the store must not
+                        # change the counters the audit reads, or reviewing a
+                        # report would alter the data the report is about.
                         found = store.recall(query=text, label_query=label, status_filter=status,
-                                             limit=limit + offset, full_count=0)["memories"]
+                                             limit=limit + offset, full_count=0,
+                                             record=False)["memories"]
                         rows = found[offset:offset + limit]
                     else:
                         rows = store.recall(order="recent", label_query=label, status_filter=status,
-                                            limit=limit, offset=offset, full_count=0)["memories"]
+                                            limit=limit, offset=offset, full_count=0,
+                                            record=False)["memories"]
                     counters = store.load_usage()["memories"]
                 for row in rows:
                     row["usage"] = counters.get(row["id"], {})
@@ -269,6 +274,17 @@ class _Handler(BaseHTTPRequestHandler):
                     memory = store.get_memory(memory_id)
                     usage = store.load_usage()["memories"].get(memory_id, {})
                 self._send(200, {"memory": memory, "usage": usage})
+                return
+
+            if path == "/api/audit":
+                # Read-only: the last recorded run, never a new sweep. Running
+                # one from a page load would put a scan on a request thread and
+                # let a refresh rewrite the history being read.
+                from .audit import last_run
+
+                verdicts = tuple(v for v in one("verdict").split(",") if v)
+                with lock:
+                    self._send(200, last_run(store, verdicts or None))
                 return
         except StoreError as exc:
             self._send(404, {"error": str(exc)})

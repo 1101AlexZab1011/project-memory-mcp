@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 
 from project_memory_mcp.sqlite_store import (
+    SCHEMA_VERSION,
     SPREAD_WINDOW_DAYS,
     SqliteMemoryStore,
     _merge_spread,
@@ -294,7 +295,7 @@ class MigrationTests(unittest.TestCase):
     def test_opening_a_v1_database_migrates_it(self):
         store = self.open()
         version = store.connection.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        self.assertEqual("2", version[0])
+        self.assertEqual(str(SCHEMA_VERSION), version[0])
         self.assertEqual(2, store.count())
 
     def test_retrieval_is_unchanged_after_migration(self):
@@ -355,7 +356,7 @@ class MigrationTests(unittest.TestCase):
         connection = sqlite3.connect(self.db)
         version = connection.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         connection.close()
-        self.assertEqual("2", version)
+        self.assertEqual(str(SCHEMA_VERSION), version)
 
     def test_the_v1_tables_are_gone(self):
         store = self.open()

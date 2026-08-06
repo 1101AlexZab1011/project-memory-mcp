@@ -46,6 +46,39 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_audit(args: argparse.Namespace) -> int:
+    """Report which memories have earned their place. Changes nothing."""
+    from .audit import AuditPolicy, format_report, run_audit, with_overrides
+    from .sqlite_store import SqliteMemoryStore, StoreError
+
+    try:
+        store = SqliteMemoryStore(args.database, args.project, create=False)
+    except StoreError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    policy = with_overrides(
+        AuditPolicy(),
+        min_surfaced_direct=args.min_direct,
+        min_applied=args.min_applied,
+        min_spread_days=args.min_spread_days,
+        min_degree=args.min_degree,
+        max_actions_per_run=args.max_actions,
+    )
+    try:
+        report = run_audit(store, policy=policy, apply=args.apply, record=not args.no_record)
+    except NotImplementedError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+
+    print(format_report(report, limit=args.limit))
+    if report.run_id is not None:
+        print(f"\nrecorded as run {report.run_id}; nothing was changed")
+    return 0
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     """Re-check every stored memory against the schema.
 
@@ -202,6 +235,30 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--database", required=True, help="Path to the SQLite database.")
     validate_parser.add_argument("--project", required=True, help="Project id inside the database.")
     validate_parser.set_defaults(func=cmd_validate)
+
+    audit_parser = subparsers.add_parser(
+        "audit", help="Report which memories have earned their place. Changes nothing.")
+    audit_parser.add_argument("--database", required=True, help="Path to the SQLite database.")
+    audit_parser.add_argument("--project", required=True, help="Project id inside the database.")
+    audit_parser.add_argument("--limit", type=int, default=20, help="Findings to print per verdict.")
+    audit_parser.add_argument("--no-record", action="store_true",
+                              help="Print the report without storing the run.")
+    audit_parser.add_argument("--apply", action="store_true",
+                              help="Not implemented: acting on verdicts is a later phase.")
+    # Thresholds are deliberately overridable. A store of 200 memories in a solo
+    # repo and one of three million share no distribution, so no default here
+    # should be trusted without looking at what it would do first.
+    audit_parser.add_argument("--min-direct", type=int, default=None,
+                              help="Direct query matches needed to survive a gate (default 1).")
+    audit_parser.add_argument("--min-applied", type=int, default=None,
+                              help="Reported applications needed to survive a gate (default 1).")
+    audit_parser.add_argument("--min-spread-days", type=int, default=None,
+                              help="Distinct recall days needed to survive a gate (default 2).")
+    audit_parser.add_argument("--min-degree", type=int, default=None,
+                              help="Incoming authored links needed to survive a gate (default 2).")
+    audit_parser.add_argument("--max-actions", type=int, default=None,
+                              help="Ceiling on memories one run may act on (default 50).")
+    audit_parser.set_defaults(func=cmd_audit)
 
     serve_parser = subparsers.add_parser("serve", help="Run the MCP server over stdio or HTTP.")
     serve_parser.add_argument("--database", default=None, help="Path to the SQLite database.")

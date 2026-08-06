@@ -21,7 +21,7 @@ from typing import Any, Iterable
 from . import validation
 from .validation import ID_RE, LABEL_RE, LabelExpression
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 64-day window for the spread bitmap: long enough to judge the early tiers,
 # and it fits one SQLite integer.
@@ -31,10 +31,14 @@ SPREAD_MASK = (1 << SPREAD_WINDOW_DAYS) - 1
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
+-- `queries` counts relevance-mode recalls. It is the unit the audit measures
+-- exposure in: a project nobody queried for six weeks has served no chances to
+-- be seen, so its memories are not "unused" - they were never asked.
 CREATE TABLE IF NOT EXISTS projects (
     id      TEXT PRIMARY KEY,
     name    TEXT NOT NULL,
-    created TEXT NOT NULL
+    created TEXT NOT NULL,
+    queries INTEGER NOT NULL DEFAULT 0
 );
 
 -- `uuid` is the identity every other table points at; `slug` is the readable
@@ -51,8 +55,16 @@ CREATE TABLE IF NOT EXISTS memories (
     created_from_task TEXT,
     area              TEXT,
     body              TEXT NOT NULL,
+    -- Retention tier. A memory is reviewed once it has had enough exposure
+    -- *and* enough real time in its current tier; surviving moves it up, where
+    -- the next review is further away. Both clocks matter: queries say whether
+    -- it had a fair chance, days say whether the problem outlived the week.
+    tier              INTEGER NOT NULL DEFAULT 1,
+    tier_since        TEXT,
+    tier_since_query  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, uuid)
 );
+CREATE INDEX IF NOT EXISTS memories_tier ON memories(project_id, tier);
 -- Unique for now: one writer, so a duplicate slug is a mistake rather than a
 -- merge. Relaxing this is a sync concern, and dropping an index is cheap.
 CREATE UNIQUE INDEX IF NOT EXISTS memories_slug ON memories(project_id, slug);
@@ -119,6 +131,37 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     id_text, description, triggers, tags, labels, facts, pattern, pitfalls, scope_text,
     tokenize='unicode61'
 );
+
+-- Every sweep writes what it examined and what it decided, so the auditor can
+-- itself be audited. Findings are kept for runs that changed nothing too -
+-- that is the whole point of watching it before letting it act.
+CREATE TABLE IF NOT EXISTS audit_runs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    started    TEXT NOT NULL,
+    finished   TEXT,
+    applied    INTEGER NOT NULL DEFAULT 0,
+    queries    INTEGER NOT NULL DEFAULT 0,
+    examined   INTEGER NOT NULL DEFAULT 0,
+    due        INTEGER NOT NULL DEFAULT 0,
+    promoted   INTEGER NOT NULL DEFAULT 0,
+    archived   INTEGER NOT NULL DEFAULT 0,
+    capped     INTEGER NOT NULL DEFAULT 0,
+    policy     TEXT
+);
+CREATE INDEX IF NOT EXISTS audit_runs_project ON audit_runs(project_id, started);
+
+CREATE TABLE IF NOT EXISTS audit_findings (
+    run_id     INTEGER NOT NULL REFERENCES audit_runs(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL,
+    memory_id  TEXT NOT NULL,
+    slug       TEXT NOT NULL,
+    tier       INTEGER NOT NULL,
+    verdict    TEXT NOT NULL,
+    reason     TEXT NOT NULL,
+    evidence   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_findings_run ON audit_findings(run_id);
 """
 
 # bm25() column weights, in the column order above (the two UNINDEXED columns
@@ -230,6 +273,28 @@ def _upgrade(connection: sqlite3.Connection) -> None:
     columns = {r[1] for r in connection.execute("PRAGMA table_info(memories)")}
     if "uuid" not in columns:
         _migrate_v1_to_v2(connection)
+        columns = {r[1] for r in connection.execute("PRAGMA table_info(memories)")}
+    if "tier" not in columns:
+        _migrate_v2_to_v3(connection)
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """Add retention tiers and the per-project query counter.
+
+    Purely additive. Existing memories start in tier 1 with their tier clock
+    beginning now: nothing was measuring exposure before this, and dating their
+    tier entry back to creation would make them instantly due for review on
+    evidence that was never collected.
+    """
+    connection.execute("ALTER TABLE memories ADD COLUMN tier INTEGER NOT NULL DEFAULT 1")
+    connection.execute("ALTER TABLE memories ADD COLUMN tier_since TEXT")
+    connection.execute("ALTER TABLE memories ADD COLUMN tier_since_query INTEGER NOT NULL DEFAULT 0")
+    if "queries" not in {r[1] for r in connection.execute("PRAGMA table_info(projects)")}:
+        connection.execute("ALTER TABLE projects ADD COLUMN queries INTEGER NOT NULL DEFAULT 0")
+    connection.execute("UPDATE memories SET tier_since=? WHERE tier_since IS NULL", (_now(),))
+    connection.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+                       (str(SCHEMA_VERSION),))
+    connection.commit()
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -486,6 +551,7 @@ class SqliteMemoryStore:
         full_count: int = 3,
         include_derived: bool = True,
         order: str = "relevance",
+        record: bool = True,
     ) -> dict[str, Any]:
         """Ranked retrieval that never loads the project.
 
@@ -528,8 +594,9 @@ class SqliteMemoryStore:
             # Browsing the timeline is retrieval by position, not by match, so
             # it never counts as direct: a memory should not earn its tier by
             # being adjacent in time to something someone was reading.
-            shown = self._uuids_for_slugs([r["id"] for r in results])
-            self._record_usage(shown.values(), direct=())
+            if record:
+                shown = self._uuids_for_slugs([r["id"] for r in results])
+                self._record_usage(shown.values(), direct=())
             payload = {"order": "recent", "offset": offset,
                        "label_query_labels": sorted(expression.used_labels),
                        "count": len(results), "memories": results}
@@ -538,6 +605,16 @@ class SqliteMemoryStore:
             if after:
                 payload["after"] = after
             return payload
+
+        # One query = one chance for every memory in the project to be matched.
+        # Only relevance mode counts: the timeline path above retrieves by
+        # position, so counting it would age memories on exposure they never
+        # actually got. `record=False` covers the management UI, where a human
+        # inspecting the store must not change the metrics they are inspecting.
+        if record:
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE projects SET queries=queries+1 WHERE id=?", (self.project,))
 
         related_uuid = self._uuid_for(related_to) if related_to else None
         text_scores = self.text_candidates(query) if query else {}
@@ -606,7 +683,8 @@ class SqliteMemoryStore:
             if len(results) >= limit:
                 break
         results.sort(key=lambda r: (-r["score"], r["id"]))
-        self._record_usage(surfaced, direct=direct)
+        if record:
+            self._record_usage(surfaced, direct=direct)
         payload: dict[str, Any] = {
             "query": query,
             "label_query_labels": sorted(expression.used_labels),
@@ -974,14 +1052,16 @@ class SqliteMemoryStore:
         scope = memory.get("scope") or {}
         self.connection.execute(
             "INSERT INTO memories(project_id, uuid, slug, status, description, created, last_validated, "
-            "created_from_task, area, body) VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "created_from_task, area, body, tier_since, tier_since_query) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,(SELECT queries FROM projects WHERE id=?)) "
             "ON CONFLICT(project_id, uuid) DO UPDATE SET slug=excluded.slug, status=excluded.status, "
             "description=excluded.description, created=excluded.created, "
             "last_validated=excluded.last_validated, created_from_task=excluded.created_from_task, "
             "area=excluded.area, body=excluded.body",
             (self.project, memory_uuid, slug, memory["status"], memory["description"],
              evidence.get("created"), evidence.get("last_validated"),
-             evidence.get("created_from_task"), scope.get("area"), json.dumps(memory)),
+             evidence.get("created_from_task"), scope.get("area"), json.dumps(memory),
+             _now(), self.project),
         )
         self.connection.execute("DELETE FROM labels WHERE project_id=? AND memory_id=?",
                                 (self.project, memory_uuid))
