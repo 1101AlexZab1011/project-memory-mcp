@@ -15,6 +15,7 @@ import json
 import os
 import re
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -46,6 +47,7 @@ SCOPE_REQUIRED_FIELDS = ("project", "area", "files")
 SCOPE_FIELDS = ("project", "area", "files", "applies_to")
 EVIDENCE_FIELDS = ("created_from_task", "last_validated")
 RELATIONSHIP_FIELDS = ("related", "supersedes", "superseded_by")
+
 
 class StoreError(ValueError):
     """Raised for any invalid input, invalid store state, or failed operation."""
@@ -201,6 +203,7 @@ class MemoryStore:
         self.memory_root = self.root / STORE_DIR_NAME
         self.active_root = self.memory_root / "active"
         self.labels_path = self.memory_root / "labels.json"
+        self.usage_path = self.memory_root / "usage.json"
         self._cache_signature: tuple[tuple[str, int, int], ...] | None = None
         self._cache_records: dict[str, dict[str, Any]] | None = None
         self._cache_contexts: dict[bool, RankingContext] = {}
@@ -364,6 +367,8 @@ class MemoryStore:
             if len(results) >= limit:
                 break
 
+        self._record_usage([entry["id"] for entry in results], "surfaced")
+
         payload: dict[str, Any] = {
             "query": query,
             "label_query_labels": sorted(expression.used_labels),
@@ -374,6 +379,60 @@ class MemoryStore:
         if related_to:
             payload["related_to"] = related_to
         return payload
+
+    # ------------------------------------------------------------------ usage
+
+    def load_usage(self) -> dict[str, Any]:
+        """Read the usage sidecar, or an empty record if it is absent.
+
+        Usage lives outside the memory files on purpose: recording a read must
+        never dirty a memory's JSON, or every recall would show up in git and
+        memory diffs would stop being reviewable.
+        """
+        if not self.usage_path.is_file():
+            return {"schema_version": 1, "memories": {}}
+        try:
+            data = json.loads(self.usage_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            # Usage is telemetry, not truth. A corrupt file costs history, not
+            # correctness, so start over rather than failing the caller's read.
+            return {"schema_version": 1, "memories": {}}
+        if not isinstance(data, dict) or not isinstance(data.get("memories"), dict):
+            return {"schema_version": 1, "memories": {}}
+        return data
+
+    def record_use(self, memory_ids: list[str]) -> dict[str, Any]:
+        """Mark memories as having actually informed the work in hand.
+
+        ``surfaced`` is recorded automatically by recall; ``applied`` cannot be,
+        because only the caller knows whether a returned memory changed what it
+        did. The gap between the two counts is the useful signal: a memory
+        surfaced often and applied never is polluting retrieval.
+        """
+        if not isinstance(memory_ids, list) or not all(isinstance(i, str) for i in memory_ids):
+            raise StoreError("memory_ids must be an array of strings.")
+        known = set(self.load_memories())
+        unknown = [i for i in memory_ids if i not in known]
+        if unknown:
+            raise StoreError(f"Unknown memory ids: {', '.join(sorted(unknown))}")
+        self._record_usage(memory_ids, "applied")
+        return {"recorded": sorted(set(memory_ids)), "field": "applied"}
+
+    def _record_usage(self, memory_ids: list[str], field: str) -> None:
+        if not memory_ids:
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        usage = self.load_usage()
+        entries = usage.setdefault("memories", {})
+        for memory_id in set(memory_ids):
+            entry = entries.setdefault(memory_id, {})
+            entry[field] = int(entry.get(field, 0)) + 1
+            entry[f"last_{field}"] = stamp
+        try:
+            self._write_json(self.usage_path, usage)
+        except OSError:
+            # A read-only checkout should still be able to recall.
+            pass
 
     # -------------------------------------------------------------- mutations
 

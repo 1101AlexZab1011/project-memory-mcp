@@ -272,3 +272,68 @@ class RecallTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UsageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        store_dir = root / ".project-memory" / "active"
+        store_dir.mkdir(parents=True)
+        (root / ".project-memory" / "labels.json").write_text(
+            json.dumps({"schema_version": 1, "description": "l",
+                        "labels": {"area:x": {"description": "x"}}}),
+            encoding="utf-8",
+        )
+        for entry in (
+            memory("cache-race", "Session cache invalidation races the auth refresh.", ["area:x"]),
+            memory("shader-stall", "Shader compilation stalls on cold start.", ["area:x"]),
+        ):
+            (store_dir / f"{entry['id']}.json").write_text(json.dumps(entry), encoding="utf-8")
+        self.store = MemoryStore(root)
+
+    def test_recall_records_what_it_surfaced(self):
+        self.store.recall(query="cache invalidation", limit=1, full_count=0)
+        entries = self.store.load_usage()["memories"]
+
+        self.assertEqual(1, entries["cache-race"]["surfaced"])
+        self.assertIn("last_surfaced", entries["cache-race"])
+        self.assertNotIn("shader-stall", entries)
+
+    def test_surfaced_accumulates_across_calls(self):
+        for _ in range(3):
+            self.store.recall(query="cache invalidation", limit=1, full_count=0)
+
+        self.assertEqual(3, self.store.load_usage()["memories"]["cache-race"]["surfaced"])
+
+    def test_applied_is_separate_from_surfaced(self):
+        self.store.recall(query="cache invalidation", limit=2, full_count=0)
+        self.store.record_use(["cache-race"])
+        entries = self.store.load_usage()["memories"]
+
+        self.assertEqual(1, entries["cache-race"]["applied"])
+        # Surfaced but never applied: exactly the signal audit will look for.
+        self.assertEqual(0, entries["shader-stall"].get("applied", 0))
+        self.assertGreater(entries["shader-stall"]["surfaced"], 0)
+
+    def test_record_use_rejects_unknown_ids(self):
+        with self.assertRaises(StoreError):
+            self.store.record_use(["no-such-memory"])
+
+    def test_usage_lives_outside_the_memory_files(self):
+        before = (self.store.active_root / "cache-race.json").read_bytes()
+        self.store.recall(query="cache invalidation")
+        self.store.record_use(["cache-race"])
+
+        self.assertEqual(before, (self.store.active_root / "cache-race.json").read_bytes())
+        self.assertTrue(self.store.usage_path.is_file())
+        self.assertEqual([], self.store.validate_store())
+
+    def test_corrupt_usage_file_does_not_break_recall(self):
+        self.store.usage_path.write_text("{ not json", encoding="utf-8")
+
+        result = self.store.recall(query="cache invalidation", limit=1, full_count=0)
+
+        self.assertEqual(1, result["count"])
+        self.assertEqual(1, self.store.load_usage()["memories"]["cache-race"]["surfaced"])

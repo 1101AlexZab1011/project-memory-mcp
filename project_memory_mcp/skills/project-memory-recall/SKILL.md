@@ -69,13 +69,19 @@ Not worth a call:
    and build output override it. If present evidence contradicts a memory, say so and
    follow the evidence.
 
-7. **Say what you used.** When memory materially changed your approach:
+7. **Say what you used, and record it.** When memory materially changed your approach:
 
    ```text
    Using project memory: <id> - <one-sentence reason>
    ```
 
-   When nothing useful comes back, say nothing about memory and continue with the task.
+   Then call `record_memory_use` with those ids. `recall` already logs that a memory was
+   *shown*; only you know whether it was *used*, and a memory that keeps being shown and
+   never used is crowding out better results. Record only what genuinely changed your
+   approach — recording everything returned makes the signal worthless.
+
+   When nothing useful comes back, say nothing about memory, record nothing, and continue
+   with the task.
 
 8. **Notice rot.** If a memory turns out stale, wrong, or misleading, the
    `project-memory-remember` skill should update or retire it once the task is resolved.

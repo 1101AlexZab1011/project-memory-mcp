@@ -55,6 +55,11 @@ def cmd_init(args: argparse.Namespace) -> int:
     gitkeep = active_dir / ".gitkeep"
     if not gitkeep.exists():
         gitkeep.write_text("", encoding="utf-8")
+    # usage.json is local telemetry, not part of the shared store: it records
+    # what this machine retrieved, which is noise in everyone else's diff.
+    store_ignore = store_dir / ".gitignore"
+    if not store_ignore.exists():
+        store_ignore.write_text("usage.json\n", encoding="utf-8")
 
     for template_name, target_name in STORE_TEMPLATES.items():
         target = store_dir / target_name

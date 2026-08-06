@@ -66,6 +66,7 @@ This scaffolds:
   labels.json          canonical label registry (starter kind:/context: labels)
   memory.schema.json   JSON Schema for memory files
   active/              one JSON file per memory
+  .gitignore           keeps usage.json local (written for you)
 ```
 
 Commit the whole folder.
@@ -130,6 +131,7 @@ Re-run `install-skills` after upgrading the package to refresh the copies.
 | `recall` | **Ranked retrieval in one call.** Scores every memory by text relevance, graph proximity, and label overlap; returns the best matches with the top few inlined in full. |
 | `list_labels` | Canonical labels grouped by prefix. |
 | `search_memories` | Filter memories by label query, status, and optional substring. Unranked; prefer `recall`. |
+| `record_memory_use` | Report which recalled memories actually informed the work. |
 | `get_memory` | Full JSON for one memory id. |
 | `get_memory_neighborhood` | Bounded relationship graph around a memory (`depth`, `max_nodes`). |
 | `create_memory` | Create a memory; syncs bidirectional links, validates the store. |
@@ -169,6 +171,26 @@ Three ways to call it:
 `related_to` anchors the walk at one memory, turning "is related" into a *degree* of
 relatedness: authored links rank first, then memories reachable through the graph. With no
 query and no anchor the restart is uniform, which is ordinary PageRank over the store.
+
+### Usage signal
+
+Ranking itself is a pure function of the store and the query — the same query always returns
+the same ordering, and retrieval never rewrites a memory. But that leaves the store with no
+idea which memories are ever actually *useful*, which matters because an agent that decides
+for itself what to remember tends to over-capture rather than under-capture.
+
+So two counters are kept in `.project-memory/usage.json`, deliberately outside the memory
+files:
+
+- **surfaced** — incremented by `recall` for every memory it returns. Automatic.
+- **applied** — incremented by `record_memory_use`, which the agent calls for the memories that
+  genuinely changed what it did. It cannot be inferred; only the caller knows.
+
+The gap between them is the signal. Surfaced often and applied never means a memory is
+crowding every result set without earning its place — different from being wrong or stale, and
+invisible to any other measure. `usage.json` is git-ignored by `init`: it records what one
+machine retrieved, which is noise in everyone else's diff, and it is disposable — deleting it
+costs history, never correctness.
 
 Ranking is pure standard library and holds its BM25 index and adjacency for as long as no
 memory file changes, so repeat calls in a live server skip the rebuild entirely.

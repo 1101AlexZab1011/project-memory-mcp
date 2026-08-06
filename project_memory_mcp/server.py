@@ -87,6 +87,21 @@ TOOLS = [
             },
         },
     ),
+    _tool(
+        "record_memory_use",
+        "Report that specific memories actually informed the work - call this after a recall whose "
+        "results changed what you did. Recall already records that a memory was SHOWN; only you know "
+        "whether it was USED. The gap between the two is how the store learns which memories earn "
+        "their place and which are just noise in every result set.",
+        {
+            "memory_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Ids of the memories that materially affected the work.",
+            }
+        },
+        ["memory_ids"],
+    ),
     _tool("get_memory", "Return the full JSON for a memory id.", {"id": {"type": "string"}}, ["id"]),
     _tool(
         "get_memory_neighborhood",
@@ -189,6 +204,8 @@ class McpServer:
                         True if args.get("include_derived") is None else bool(args["include_derived"])
                     ),
                 )
+            elif name == "record_memory_use":
+                payload = self.store.record_use(args["memory_ids"])
             elif name == "get_memory":
                 payload = self.store.get_memory(args["id"])
             elif name == "get_memory_neighborhood":
