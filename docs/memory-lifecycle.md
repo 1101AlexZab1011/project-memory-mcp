@@ -56,6 +56,31 @@ So the gates must be *late enough to be evidence* and the early ones must be *re
   is for what only helps here; no amount of usage promotes it. Private by default, because
   over-sharing is the harder mistake to undo.
 
+## The five elements
+
+| Element | What it owns | Where it lives |
+|---|---|---|
+| **Computer** | Every job that runs on memories rather than answering a question: tiering, archiving, outbox delivery, duplicate detection | `computer.py` — a thread inside `serve`, or its own process |
+| **Runtime storage** | Tier 1: memories that exist but have not proven anything | `memories` where `tier = 1` |
+| **Private store** | What only helps here — this user, this machine, these habits | `visibility = 'private'`, never leaves |
+| **Public store** | What would help anyone on this project | `visibility = 'public'`, publishable once it has earned a tier |
+| **Mail** | Questions a memory's own text cannot answer, addressed to its author | `messages.py` |
+
+Private and public are one table with a discriminator rather than two databases, deliberately:
+the relationship graph has to span them. A private memory about how this user works often
+explains a public one about how the build behaves, and in-degree is both a ranking signal and
+audit evidence. Two stores would have severed that.
+
+**Computer is a component, not a schedule.** The jobs are heavy — a sweep reads every due
+memory, dedup compares candidate pairs — so it cannot run on a request thread and cannot hold a
+project's lock for its whole duration. It takes the lock for a slice, yields, and asks again.
+And because at scale the computation should not share an interpreter with request handling at
+all, the same worker runs standalone (`project-memory-mcp compute`) against the same database,
+on another machine if that is what the load needs.
+
+Without it the audit is a command somebody has to remember to type, which in practice means a
+store that never gets cleaned.
+
 ## Architecture
 
 ```text
@@ -100,6 +125,13 @@ and it does not need to.
 
 Promotion out of the nursery is the moment a memory becomes shared, and therefore the moment
 it becomes visible to other people, subject to dedup, and eligible for a secret scan.
+
+**Publishing requires having earned a tier.** A memory written thirty seconds ago cannot be
+pushed to a shared server, whatever its author thinks of it; otherwise "earn your way into the
+shared store" describes nothing the code does. The exception is explicit and named: a lesson
+whose value will never show up in usage — hard-won, rarely needed, expensive to rediscover —
+can be published with `force`, which is the non-statistical path this design has needed since
+the beginning.
 
 **Capacity, not calendar, triggers review.** When tier 1 exceeds N, the memories that have
 lived there long enough are judged. Everything else waits.

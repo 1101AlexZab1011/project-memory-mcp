@@ -487,8 +487,51 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, result)
 
 
+def start_computer(registry: _StoreRegistry, database: Path | str,
+                   interval_seconds: int = 3600) -> tuple[Any, Any]:
+    """Bring up the worker that does the periodic work on memories.
+
+    It shares the registry's per-project locks, so a sweep and a request never
+    touch one project at the same time, and it holds each lock only for a slice
+    at a time so serving keeps flowing while heavy work runs.
+    """
+    from .computer import Computer, Scheduler
+
+    def projects() -> list[str]:
+        return SqliteMemoryStore.list_projects(registry.control())
+
+    def open_store(project: str):
+        store, _ = registry.get(project)
+        return store
+
+    def lock_for(project: str):
+        _, lock = registry.get(project)
+        return lock
+
+    # The registry owns these stores, so the worker must not close them.
+    computer = Computer(open_store=lambda p: _Borrowed(open_store(p)),
+                        lock_for=lock_for, database=database)
+    computer.start()
+    scheduler = Scheduler(computer, projects, interval_seconds=interval_seconds)
+    scheduler.start()
+    return computer, scheduler
+
+
+class _Borrowed:
+    """A store the worker uses but does not own, so close() is a no-op."""
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+    def close(self) -> None:
+        return None
+
+
 def run_http_server(database: Path | str, bind: str, port: int, token: str,
-                    ui_enabled: bool = True) -> int:
+                    ui_enabled: bool = True, compute_interval: int = 3600) -> int:
     registry = _StoreRegistry(database)
     handler = type("Handler", (_Handler,), {
         "registry": registry, "token": token, "sessions": _Sessions(), "ui_enabled": ui_enabled})
@@ -508,6 +551,10 @@ def run_http_server(database: Path | str, bind: str, port: int, token: str,
     for name in projects:
         registry.get(name)
 
+    computer = scheduler = None
+    if compute_interval > 0:
+        computer, scheduler = start_computer(registry, database, compute_interval)
+
     browser = f"http://{bind}:{port}/" if ui_enabled else "(disabled)"
     print(
         "\n".join([
@@ -515,6 +562,7 @@ def run_http_server(database: Path | str, bind: str, port: int, token: str,
             f"  projects: {', '.join(projects) or '(none - create one with `migrate` first)'}",
             f"  clients:  url http://{bind}:{port}/mcp?project=<id> with an Authorization: Bearer header",
             f"  browser:  {browser}",
+            f"  computer: {'running, every %ds' % compute_interval if computer else 'disabled'}",
         ]),
         file=sys.stderr,
     )
@@ -523,6 +571,10 @@ def run_http_server(database: Path | str, bind: str, port: int, token: str,
     except KeyboardInterrupt:
         pass
     finally:
+        if scheduler is not None:
+            scheduler.stop()
+        if computer is not None:
+            computer.stop()
         httpd.server_close()
         registry.close()
     return 0

@@ -153,7 +153,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                   file=sys.stderr)
         try:
             return run_http_server(args.database, args.bind, args.port, token,
-                               ui_enabled=not args.no_ui)
+                                   ui_enabled=not args.no_ui,
+                                   compute_interval=args.compute_interval)
         finally:
             if scheduler is not None:
                 scheduler.stop()
@@ -383,6 +384,63 @@ def cmd_join(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_compute(args: argparse.Namespace) -> int:
+    """Run the memory maintenance worker.
+
+    Inside `serve` this runs as a thread. As its own process it does the same
+    work against the same database, on another machine if you like - which is
+    the point once the jobs are heavy enough to matter: computation should not
+    have to share an interpreter with request handling.
+    """
+    import time as _time
+
+    from .computer import JOB_KINDS, Computer, Scheduler, make_job
+    from .sqlite_store import SqliteMemoryStore
+
+    database = Path(args.database)
+    if not database.is_file():
+        print(f"error: no database at {database}", file=sys.stderr)
+        return 1
+
+    import sqlite3
+
+    connection = sqlite3.connect(database)
+    try:
+        projects = [args.project] if args.project else SqliteMemoryStore.list_projects(connection)
+    finally:
+        connection.close()
+    if not projects:
+        print("No projects in this database.", file=sys.stderr)
+        return 1
+
+    computer = Computer(open_store=lambda p: SqliteMemoryStore(database, p, create=False),
+                        database=database)
+
+    if args.once:
+        for project in projects:
+            for kind in (args.kind or list(JOB_KINDS)):
+                result = computer.run_one(make_job(kind, project))
+                print(f"{project:24s} {kind:8s} {result['outcome']:7s} {result['detail']}")
+        return 0
+
+    computer.start()
+    scheduler = Scheduler(computer, lambda: projects, interval_seconds=args.interval,
+                          kinds=tuple(args.kind) if args.kind else ("outbox", "audit", "dedup"))
+    scheduler.start()
+    print(f"project-memory-mcp computer: {len(projects)} project(s), every {scheduler.interval}s",
+          file=sys.stderr)
+    print("  jobs: " + ", ".join(sorted(JOB_KINDS)), file=sys.stderr)
+    try:
+        while True:
+            _time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        scheduler.stop()
+        computer.stop()
+    return 0
+
+
 def cmd_remote(args: argparse.Namespace) -> int:
     """Manage the servers this machine federates with. Zero of them is normal."""
     from . import federation
@@ -558,6 +616,9 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Seconds between snapshots (default: 3600, minimum 60).")
     serve_parser.add_argument("--backup-keep", type=int, default=7,
                               help="How many snapshots to retain (default: 7).")
+    serve_parser.add_argument("--compute-interval", type=int, default=3600,
+                              help="Seconds between maintenance sweeps (default: 3600). "
+                                   "0 disables the built-in worker, for when it runs separately.")
     serve_parser.add_argument("--token", default=None,
                               help="Shared bearer token. Falls back to PROJECT_MEMORY_TOKEN.")
     serve_parser.set_defaults(func=cmd_serve)
@@ -582,6 +643,19 @@ def build_parser() -> argparse.ArgumentParser:
     join_parser.add_argument("--key", default=None,
                              help=f"Private key path (default: {DEFAULT_HOME / 'client_key.pem'}).")
     join_parser.set_defaults(func=cmd_join)
+
+    compute_parser = subparsers.add_parser(
+        "compute", help="Run the memory maintenance worker: tiering, archiving, outbox, dedup.")
+    compute_parser.add_argument("--database", required=True, help="Path to the SQLite database.")
+    compute_parser.add_argument("--project", default=None, help="One project (default: all).")
+    compute_parser.add_argument("--kind", action="append", default=None,
+                                choices=("audit", "outbox", "dedup"),
+                                help="Run only this job kind. Repeatable.")
+    compute_parser.add_argument("--interval", type=int, default=3600,
+                                help="Seconds between sweeps (default: 3600).")
+    compute_parser.add_argument("--once", action="store_true",
+                                help="Run each job once and exit, printing what happened.")
+    compute_parser.set_defaults(func=cmd_compute)
 
     remote_parser = subparsers.add_parser(
         "remote", help="Add, list or remove servers this machine federates with.")

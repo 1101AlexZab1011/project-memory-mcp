@@ -1258,7 +1258,14 @@ class SqliteMemoryStore:
         return {"id": memory_id, "visibility": "public",
                 "targets": federation.choose_remote(self.remotes(), self.get_memory(memory_id), used)}
 
-    def promote(self, memory_id: str, remote: str, private_key: Any = None) -> dict[str, Any]:
+    #: A memory must have survived at least this tier before it can be published.
+    #: Otherwise "earn your way into the shared store" is decorative: anything
+    #: written thirty seconds ago could be pushed to everyone. Overridable for
+    #: the rare-but-critical lesson that will never accrue usage on its own.
+    MIN_PROMOTION_TIER = 2
+
+    def promote(self, memory_id: str, remote: str, private_key: Any = None,
+                force: bool = False) -> dict[str, Any]:
         """Publish one memory to one named remote.
 
         Never to all of them: that is how one lesson ends up duplicated across
@@ -1276,6 +1283,15 @@ class SqliteMemoryStore:
             (self.project, memory_uuid),
         ).fetchone():
             raise StoreError(f"'{memory_id}' is a cached copy from another server, not yours to publish.")
+
+        tier = self.connection.execute(
+            "SELECT tier FROM memories WHERE project_id=? AND uuid=?",
+            (self.project, memory_uuid)).fetchone()["tier"]
+        if tier < self.MIN_PROMOTION_TIER and not force:
+            raise StoreError(
+                f"'{memory_id}' is still tier {tier} and has not earned publication "
+                f"(needs tier {self.MIN_PROMOTION_TIER}). Pass force=true only for a lesson that "
+                f"matters more than its usage will ever show.")
 
         matches = [r for r in self.remotes(enabled_only=True) if r.name == remote]
         if not matches:

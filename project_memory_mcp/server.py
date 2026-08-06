@@ -146,7 +146,11 @@ TOOLS = [
         "Publish one public memory to one named remote. Never publish to every remote: the same "
         "lesson on several servers then diverges independently. If the remote is unreachable the "
         "work is queued and retried, and you are told so rather than failing.",
-        {"id": {"type": "string"}, "remote": {"type": "string"}},
+        {"id": {"type": "string"}, "remote": {"type": "string"},
+         "force": {"type": ["boolean", "null"], "default": False,
+                   "description": "Publish a memory that has not yet earned a tier. Use only for "
+                                  "a lesson whose value will never show up in usage - hard-won, "
+                                  "rarely needed, expensive to rediscover."}},
         ["id", "remote"],
     ),
     _tool(
@@ -343,7 +347,8 @@ class McpServer:
             elif name == "promotion_targets":
                 payload = self.store.promotion_targets(args["id"], args.get("consulted"))
             elif name == "promote_memory":
-                payload = self.store.promote(args["id"], args["remote"])
+                payload = self.store.promote(args["id"], args["remote"],
+                                             force=bool(args.get("force")))
             elif name == "set_memory_visibility":
                 payload = self.store.set_visibility(args["id"], args["visibility"])
             elif name == "send_message":

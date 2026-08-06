@@ -94,7 +94,15 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(["personal"], [r["name"] for r in choose_remote(self.remotes, memory("m", "any text"))])
 
 
-class LocalStoreTests(unittest.TestCase):
+class TierCase(unittest.TestCase):
+    def earn(self, slug, tier=2):
+        """Put a memory where the audit would have, had it proven itself."""
+        self.store.connection.execute(
+            "UPDATE memories SET tier=? WHERE project_id='demo' AND slug=?", (tier, slug))
+        self.store.connection.commit()
+
+
+class LocalStoreTests(TierCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -135,9 +143,26 @@ class LocalStoreTests(unittest.TestCase):
         federation.add_remote(self.store.connection, "team", "http://team", "everything")
         self.assertTrue(self.store.promotion_targets("cache-race")["targets"])
 
+    def test_a_memory_that_has_not_earned_a_tier_is_not_published(self):
+        # Otherwise "earn your way into the shared store" is decorative: a
+        # memory written thirty seconds ago could be pushed to everyone.
+        federation.add_remote(self.store.connection, "team", "http://team", "everything")
+        self.store.create_memory(memory("brand-new", CACHE), visibility="public")
+        with self.assertRaises(StoreError) as caught:
+            self.store.promote("brand-new", "team")
+        self.assertIn("has not earned publication", str(caught.exception))
+
+    def test_a_rare_but_critical_lesson_can_be_published_deliberately(self):
+        # Knowledge that will never accrue usage still needs a way out.
+        federation.add_remote(self.store.connection, "team", "http://127.0.0.1:9/", "down")
+        self.store.create_memory(memory("rare-lesson", CACHE), visibility="public")
+        result = self.store.promote("rare-lesson", "team", force=True)
+        self.assertIn("queued", result)
+
     def test_an_unreachable_remote_queues_the_promotion_instead_of_failing(self):
         federation.add_remote(self.store.connection, "team", "http://127.0.0.1:9/", "nothing here")
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
+        self.earn("cache-race")
         result = self.store.promote("cache-race", "team")
         self.assertIn("queued", result)
         queued = self.store.connection.execute("SELECT COUNT(*) AS n FROM outbox").fetchone()["n"]
@@ -152,7 +177,7 @@ class LocalStoreTests(unittest.TestCase):
         self.assertEqual(["local"], found["sources_answered"])
 
 
-class TwoServerTests(unittest.TestCase):
+class TwoServerTests(TierCase):
     """A real second server, queried over HTTP."""
 
     def setUp(self):
@@ -219,6 +244,7 @@ class TwoServerTests(unittest.TestCase):
 
     def test_promotion_publishes_to_the_named_remote(self):
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
+        self.earn("cache-race")
         result = self.store.promote("cache-race", "team")
         self.assertEqual("cache-race", result["promoted"])
         found = self.store.federated_recall("cache invalidation races auth", limit=5)
@@ -228,6 +254,7 @@ class TwoServerTests(unittest.TestCase):
     def test_a_queued_promotion_is_sent_when_the_remote_returns(self):
         federation.add_remote(self.store.connection, "flaky", "http://127.0.0.1:9/", "down")
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
+        self.earn("cache-race")
         self.store.promote("cache-race", "flaky")
         federation.add_remote(self.store.connection, "flaky", self.url, "back up", token=TOKEN)
         result = self.store.drain_outbox()
