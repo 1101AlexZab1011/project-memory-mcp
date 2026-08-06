@@ -142,6 +142,27 @@ where the token would travel in the clear.
 Unknown project ids return 404 with the list of known projects, rather than quietly serving an
 empty store.
 
+### Management UI
+
+The same process serves a browser UI at `/`. It works on a phone, a tablet or a desktop, on any
+OS, with no app to install — one hand-written page, no framework and no build step.
+
+Sign in with the server token; the server sets an `HttpOnly; SameSite=Strict` session cookie
+holding a random id rather than the token itself, so a leaked session expires and can be
+revoked. `SameSite=Strict` is what protects the status and delete routes — a cross-site request
+does not carry the cookie. MCP clients keep using the Bearer header and never touch sessions.
+
+Scope is read and triage: browse newest-first, search with the same ranking `recall` gives an
+agent, filter by label and status, read a memory in full with its links and usage counts, change
+status, delete. Creating and editing memories stays the agent's job through validated tools.
+
+Pass `--no-ui` to serve MCP only. The login page is the one thing a port scan can find, so a
+headless deployment may prefer it gone.
+
+Note that the login POST crosses the network in clear text, exactly like the Bearer token. That
+is consistent with the rest of the posture and fine on a trusted LAN or an encrypted overlay; it
+is not fine on a hostile network.
+
 ### Backups
 
 A database-backed store has no redundancy of its own. While memories lived in git every clone

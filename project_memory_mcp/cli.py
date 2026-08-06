@@ -137,7 +137,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                   "stopped being a replica, so an unbacked failure loses the whole store.",
                   file=sys.stderr)
         try:
-            return run_http_server(args.database, args.bind, args.port, token)
+            return run_http_server(args.database, args.bind, args.port, token,
+                               ui_enabled=not args.no_ui)
         finally:
             if scheduler is not None:
                 scheduler.stop()
@@ -247,6 +248,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--bind", default=None,
                               help="Interface address to listen on. Required with --http; no default.")
     serve_parser.add_argument("--port", type=int, default=8765, help="Port to listen on (default: 8765).")
+    serve_parser.add_argument("--no-ui", action="store_true",
+                              help="Disable the browser management UI; serve MCP only.")
     serve_parser.add_argument("--backup-dir", default=None,
                               help="Snapshot the database into this directory while serving.")
     serve_parser.add_argument("--backup-interval", type=int, default=3600,
