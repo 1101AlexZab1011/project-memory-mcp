@@ -35,10 +35,16 @@ The user's query may be:
 - a description of the lesson, subsystem, or symptom (e.g. "forget the thing about the old caching workaround");
 - broad enough to plausibly match several memories.
 
-Do the cheap scan first:
+Resolve it with `recall`:
 
-- Read `.project-memory/active/*.json` and compare the query against `id`, `description`, `tags`, and `triggers` for every memory.
-- Only open full memory JSON files for candidates that remain ambiguous after the index-level scan.
+- Call `recall` with the user's wording as `query`. Ranked results surface the intended memory
+  even when the user describes a lesson loosely, which matching on `id` alone will not.
+- Pass `status_filter: "all"` so `stale`, `wrong`, and `superseded` memories are candidates too -
+  those are often exactly what someone asks to retract.
+- Read the top candidates in full before acting. Deletion is not reversible through this tool,
+  so a confident-looking ranking is not on its own sufficient grounds to delete.
+- If MCP is unavailable, read `.project-memory/active/*.json` and compare the query against
+  `id`, `description`, `tags`, and `triggers` for every memory.
 
 Resolution rules:
 

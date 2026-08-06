@@ -102,12 +102,13 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
 ## Workflow
 
 1. Inspect existing memories.
-   - Prefer the `project-memory` MCP server when available.
-   - Use `list_labels` to inspect canonical labels.
-   - Use `search_memories` with labels to retrieve the likely duplicate/related cluster.
-   - Use `get_memory` only for selected candidates.
-   - If MCP is unavailable, inspect `.project-memory/active/*.json`.
-   - First inspect only `id`, `status`, `description`, `labels`, `tags`, `scope`, and `triggers`.
+   - Call `recall` with the lesson you are about to store, phrased as you would write its
+     `description`. Ranked results show immediately whether this ground is already covered.
+   - Use `list_labels` to see the canonical labels before choosing any.
+   - `search_memories` remains available for an exhaustive unranked sweep of a label cluster,
+     and `get_memory` for reading a specific candidate in full.
+   - If MCP is unavailable, inspect `.project-memory/active/*.json`, reading only `id`,
+     `status`, `description`, `labels`, `tags`, `scope`, and `triggers` first.
 
 2. Decide whether the resolved task contains reusable knowledge.
    - If not, report that nothing should be remembered and explain why.
@@ -120,8 +121,16 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
    - delete only if the memory is invalid junk, unsafe to store, or a pure duplicate with no historical value;
    - delete or mark `wrong` any memory that was recalled during this task and led the agent down a wrong path, or that this task's resolution has proven false or completely unusable going forward.
 
-4. Before creating a new memory, check for duplicates.
-   Prefer editing an existing memory if the same triggers, subsystem, and lesson already exist.
+4. Before creating a new memory, check for duplicates with `recall`.
+   - Query with the draft `description` plus the concrete symptoms you would put in `triggers`.
+     Ranked text matching catches a lesson already stored under different wording, which a
+     label-cluster scan misses - and near-duplicates are the main way a store degrades.
+   - Read the top few results in full before deciding they are distinct.
+   - Prefer editing an existing memory whenever the same triggers, subsystem, and lesson
+     already exist. Two memories covering one lesson is worse than one imperfect memory:
+     both then surface for the same query and neither is authoritative.
+   - Create a new memory only when the lesson is genuinely separate, not merely a new
+     instance of a stored pattern - in that case extend the existing memory's `triggers`.
 
 5. Write compact valid JSON.
    Use this structure (set `scope.project` to this project's name):
@@ -168,7 +177,11 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
 
 7. Cross-link related memories.
    - This step runs whenever a memory is created, or whenever an existing memory's `remembered_facts`, `solution_pattern`, or `pitfalls` change substantively. Skip it for pure status changes (e.g. marking something `stale` or `wrong`).
-   - Prefer MCP `search_memories` with a label query matching the new/changed memory to get a small candidate cluster.
+   - Call `recall` with `related_to` set to the new/changed memory's id. It ranks the store by
+     degree of relatedness - authored links first, then memories reachable through the graph -
+     so you get ordered candidates instead of an unordered cluster to sift.
+   - Work down that ranking and stop when the candidates stop being genuinely related. The
+     scores are a prompt for judgment, not a threshold to apply mechanically.
    - If MCP is unavailable, compare the new/changed memory's `labels` and `description` against the same fields in `.project-memory/active/*.json`. Read only those fields; do not study whole memories just to check relatedness.
    - Apply a real quality bar: link only when there is genuine subsystem, error-mode, or file overlap, not superficial topical resemblance.
    - For each memory judged related, author one `reason` string and reuse the identical string on both sides.
