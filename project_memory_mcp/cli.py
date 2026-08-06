@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 from . import __version__
 
@@ -168,6 +169,127 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return run_server(store)
 
 
+DEFAULT_HOME = Path.home() / ".project-memory"
+
+
+def _slugify(name: str) -> str:
+    """A directory name turned into a valid project id."""
+    out, dash = [], False
+    for char in name.lower():
+        if char.isalnum():
+            out.append(char)
+            dash = False
+        elif out and not dash:
+            out.append("-")
+            dash = True
+    return "".join(out).strip("-") or "project"
+
+
+def _merge_mcp_json(path: Path, entry: dict[str, Any]) -> str:
+    """Add our server to .mcp.json without disturbing anything already there.
+
+    Projects routinely configure several MCP servers. Overwriting the file to
+    add one would silently remove the others, which is the kind of damage a
+    setup command must never do.
+    """
+    config: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            config = json.loads(path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError:
+            return f"left {path.name} alone: it is not valid JSON, add the server by hand"
+    servers = config.setdefault("mcpServers", {})
+    existing = servers.get("project-memory")
+    if existing == entry:
+        return f"{path.name} already points here"
+    servers["project-memory"] = entry
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return f"{'updated' if existing else 'added project-memory to'} {path.name}"
+
+
+def _toml_string(value: str) -> str:
+    r"""Quote a value for TOML.
+
+    Windows paths are the reason this exists: ``C:\Users\...`` inside a basic
+    string is a string of invalid escapes, and the file will not parse.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _merge_codex_toml(path: Path, command: str, args: list[str]) -> str:
+    """Same for Codex. Hand-written TOML: one table, appended if absent."""
+    block = "\n".join([
+        "[mcp_servers.project-memory]",
+        f"command = {_toml_string(command)}",
+        "args = [" + ", ".join(_toml_string(a) for a in args) + "]",
+    ])
+    text = path.read_text(encoding="utf-8-sig") if path.is_file() else ""
+    if "[mcp_servers.project-memory]" in text:
+        return f"left {path.name} alone: it already has a project-memory entry"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    separator = "" if not text or text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
+    path.write_text(text + separator + block + "\n", encoding="utf-8")
+    return f"{'appended to' if text else 'created'} {path.name}"
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Take a project from nothing to a working memory store.
+
+    Everything here is local: a database under the user's home directory, the
+    skills, and client config pointing at them. No server, no network, no token.
+    A remote is something you add later if you ever want one.
+    """
+    from .sqlite_store import SqliteMemoryStore, StoreError
+
+    root = Path(args.root).resolve() if args.root else Path.cwd()
+    project = args.project or _slugify(root.name)
+    database = Path(args.database).resolve() if args.database else DEFAULT_HOME / "memory.db"
+    steps: list[str] = []
+
+    try:
+        store = SqliteMemoryStore(database, project)
+    except StoreError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    if store.list_labels()["labels"]:
+        steps.append(f"project '{project}' already exists ({store.count()} memories)")
+    else:
+        seed = json.loads((TEMPLATES_ROOT / "labels.json").read_text(encoding="utf-8"))
+        for label, data in sorted(seed["labels"].items()):
+            store.add_label(label, data["description"])
+        steps.append(f"created project '{project}' with {len(seed['labels'])} starter labels")
+    store.close()
+
+    targets = []
+    if not args.codex_only:
+        targets.append(root / ".claude" / "skills")
+    if args.codex or args.codex_only:
+        targets.append(root / ".agents" / "skills")
+    for destination in targets:
+        for skill_name in SKILL_NAMES:
+            shutil.copytree(SKILLS_ROOT / skill_name, destination / skill_name, dirs_exist_ok=True)
+        steps.append(f"installed {len(SKILL_NAMES)} skills into {destination.relative_to(root)}")
+
+    serve_args = ["serve", "--database", str(database), "--project", project]
+    if not args.codex_only:
+        steps.append(_merge_mcp_json(root / ".mcp.json", {
+            "type": "stdio", "command": "project-memory-mcp", "args": serve_args}))
+    if args.codex or args.codex_only:
+        steps.append(_merge_codex_toml(
+            root / ".codex" / "config.toml", "project-memory-mcp", serve_args))
+
+    print(f"project memory ready for {root}")
+    for step in steps:
+        print(f"  {step}")
+    print(f"\ndatabase: {database}")
+    print("Restart the agent to pick up the new configuration.")
+    print("This store is local and needs no server. To share it later, run `serve --http` "
+          "on one machine and point the others at it.")
+    return 0
+
+
 def cmd_install_skills(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve() if args.root else Path.cwd()
     destinations: list[Path] = []
@@ -238,6 +360,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    setup_parser = subparsers.add_parser(
+        "setup", help="Set a project up from scratch: local database, skills, client config.")
+    setup_parser.add_argument("--root", default=None, help="Project directory (default: current).")
+    setup_parser.add_argument("--project", default=None,
+                              help="Project id (default: derived from the directory name).")
+    setup_parser.add_argument("--database", default=None,
+                              help=f"Database path (default: {DEFAULT_HOME / 'memory.db'}).")
+    setup_parser.add_argument("--codex", action="store_true", help="Also configure Codex.")
+    setup_parser.add_argument("--codex-only", action="store_true", help="Configure Codex instead of Claude.")
+    setup_parser.set_defaults(func=cmd_setup)
 
     init_parser = subparsers.add_parser("init", help="Create a project in a database and seed its labels.")
     init_parser.add_argument("--database", required=True, help="Path to the SQLite database.")

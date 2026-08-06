@@ -27,40 +27,49 @@ build quirks — so future sessions don't re-derive them from scratch.
   registry membership, and relationship bidirectionality. Every mutation is transactional —
   validated, and rolled back on failure.
 
-## Installation
+## Setup
 
-Not yet on PyPI — install straight from GitHub:
+Two commands, from nothing to a working store. Requires Python 3.10+ and no network.
 
 ```bash
 pip install git+https://github.com/1101AlexZab1011/project-memory-mcp
-# or: pipx install git+https://github.com/1101AlexZab1011/project-memory-mcp
-# or: uv tool install git+https://github.com/1101AlexZab1011/project-memory-mcp
+project-memory-mcp setup
 ```
 
-Or clone and run without installing:
+Run `setup` from your project directory. It creates a local database under
+`~/.project-memory/`, names the project after the directory, seeds a starter label registry,
+installs the agent skills, and adds itself to `.mcp.json` — leaving any MCP servers already
+configured there untouched. Add `--codex` to configure Codex as well.
+
+Then restart your agent. That is the whole setup: **no server, no token, no network.** The
+store is local and stays local until you decide otherwise.
+
+> **If you are an agent doing this for someone:** run the two commands above from the
+> repository root, then tell the user to restart you. Nothing else is required, and nothing
+> needs to be installed system-wide beyond the package itself. Do not create a `.project-memory`
+> directory — that was the pre-0.4.0 layout and nothing reads it any more.
+
+<details>
+<summary>Other ways to install</summary>
 
 ```bash
+pipx install git+https://github.com/1101AlexZab1011/project-memory-mcp
+uv tool install git+https://github.com/1101AlexZab1011/project-memory-mcp
+
+# or run from a clone, without installing
 git clone https://github.com/1101AlexZab1011/project-memory-mcp
-cd project-memory-mcp
-python -m project_memory_mcp --help
+cd project-memory-mcp && python -m project_memory_mcp --help
 ```
 
-Requires Python 3.10+.
+</details>
 
-## Quick start
+## Sharing a store
 
-**1. Create a project in a database:**
+One database holds many projects, and `setup` is enough for a single machine. To share memory
+across devices or people, serve one database over HTTP and point the others at it — see
+[Sharing one store across devices](#sharing-one-store-across-devices) below.
 
-```bash
-project-memory-mcp init --database ~/memory.db --project my-project
-```
-
-One database holds many projects. This creates the project and seeds its label registry,
-so it is servable and visible in the UI before its first memory exists.
-
-**2. Register the MCP server with your agent.**
-
-Claude Code — add to your project's `.mcp.json`:
+Configuring a client by hand, if you would rather not use `setup`:
 
 ```json
 {
@@ -284,8 +293,11 @@ memory file changes, so repeat calls in a live server skip the rebuild entirely.
 ## CLI
 
 ```text
+project-memory-mcp setup           [--root DIR] [--project ID] [--database DB] [--codex]
 project-memory-mcp init            --database DB --project ID [--force]
 project-memory-mcp validate        --database DB --project ID
+project-memory-mcp audit           --database DB --project ID [--apply --yes]
+                                   [--delete-superseded] [--min-* N] [--max-actions N]
 project-memory-mcp serve           --database DB [--project ID] [--http --bind ADDR [--port N]]
                                    [--token T] [--no-ui] [--backup-dir DIR]
 project-memory-mcp migrate         --from DIR --database DB --project ID
