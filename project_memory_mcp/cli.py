@@ -65,9 +65,6 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"wrote {target.relative_to(root)}")
 
     store = MemoryStore(root)
-    store.regenerate_index()
-    print(f"wrote {store.index_path.relative_to(root)}")
-
     errors = store.validate_store()
     if errors:
         for error in errors:
@@ -82,12 +79,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if root is None:
         return 1
     store = MemoryStore(root)
-    if args.fix_index:
-        # Validate content first so a broken store never silently overwrites the index.
-        errors = store.validate_store(check_index=False)
-        if not errors:
-            store.regenerate_index()
-            print(f"Regenerated {store.index_path}")
     errors = store.validate_store()
     if errors:
         for error in errors:
@@ -95,6 +86,15 @@ def cmd_validate(args: argparse.Namespace) -> int:
         return 1
     count = len(list(store.active_root.glob("*.json"))) if store.active_root.is_dir() else 0
     print(f"Project memory validation passed. Memories: {count}")
+    legacy_index = store.memory_root / "INDEX.json"
+    if legacy_index.is_file():
+        # Stores created before 0.3.0 carry a generated index that nothing reads
+        # any more. Say so once rather than deleting a file we did not write.
+        print(
+            f"note: {legacy_index.relative_to(root)} is obsolete as of 0.3.0 and is no longer "
+            "read or updated. It is safe to delete.",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -138,9 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--force", action="store_true", help="Overwrite existing store template files.")
     init_parser.set_defaults(func=cmd_init)
 
-    validate_parser = subparsers.add_parser("validate", help="Validate the store and optionally regenerate the index.")
+    validate_parser = subparsers.add_parser("validate", help="Validate the store.")
     validate_parser.add_argument("--root", default=None, help="Project root (default: search upward from cwd).")
-    validate_parser.add_argument("--fix-index", action="store_true", help="Regenerate INDEX.json from memory files.")
     validate_parser.set_defaults(func=cmd_validate)
 
     serve_parser = subparsers.add_parser("serve", help="Run the stdio MCP server.")

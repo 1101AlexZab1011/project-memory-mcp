@@ -25,9 +25,8 @@ build quirks — so future sessions don't re-derive them from scratch.
 - **Lifecycle statuses, not deletion.** `active` / `stale` / `superseded` / `wrong` —
   disproven memories become warnings instead of silently disappearing.
 - **Strict validation.** A JSON Schema plus a built-in validator that checks the whole
-  store: field shapes, label registry membership, filename/id agreement, relationship
-  bidirectionality, and index freshness. Every mutation is transactional — validated,
-  and rolled back on failure.
+  store: field shapes, label registry membership, filename/id agreement, and relationship
+  bidirectionality. Every mutation is transactional — validated, and rolled back on failure.
 - **Zero runtime dependencies.** Pure Python standard library.
 
 ## Installation
@@ -66,7 +65,6 @@ This scaffolds:
   README.md            store rules for humans and agents
   labels.json          canonical label registry (starter kind:/context: labels)
   memory.schema.json   JSON Schema for memory files
-  INDEX.json           generated search index
   active/              one JSON file per memory
 ```
 
@@ -131,10 +129,10 @@ Re-run `install-skills` after upgrading the package to refresh the copies.
 | --- | --- |
 | `recall` | **Ranked retrieval in one call.** Scores every memory by text relevance, graph proximity, and label overlap; returns the best matches with the top few inlined in full. |
 | `list_labels` | Canonical labels grouped by prefix. |
-| `search_memories` | Search the lightweight index by label query, status, and optional text. |
+| `search_memories` | Filter memories by label query, status, and optional substring. Unranked; prefer `recall`. |
 | `get_memory` | Full JSON for one memory id. |
 | `get_memory_neighborhood` | Bounded relationship graph around a memory (`depth`, `max_nodes`). |
-| `create_memory` | Create a memory; syncs bidirectional links, regenerates the index, validates. |
+| `create_memory` | Create a memory; syncs bidirectional links, validates the store. |
 | `update_memory` | Deep-merge a patch into a memory; same sync + validation. |
 | `add_label` | Register a new canonical label. |
 | `delete_memory` | Delete after exact-id confirmation; removes dangling references. |
@@ -179,14 +177,18 @@ memory file changes, so repeat calls in a live server skip the rebuild entirely.
 
 ```text
 project-memory-mcp init            [--root DIR] [--force]
-project-memory-mcp validate        [--root DIR] [--fix-index]
+project-memory-mcp validate        [--root DIR]
 project-memory-mcp serve           [--root DIR]
 project-memory-mcp install-skills  [--root DIR] [--claude] [--codex] [--dest DIR]
 ```
 
-`validate` checks the whole store and exits non-zero on any problem; `--fix-index`
-regenerates `INDEX.json` from the memory files (refusing if the store itself is invalid).
-Use it in CI or a pre-commit hook to keep hand-edited memories honest.
+`validate` checks the whole store and exits non-zero on any problem. Use it in CI or a
+pre-commit hook to keep hand-edited memories honest.
+
+There is no generated index. Memory files are the only source of truth, parsed on demand
+and cached in memory until one of them changes, so a hand-written memory file is live
+immediately with no catalogue step. (Stores created before 0.3.0 have an `INDEX.json`;
+nothing reads it any more and it is safe to delete.)
 
 ## Memory format
 

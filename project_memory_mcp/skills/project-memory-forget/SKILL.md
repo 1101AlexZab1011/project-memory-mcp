@@ -24,7 +24,6 @@ Prefer `project-memory-remember`'s `stale` / `wrong` / `superseded` status path 
   README.md
   labels.json
   memory.schema.json
-  INDEX.json
   active/
 ```
 
@@ -38,7 +37,7 @@ The user's query may be:
 
 Do the cheap scan first:
 
-- Read `.project-memory/INDEX.json` and compare the query against `id`, `description`, `tags`, and `triggers` for every entry.
+- Read `.project-memory/active/*.json` and compare the query against `id`, `description`, `tags`, and `triggers` for every memory.
 - Only open full memory JSON files for candidates that remain ambiguous after the index-level scan.
 
 Resolution rules:
@@ -51,7 +50,7 @@ Resolution rules:
 
 Before deleting a memory file, find every other memory that points at it, since removing it must not leave a dangling reference:
 
-- Search for the memory's `id` string across `.project-memory/active/*.json`. `INDEX.json` does not carry relationship data, so it cannot be used for this check — search the full files.
+- Search for the memory's `id` string across `.project-memory/active/*.json` to find every relationship that references it.
 - A hit can appear in `relationships.related[].id`, `relationships.supersedes[]`, or `relationships.superseded_by[]`.
 - Record every file that references the id being deleted and which field it appears in.
 
@@ -70,8 +69,7 @@ For each memory confirmed for removal:
 
 ## Step 4 — Regenerate the index and validate
 
-- Run `project-memory-mcp validate --fix-index` to regenerate `INDEX.json` cleanly from the remaining files — safer than hand-editing the index after a deletion.
-- Run `project-memory-mcp validate` (without `--fix-index`) to confirm the store is valid afterward.
+- Run `project-memory-mcp validate` to confirm the store is valid afterward.
 
 ## Step 5 — Report
 

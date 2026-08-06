@@ -17,12 +17,6 @@ Memory files are JSON files under:
 .project-memory/active/
 ```
 
-A lightweight index may exist at:
-
-```text
-.project-memory/INDEX.json
-```
-
 A canonical label registry may exist at:
 
 ```text
@@ -56,7 +50,6 @@ Do not use for generic programming questions unless the task clearly depends on 
    - When a selected memory is useful but may have related context, call `get_memory_neighborhood` with a bounded `depth` and `max_nodes`.
 
 2. If MCP is unavailable, locate the memory store.
-   - Prefer `.project-memory/INDEX.json` if it exists.
    - Otherwise inspect `.project-memory/active/*.json`.
 
 3. First pass: inspect only lightweight fields.

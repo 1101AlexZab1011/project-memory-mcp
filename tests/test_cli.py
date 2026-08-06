@@ -21,7 +21,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         store_dir = self.root / ".project-memory"
-        for name in ("labels.json", "memory.schema.json", "README.md", "INDEX.json"):
+        for name in ("labels.json", "memory.schema.json", "README.md"):
             self.assertTrue((store_dir / name).is_file(), name)
         self.assertTrue((store_dir / "active").is_dir())
         self.assertEqual([], MemoryStore(self.root).validate_store())
@@ -62,25 +62,21 @@ class CliTests(unittest.TestCase):
         self.assertEqual(["first-lesson"], [entry["id"] for entry in result["memories"]])
         self.assertEqual(0, main(["validate", "--root", str(self.root)]))
 
-    def test_validate_fix_index_regenerates(self):
+    def test_init_writes_no_index(self):
         main(["init", "--root", str(self.root)])
-        store = MemoryStore(self.root)
-        store.create_memory(make_memory("first-lesson", ["kind:bug"]))
-        store.index_path.write_text('{"schema_version": 1, "memories": []}', encoding="utf-8")
 
-        self.assertEqual(1, main(["validate", "--root", str(self.root)]))
-        self.assertEqual(0, main(["validate", "--root", str(self.root), "--fix-index"]))
+        self.assertFalse((self.root / ".project-memory" / "INDEX.json").exists())
+
+    def test_a_pre_0_3_index_left_on_disk_is_tolerated(self):
+        # Upgraded stores still have the file committed; it must not fail
+        # validation, and nothing should read or rewrite it.
+        main(["init", "--root", str(self.root)])
+        legacy = self.root / ".project-memory" / "INDEX.json"
+        legacy.write_text('{"schema_version": 1, "memories": []}', encoding="utf-8")
+        MemoryStore(self.root).create_memory(make_memory("first-lesson", ["kind:bug"]))
+
         self.assertEqual(0, main(["validate", "--root", str(self.root)]))
-
-    def test_validate_fix_index_refuses_to_mask_a_broken_store(self):
-        main(["init", "--root", str(self.root)])
-        bad = make_memory("bad-memory", ["kind:bug"])
-        bad["description"] = "short"
-        MemoryStore(self.root)._write_json(
-            self.root / ".project-memory" / "active" / "bad-memory.json", bad
-        )
-
-        self.assertEqual(1, main(["validate", "--root", str(self.root), "--fix-index"]))
+        self.assertEqual('{"schema_version": 1, "memories": []}', legacy.read_text(encoding="utf-8"))
 
     def test_install_skills_copies_all_skills(self):
         exit_code = main(["install-skills", "--root", str(self.root), "--claude", "--codex"])

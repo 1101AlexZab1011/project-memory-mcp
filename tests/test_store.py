@@ -57,7 +57,6 @@ class StoreTestCase(unittest.TestCase):
         self.write_memory(make_memory("alpha-bug", ["area:alpha", "context:runtime", "kind:bug"]))
         self.write_memory(make_memory("beta-workflow", ["area:beta", "kind:workflow"]))
         self.write_memory(make_memory("alpha-workflow", ["area:alpha", "kind:workflow"]))
-        self.store.regenerate_index()
 
 
 class SearchTests(StoreTestCase):
@@ -86,13 +85,16 @@ class SearchTests(StoreTestCase):
 
 
 class MutationTests(StoreTestCase):
-    def test_create_regenerates_index_with_labels(self):
+    def test_create_writes_only_the_memory_file(self):
         memory = make_memory("new-memory", ["area:alpha", "kind:bug"])
 
         self.store.create_memory(memory)
-        index = self.store._read_json(self.root / ".project-memory" / "INDEX.json")
 
-        self.assertEqual(["area:alpha", "kind:bug"], index["memories"][0]["labels"])
+        self.assertEqual(
+            ["area:alpha", "kind:bug"], self.store.get_memory("new-memory")["labels"]
+        )
+        # No derived index is written alongside it; the files are the store.
+        self.assertFalse((self.root / ".project-memory" / "INDEX.json").exists())
 
     def test_create_rejects_invalid_memory_and_rolls_back(self):
         self.seed_memories()
@@ -161,7 +163,6 @@ class MutationTests(StoreTestCase):
                 [{"id": "alpha-bug", "reason": "shared test relationship"}],
             )
         )
-        self.store.regenerate_index()
 
         with self.assertRaises(StoreError):
             self.store.delete_memory("beta-workflow", "wrong-id")
@@ -200,7 +201,6 @@ class NeighborhoodTests(StoreTestCase):
                 [{"id": "beta-workflow", "reason": "second hop relationship"}],
             )
         )
-        self.store.regenerate_index()
 
         depth_one = self.store.get_memory_neighborhood("alpha-bug", depth=1)
         depth_two = self.store.get_memory_neighborhood("alpha-bug", depth=2)

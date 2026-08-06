@@ -14,7 +14,6 @@ Managed by the `project-memory-mcp` tool (store scaffolding, validation, and MCP
   README.md            this file
   labels.json          canonical label registry
   memory.schema.json   JSON Schema for memory files
-  INDEX.json           generated search index (not the source of truth)
   active/              one JSON file per memory
 ```
 
@@ -31,7 +30,7 @@ Managed by the `project-memory-mcp` tool (store scaffolding, validation, and MCP
 - Current code, tests, logs, and build output override memory.
 - Prefer marking outdated memories `stale`/`wrong`/`superseded` over deleting them.
 - Run `project-memory-mcp validate` after editing memory files by hand.
-- Run `project-memory-mcp validate --fix-index` to regenerate `INDEX.json`.
+- Memory files are the only source of truth; there is no generated index to keep in sync.
 
 ## Labels
 

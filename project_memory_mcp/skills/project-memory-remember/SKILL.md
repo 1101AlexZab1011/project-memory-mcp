@@ -53,7 +53,6 @@ Expected structure:
   README.md
   labels.json
   memory.schema.json
-  INDEX.json
   active/
 ```
 
@@ -107,8 +106,7 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
    - Use `list_labels` to inspect canonical labels.
    - Use `search_memories` with labels to retrieve the likely duplicate/related cluster.
    - Use `get_memory` only for selected candidates.
-   - If MCP is unavailable, read `.project-memory/INDEX.json` if it exists.
-   - Otherwise inspect `.project-memory/active/*.json`.
+   - If MCP is unavailable, inspect `.project-memory/active/*.json`.
    - First inspect only `id`, `status`, `description`, `labels`, `tags`, `scope`, and `triggers`.
 
 2. Decide whether the resolved task contains reusable knowledge.
@@ -171,13 +169,12 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
 7. Cross-link related memories.
    - This step runs whenever a memory is created, or whenever an existing memory's `remembered_facts`, `solution_pattern`, or `pitfalls` change substantively. Skip it for pure status changes (e.g. marking something `stale` or `wrong`).
    - Prefer MCP `search_memories` with a label query matching the new/changed memory to get a small candidate cluster.
-   - If MCP is unavailable, scan `.project-memory/INDEX.json` and compare the new/changed memory's `labels` and `description` against lightweight entries only. Do not open full memory files just to check relatedness.
+   - If MCP is unavailable, compare the new/changed memory's `labels` and `description` against the same fields in `.project-memory/active/*.json`. Read only those fields; do not study whole memories just to check relatedness.
    - Apply a real quality bar: link only when there is genuine subsystem, error-mode, or file overlap, not superficial topical resemblance.
    - For each memory judged related, author one `reason` string and reuse the identical string on both sides.
    - Update the new/changed memory's own `relationships.related` with `{id, reason}` entries for every related memory found.
    - For each related memory, add a matching `{id, reason}` entry pointing back at the new/changed memory.
    - `relationships.supersedes` / `relationships.superseded_by` stay plain memory-id arrays.
-   - Do not add relationship data to `INDEX.json`. The index stays limited to `id`, `file`, `status`, `description`, `labels`, `tags`, `triggers`; relationships live only in the full memory files.
 
 8. Keep memories granular.
    - One memory = one reusable lesson.
@@ -191,15 +188,9 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
    - `solution_pattern`: practical steps or rules.
    - `pitfalls`: likely future mistakes.
 
-10. Update `.project-memory/INDEX.json`.
-   - Add new active memories.
-   - Update descriptions, labels, tags, triggers, files, and statuses for edited memories.
-   - Mark superseded/wrong memories accordingly.
-   - If the index contradicts individual memory files, individual memory files are the source of truth.
-
-11. Validate JSON.
+10. Validate JSON.
     - Run `project-memory-mcp validate`.
-    - Use `project-memory-mcp validate --fix-index` when the index should be regenerated from memory files.
+    - There is no index to update: memory files are the only source of truth, so a written file is live immediately.
     - Ensure each edited file parses as JSON.
     - Ensure no comments or trailing commas exist.
     - Ensure `id` matches filename.
@@ -207,7 +198,7 @@ Rule of thumb: store a memory only if it would save at least 10-20 minutes later
     - Ensure every label exists in `.project-memory/labels.json`.
     - Ensure every `relationships.related` entry is an `{id, reason}` object, not a bare string, and that links are bidirectional.
 
-12. Report the result to the user.
+11. Report the result to the user.
 
 ## Status Rules
 

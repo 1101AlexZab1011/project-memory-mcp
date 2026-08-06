@@ -100,7 +100,7 @@ TOOLS = [
     ),
     _tool(
         "create_memory",
-        "Create a memory JSON file, synchronize bidirectional relationships, regenerate INDEX.json, and validate.",
+        "Create a memory JSON file, synchronize bidirectional relationships, and validate the store.",
         {
             "memory": {"type": "object", "additionalProperties": True},
             "related_label_query": {
@@ -113,7 +113,7 @@ TOOLS = [
     ),
     _tool(
         "update_memory",
-        "Patch an existing memory, synchronize relationships, regenerate INDEX.json, and validate.",
+        "Patch an existing memory, synchronize relationships, and validate the store.",
         {
             "id": {"type": "string"},
             "patch": {"type": "object", "additionalProperties": True},

@@ -215,7 +215,6 @@ class RecallTests(unittest.TestCase):
         ):
             (store_dir / f"{entry['id']}.json").write_text(json.dumps(entry), encoding="utf-8")
         self.store = MemoryStore(root)
-        self.store.regenerate_index()
 
     def test_recall_ranks_and_inlines_full_memories(self):
         result = self.store.recall(query="cache invalidation", limit=2, full_count=1)

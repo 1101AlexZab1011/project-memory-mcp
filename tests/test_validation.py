@@ -14,7 +14,6 @@ class ValidateStoreTests(StoreTestCase):
         memory = make_memory("alpha-bug", ["area:alpha", "kind:bug"])
         del memory["triggers"]
         self.write_memory(memory)
-        self.store.regenerate_index()
 
         errors = self.store.validate_store()
 
@@ -24,7 +23,6 @@ class ValidateStoreTests(StoreTestCase):
         memory = make_memory("alpha-bug", ["area:alpha", "kind:bug"])
         memory["extra_field"] = "unexpected"
         self.write_memory(memory)
-        self.store.regenerate_index()
 
         errors = self.store.validate_store()
 
@@ -33,13 +31,11 @@ class ValidateStoreTests(StoreTestCase):
     def test_unregistered_label_is_reported(self):
         memory = make_memory("alpha-bug", ["area:alpha", "kind:bug"])
         self.write_memory(memory)
-        self.store.regenerate_index()
         # Bypass mutation APIs to simulate a hand-edit introducing a rogue label.
         path = self.root / ".project-memory" / "active" / "alpha-bug.json"
         raw = json.loads(path.read_text(encoding="utf-8"))
         raw["labels"] = ["area:alpha", "area:unregistered"]
         path.write_text(json.dumps(raw), encoding="utf-8")
-        self.store.regenerate_index()
 
         errors = self.store.validate_store()
 
@@ -49,7 +45,6 @@ class ValidateStoreTests(StoreTestCase):
         memory = make_memory("alpha-bug", ["area:alpha", "kind:bug"])
         path = self.root / ".project-memory" / "active" / "wrong-name.json"
         self.store._write_json(path, memory)
-        self.store.regenerate_index()
 
         errors = self.store.validate_store()
 
@@ -64,7 +59,6 @@ class ValidateStoreTests(StoreTestCase):
             )
         )
         self.write_memory(make_memory("beta-workflow", ["area:beta", "kind:workflow"]))
-        self.store.regenerate_index()
 
         errors = self.store.validate_store()
 
@@ -76,26 +70,23 @@ class ValidateStoreTests(StoreTestCase):
         new["relationships"]["supersedes"] = ["old-lesson"]
         self.write_memory(old)
         self.write_memory(new)
-        self.store.regenerate_index()
 
         errors = self.store.validate_store()
 
         self.assertTrue(any("is not mirrored by superseded_by" in error for error in errors))
 
-    def test_stale_index_is_reported(self):
+    def test_a_hand_written_memory_file_needs_no_catalogue_step(self):
         self.seed_memories()
         self.write_memory(make_memory("uncatalogued", ["area:alpha", "kind:bug"]))
 
-        errors = self.store.validate_store()
-
-        self.assertTrue(any("stale or inconsistent" in error for error in errors))
+        self.assertEqual([], self.store.validate_store())
+        self.assertIn("uncatalogued", self.store.load_memories())
 
     def test_missing_status_and_description_do_not_crash_validation(self):
         memory = make_memory("alpha-bug", ["area:alpha", "kind:bug"])
         del memory["status"]
         del memory["description"]
         self.write_memory(memory)
-        self.store.regenerate_index()
 
         errors = self.store.validate_store()
 
@@ -107,7 +98,6 @@ class ValidateStoreTests(StoreTestCase):
         memory["status"] = "archived"
         memory["evidence"]["last_validated"] = "July 2026"
         self.write_memory(memory)
-        self.store.regenerate_index()
 
         errors = self.store.validate_store()
 

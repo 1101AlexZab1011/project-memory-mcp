@@ -1,9 +1,11 @@
 """File-based project memory store.
 
 Memories are individual JSON files under ``.project-memory/active/``, described by a
-canonical label registry (``labels.json``) and summarized in a generated search index
-(``INDEX.json``). The store is plain JSON on disk so it diffs, merges, and reviews
-cleanly in git alongside the project it belongs to.
+canonical label registry (``labels.json``). The store is plain JSON on disk so it
+diffs, merges, and reviews cleanly in git alongside the project it belongs to.
+
+There is no generated index: memory files are the only source of truth. They are
+parsed on demand and cached in memory until one of them changes.
 """
 
 from __future__ import annotations
@@ -43,12 +45,6 @@ SCOPE_REQUIRED_FIELDS = ("project", "area", "files")
 SCOPE_FIELDS = ("project", "area", "files", "applies_to")
 EVIDENCE_FIELDS = ("created_from_task", "last_validated")
 RELATIONSHIP_FIELDS = ("related", "supersedes", "superseded_by")
-
-INDEX_DESCRIPTION = (
-    "Search index for project memory JSON files. "
-    "This file is not the source of truth; memory files under active/ are."
-)
-
 
 class StoreError(ValueError):
     """Raised for any invalid input, invalid store state, or failed operation."""
@@ -203,7 +199,6 @@ class MemoryStore:
         self.root = Path(root).resolve()
         self.memory_root = self.root / STORE_DIR_NAME
         self.active_root = self.memory_root / "active"
-        self.index_path = self.memory_root / "INDEX.json"
         self.labels_path = self.memory_root / "labels.json"
         self._cache_signature: tuple[tuple[str, int, int], ...] | None = None
         self._cache_records: dict[str, dict[str, Any]] | None = None
@@ -235,27 +230,18 @@ class MemoryStore:
         expression = LabelExpression(label_query, known)
         statuses = self._normalize_status_filter(status_filter)
         needle = text_query.lower().strip() if text_query else ""
-        index = self._read_json(self.index_path)
         matches: list[dict[str, Any]] = []
-        for entry in index.get("memories", []):
-            if statuses is not None and entry.get("status") not in statuses:
+        for memory_id, record in sorted(self.load_memories().items()):
+            memory = record["memory"]
+            if statuses is not None and memory.get("status") not in statuses:
                 continue
-            labels = entry.get("labels", [])
+            labels = memory.get("labels", [])
             if not expression.matches(labels):
                 continue
+            entry = self._light_record(memory_id, record["path"], memory)
             if needle and needle not in self._entry_text(entry):
                 continue
-            matches.append(
-                {
-                    "id": entry.get("id"),
-                    "status": entry.get("status"),
-                    "description": entry.get("description"),
-                    "labels": labels,
-                    "tags": entry.get("tags", []),
-                    "triggers": entry.get("triggers", []),
-                    "file": entry.get("file"),
-                }
-            )
+            matches.append(entry)
             if limit is not None and len(matches) >= limit:
                 break
         return {"count": len(matches), "label_query_labels": sorted(expression.used_labels), "memories": matches}
@@ -468,20 +454,7 @@ class MemoryStore:
 
     # ------------------------------------------------------- index/validation
 
-    def regenerate_index(self) -> None:
-        entries: list[dict[str, Any]] = []
-        if self.active_root.exists():
-            for path in sorted(self.active_root.glob("*.json")):
-                memory = self._read_json(path)
-                entries.append(self._index_entry(path, memory))
-        index = {
-            "schema_version": 1,
-            "description": INDEX_DESCRIPTION,
-            "memories": sorted(entries, key=lambda entry: entry["id"]),
-        }
-        self._write_json(self.index_path, index)
-
-    def validate_store(self, check_index: bool = True) -> list[str]:
+    def validate_store(self) -> list[str]:
         """Validate the whole store. Returns a list of human-readable problems
         (empty when the store is valid). Never raises for content problems."""
         errors: list[str] = []
@@ -494,8 +467,6 @@ class MemoryStore:
         known_labels = self._validate_label_registry(errors)
         records = self._validate_memory_files(errors, known_labels)
         self._validate_relationship_graph(errors, records)
-        if check_index:
-            self._validate_index(errors, records)
         return errors
 
     def validate_memory(self, memory: Any, known_labels: set[str] | None, where: str) -> list[str]:
@@ -618,7 +589,6 @@ class MemoryStore:
         snapshot = self._snapshot()
         try:
             result = mutate()
-            self.regenerate_index()
             errors = self.validate_store()
             if errors:
                 raise StoreError("Store validation failed after mutation:\n" + "\n".join(errors))
@@ -628,13 +598,13 @@ class MemoryStore:
             raise
 
     def _snapshot(self) -> dict[Path, bytes | None]:
-        paths = [self.index_path, self.labels_path]
+        paths = [self.labels_path]
         if self.active_root.exists():
             paths.extend(self.active_root.glob("*.json"))
         return {path: path.read_bytes() if path.exists() else None for path in paths}
 
     def _restore(self, snapshot: dict[Path, bytes | None]) -> None:
-        current_paths = {self.index_path, self.labels_path}
+        current_paths = {self.labels_path}
         if self.active_root.exists():
             current_paths.update(self.active_root.glob("*.json"))
         for path in current_paths:
@@ -764,19 +734,6 @@ class MemoryStore:
             "file": path.relative_to(self.memory_root).as_posix(),
         }
 
-    def _index_entry(self, path: Path, memory: dict[str, Any]) -> dict[str, Any]:
-        # Tolerate missing fields: this also runs on hand-edited files during
-        # validation, where missing-field errors are reported separately.
-        return {
-            "id": memory.get("id"),
-            "file": path.relative_to(self.memory_root).as_posix(),
-            "status": memory.get("status"),
-            "description": memory.get("description"),
-            "tags": memory.get("tags", []),
-            "labels": memory.get("labels", []),
-            "triggers": memory.get("triggers", []),
-        }
-
     def _entry_text(self, entry: dict[str, Any]) -> str:
         chunks = [
             entry.get("id", ""),
@@ -819,7 +776,7 @@ class MemoryStore:
             return json.loads(path.read_text(encoding="utf-8-sig"))
         except FileNotFoundError as exc:
             hint = ""
-            if path in (self.labels_path, self.index_path):
+            if path == self.labels_path:
                 hint = " If the store is not initialized yet, run 'project-memory-mcp init'."
             raise StoreError(f"Missing file: {path}.{hint}") from exc
         except json.JSONDecodeError as exc:
@@ -933,30 +890,6 @@ class MemoryStore:
                             f"{where}: relationships.{source_field} '{target_id}' is not mirrored "
                             f"by {mirror_field}."
                         )
-
-    def _validate_index(self, errors: list[str], records: dict[str, dict[str, Any]]) -> None:
-        if not self.index_path.is_file():
-            errors.append(f"Missing index file: {self.index_path}")
-            return
-        try:
-            index = self._read_json(self.index_path)
-        except StoreError as exc:
-            errors.append(str(exc))
-            return
-        if index.get("schema_version") != 1:
-            errors.append(f"{self.index_path}: schema_version must be 1.")
-        if not isinstance(index.get("memories"), list):
-            errors.append(f"{self.index_path}: field 'memories' must be an array.")
-            return
-        expected = sorted(
-            (self._index_entry(record["path"], record["memory"]) for record in records.values()),
-            key=lambda entry: entry["id"],
-        )
-        if index.get("memories") != expected:
-            errors.append(
-                f"{self.index_path} is stale or inconsistent. "
-                "Run 'project-memory-mcp validate --fix-index' to regenerate it."
-            )
 
     def _check_string_array(
         self,
