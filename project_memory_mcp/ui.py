@@ -94,6 +94,11 @@ PAGE = """<!doctype html>
 </header>
 <main id="list"></main>
 <dialog id="detail"><div class="detail" id="detailBody"></div>
+  <div class="actions" id="publishRow" hidden>
+    <button class="ghost" id="visibility">Make public</button>
+    <select id="remote"></select>
+    <button class="ghost" id="publish">Publish</button>
+  </div>
   <div class="actions">
     <select id="newStatus">
       <option value="active">active</option><option value="stale">stale</option>
@@ -108,6 +113,7 @@ PAGE = """<!doctype html>
 <script>
 const $ = s => document.querySelector(s);
 let current = null, currentArchived = false, offset = 0, busy = false, done = false;
+let remotes = [], currentTier = 1, currentPublic = false, currentBorrowed = false;
 
 async function api(path, options) {
   const r = await fetch(path, Object.assign({credentials: 'same-origin'}, options || {}));
@@ -166,7 +172,7 @@ async function open(id) {
   const u = m.usage || {}, r = m.memory.relationships || {}, s = m.memory.scope || {};
   $('#detailBody').innerHTML = `<h1>${esc(m.memory.id)}</h1>
     <p class="muted">${esc(m.memory.status)} · created ${esc((m.memory.evidence||{}).created || '—')}
-     · tier ${m.tier || 1}${m.archived_at ? ', archived ' + esc(m.archived_at) : ''}
+     · tier ${m.tier || 1} · ${esc(m.visibility || 'private')}${m.borrowed ? ' (cached)' : ''}${m.archived_at ? ', archived ' + esc(m.archived_at) : ''}
      · shown ${u.surfaced||0} (${u.surfaced_direct||0} direct), used ${u.applied||0}
      · ${u.spread_days||0} distinct days</p>
     <p>${esc(m.memory.description)}</p>
@@ -178,14 +184,45 @@ async function open(id) {
   $('#newStatus').value = m.memory.status;
   currentArchived = !!m.archived_at;
   $('#archive').textContent = currentArchived ? 'Restore' : 'Archive';
+  currentTier = m.tier || 1;
+  currentPublic = m.visibility === 'public';
+  currentBorrowed = !!m.borrowed;
+  publishState();
   $('#detail').showModal();
+}
+
+// Publishing is only offered where it means something. A cached copy belongs to
+// the server it came from, and a private memory is private because of who it is
+// for - so both say why they cannot be published rather than silently omitting
+// the control.
+function publishState() {
+  $('#publishRow').hidden = !remotes.length;
+  if (!remotes.length) return;
+  $('#visibility').textContent = currentPublic ? 'Make private' : 'Make public';
+  $('#visibility').disabled = currentBorrowed;
+  const why = currentBorrowed ? 'cached from another server, not yours to publish'
+    : !currentPublic ? 'private memories are never published - make it public first'
+    : currentTier < 2 ? 'has not earned publication yet; you can publish it anyway'
+    : 'publish to the selected server';
+  $('#publish').disabled = currentBorrowed || !currentPublic;
+  $('#publish').title = why;
 }
 
 async function boot() {
   const info = await api('/api/projects');
   $('#project').innerHTML = info.projects.map(p => `<option>${esc(p)}</option>`).join('');
   if (!info.projects.length) { $('#list').innerHTML = '<p class="empty">No projects yet.</p>'; return; }
-  await labels(); load(true);
+  await labels(); await loadRemotes(); load(true);
+}
+async function loadRemotes() {
+  // A store with no remotes is a complete setup, not a broken one, so failing
+  // to list them must leave the rest of the page working.
+  try {
+    const data = await api('/api/remotes?project=' + encodeURIComponent($('#project').value));
+    remotes = data.remotes || [];
+  } catch (e) { remotes = []; }
+  $('#remote').innerHTML = remotes.map(r => `<option value="${esc(r.name)}">${esc(r.name)}` +
+    `${r.description ? ' - ' + esc(r.description) : ''}</option>`).join('');
 }
 async function labels() {
   const data = await api('/api/labels?project=' + encodeURIComponent($('#project').value));
@@ -196,7 +233,7 @@ async function labels() {
 let timer;
 $('#q').oninput = () => { clearTimeout(timer); timer = setTimeout(() => load(true), 250); };
 $('#status').onchange = $('#label').onchange = () => load(true);
-$('#project').onchange = async () => { await labels(); load(true); };
+$('#project').onchange = async () => { await labels(); await loadRemotes(); load(true); };
 $('#close').onclick = () => $('#detail').close();
 $('#save').onclick = async () => {
   await api('/api/status', {method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -213,6 +250,32 @@ $('#del').onclick = async () => {
   await api('/api/delete', {method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({project: $('#project').value, id: current})});
   $('#detail').close(); load(true);
+};
+$('#visibility').onclick = async () => {
+  const next = currentPublic ? 'private' : 'public';
+  await api('/api/visibility', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({project: $('#project').value, id: current, visibility: next})});
+  currentPublic = next === 'public';
+  publishState();
+};
+$('#publish').onclick = async () => {
+  const remote = $('#remote').value;
+  // Tier is the store's evidence that a memory has proven useful. Overriding it
+  // is exactly what this button is for - a lesson that is hard-won, rarely
+  // needed and expensive to rediscover never accrues the usage to earn a tier -
+  // but it should be a deliberate answer to a question, not a side effect.
+  if (currentTier < 2 && !confirm(
+      `${current} is tier ${currentTier} and has not earned publication.\n\n` +
+      `Publish it to ${remote} anyway? Do this for a lesson whose value will never ` +
+      `show up in usage: hard-won, rarely needed, expensive to rediscover.`)) return;
+  try {
+    const r = await api('/api/promote', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({project: $('#project').value, id: current, remote,
+                            force: currentTier < 2})});
+    alert(r.promoted ? `Published ${r.promoted} to ${r.remote}.`
+      : `${r.queued} is queued for ${r.remote} and will be retried: ${r.reason}`);
+  } catch (e) { alert(e.message); }
 };
 $('#logout').onclick = async () => {
   await api('/api/logout', {method: 'POST'}); location.href = '/login';

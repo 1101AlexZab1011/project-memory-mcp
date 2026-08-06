@@ -48,7 +48,7 @@ class UiTests(unittest.TestCase):
         seed.create_memory(memory("shader-stall", SHADER, ["area:z"]))
         seed.close()
 
-        registry = _StoreRegistry(self.db)
+        registry = self.registry = _StoreRegistry(self.db)
         self.addCleanup(registry.close)
         handler = type("H", (_Handler,), {"registry": registry, "token": TOKEN,
                                           "sessions": _Sessions(), "ui_enabled": self.ui_enabled})
@@ -195,6 +195,80 @@ class UiTests(unittest.TestCase):
     def test_mutations_require_a_session(self):
         status, _ = self.post("/api/delete", {"project": "demo", "id": "cache-race"})
         self.assertEqual(401, status)
+
+    # --------------------------------------------------- human promotion path
+
+    def test_remotes_are_listed_and_an_empty_list_is_a_valid_answer(self):
+        self.login()
+        status, body = self.get("/api/remotes?project=demo")
+        self.assertEqual(200, status)
+        self.assertEqual([], json.loads(body)["remotes"])
+
+    def test_detail_reports_visibility_so_the_button_knows_what_to_offer(self):
+        self.login()
+        _, body = self.get("/api/memory?project=demo&id=cache-race")
+        payload = json.loads(body)
+        self.assertEqual("private", payload["visibility"])
+        self.assertFalse(payload["borrowed"])
+
+    def test_visibility_can_be_changed_from_the_ui(self):
+        # Without this, every memory is created private and the publish button
+        # would be permanently disabled.
+        self.login()
+        status, _ = self.post("/api/visibility",
+                              {"project": "demo", "id": "cache-race", "visibility": "public"})
+        self.assertEqual(200, status)
+        _, body = self.get("/api/memory?project=demo&id=cache-race")
+        self.assertEqual("public", json.loads(body)["visibility"])
+
+    def test_a_human_can_publish_a_memory_that_has_not_earned_a_tier(self):
+        # The non-statistical path: a tier-1 memory that would never accrue the
+        # usage to promote itself. The remote is down, so it queues.
+        from project_memory_mcp import federation
+
+        self.login()
+        store, lock = self.registry.get("demo")
+        with lock:
+            federation.add_remote(store.connection, "team", "http://127.0.0.1:9/", "the team")
+        self.post("/api/visibility",
+                  {"project": "demo", "id": "cache-race", "visibility": "public"})
+        status, body = self.post("/api/promote", {"project": "demo", "id": "cache-race",
+                                                  "remote": "team", "force": True})
+        self.assertEqual(200, status)
+        self.assertEqual("cache-race", json.loads(body)["queued"])
+
+    def test_publishing_an_unearned_memory_without_force_is_refused(self):
+        from project_memory_mcp import federation
+
+        self.login()
+        store, lock = self.registry.get("demo")
+        with lock:
+            federation.add_remote(store.connection, "team", "http://127.0.0.1:9/", "the team")
+        self.post("/api/visibility",
+                  {"project": "demo", "id": "cache-race", "visibility": "public"})
+        status, body = self.post("/api/promote",
+                                 {"project": "demo", "id": "cache-race", "remote": "team"})
+        self.assertEqual(400, status)
+        self.assertIn("has not earned publication", json.loads(body)["error"])
+
+    def test_the_ui_cannot_wave_a_credential_through(self):
+        # allow_secrets is deliberately not exposed here: judging a match needs
+        # the memory read next to the code, not a button in a browser.
+        from project_memory_mcp import federation
+
+        self.login()
+        store, lock = self.registry.get("demo")
+        with lock:
+            federation.add_remote(store.connection, "team", "http://127.0.0.1:9/", "the team")
+            store.update_memory("cache-race", {
+                "remembered_facts": ["STRIPE_KEY=" + "sk_" + "live_" + "4eC39HqLyjWDarjtT1zdp7dc"]})
+        self.post("/api/visibility",
+                  {"project": "demo", "id": "cache-race", "visibility": "public"})
+        status, body = self.post("/api/promote", {"project": "demo", "id": "cache-race",
+                                                  "remote": "team", "force": True,
+                                                  "allow_secrets": True})
+        self.assertEqual(400, status)
+        self.assertIn("stripe key", json.loads(body)["error"])
 
     def test_unknown_project_is_reported(self):
         self.login()

@@ -60,7 +60,7 @@ So the gates must be *late enough to be evidence* and the early ones must be *re
 
 | Element | What it owns | Where it lives |
 |---|---|---|
-| **Computer** | Every job that runs on memories rather than answering a question: tiering, archiving, outbox delivery, duplicate detection | `computer.py` — a thread inside `serve`, or its own process |
+| **Computer** | Every job that runs on memories rather than answering a question: outbox delivery, re-anchoring, tiering and archiving, graph rebuilds, duplicate detection | `computer.py` — a thread inside `serve`, or its own process |
 | **Runtime storage** | Tier 1: memories that exist but have not proven anything | `memories` where `tier = 1` |
 | **Private store** | What only helps here — this user, this machine, these habits | `visibility = 'private'`, never leaves |
 | **Public store** | What would help anyone on this project | `visibility = 'public'`, publishable once it has earned a tier |
@@ -543,20 +543,48 @@ federation on their own — being able to see who contributed what, and to query
 directly, answers most of "Bob knows things I don't" without any conversation. Build the message
 primitive only if a real gap survives those two.
 
-## Secrets
+## Secrets ✔
 
-[SKILL.md:98](../project_memory_mcp/skills/project-memory-remember/SKILL.md) lists
-`secrets, credentials, tokens, or personal data` among eleven things not to remember. That is
-weak in three ways: it reads as a ban on the *topic* rather than on the *value*, so a useful
-memory about where configuration lives is either skipped or recorded with the secret attached;
-it carries the same weight as "typos" though it is a harm rule and not a triviality rule; and it
-predates sharing, when a leaked secret sat in a repo that already had access control.
+The skill used to list `secrets, credentials, tokens, or personal data` among eleven things not
+to remember. That was weak in three ways: it read as a ban on the *topic* rather than on the
+*value*, so a useful memory about where configuration lives was either skipped or recorded with
+the secret attached; it carried the same weight as "typos" though it is a harm rule and not a
+triviality rule; and it predated sharing, when a leaked secret sat in a repo that already had
+access control.
 
-Two changes. State it positively and separately — record where a secret lives and what shape it
-takes, never the value. And scan at promotion for obvious secret shapes, holding the memory for
-review rather than publishing it. Skill text is advisory, and `applied` being zero everywhere is
-direct evidence that advisory instructions in these skills do not reliably fire; the scan is
-what enforces it.
+Both changes are made. The rule now has its own section stating it positively — record where a
+secret lives and what shape it takes, never the value — with the useful version and the harmful
+version of the same memory shown side by side. And `secret_scan.py` runs at promotion, holding
+the memory rather than publishing it. Skill text is advisory, and `applied` being zero
+everywhere is direct evidence that advisory instructions in these skills do not reliably fire;
+the scan is what enforces it.
+
+Three tiers, and the ordering is the whole design. Structural shapes (PEM blocks, JWTs,
+connection strings with an inline password) and vendor prefixes (`sk_live_`, `AKIA`, `ghp_`)
+are self-identifying and near-free in false positives — vendors chose those prefixes so that
+scanners could find them, and they carry the overwhelming majority of real leaks. Entropy is
+last and gated, because measured naively it does not work at all: English prose runs about 4.3
+bits per character, *higher* than a real GitHub token, since Shannon over a short string mostly
+reports length and character variety. It separates only after tokenizing, restricting to a
+credential alphabet, and requiring a name like `key` or `token` nearby.
+
+Two consequences worth recording because they are easy to get wrong later:
+
+- **Hex is not a tier of its own.** A 40-character git SHA scores 3.95 against the usual 3.0
+  threshold, as does every MD5 and every dash-stripped UUID. In a store whose memories are
+  largely *about commits*, an ungated hex rule is a commit-SHA detector. It runs only beside a
+  credential name.
+- **Our own key material is allowlisted explicitly.** Every promoted memory carries an Ed25519
+  fingerprint in `author_key`, and a public key is high-entropy precisely so it can be
+  published. That fingerprints survive a naive scan at all is an accident of `:` not being a
+  base64 character — one that disappears the moment anyone adds `:` to the delimiter set.
+
+Findings are masked: a report that echoed the matched value would copy the secret into an error
+message, a job log and an HTTP response. The scan runs again in `drain_outbox`, because the body
+is re-read at send time and an edit made while an item sat queued would otherwise ship
+unexamined. `allow_secrets` overrides it and is deliberately separate from `force`: "this
+matters more than its usage shows" and "that string is not a secret" are different claims, and
+the browser is given the first and never the second.
 
 ## Risks
 
@@ -578,9 +606,11 @@ what enforces it.
   numbers are free; a large number would need local-first querying, which trades latency
   variance for cost.
 - **Rare-but-critical knowledge can still die in a nursery.** It never accumulates enough local
-  usage to earn promotion, so a hard-won lesson evaporates on one laptop. Promotion needs a
-  non-statistical path: the agent marking a memory as worth sharing, and a human promoting from
-  the UI.
+  usage to earn promotion, so a hard-won lesson evaporates on one laptop. Both non-statistical
+  paths now exist: `promote_memory` with `force` for the agent, and a Publish button in the UI
+  that asks for confirmation naming the tier before overriding it. The UI also gained a
+  visibility toggle, without which the button would have been permanently disabled — memories
+  are created private, and nothing else in the UI could change that.
 - **Federation weakens no-longer-true.** A memory corrected on one server stays wrong on
   another. Nothing propagates a correction across sources, by design — which is the cost of
   letting sources differ, and it is paid in stale answers rather than in conflicts.
@@ -615,9 +645,14 @@ what enforces it.
 Deployment and networking are deliberately **not** a phase. The server binds to an address; how
 that address exists is the operator's choice and belongs in documentation.
 
-All phases are built. What remains is not more construction but use: every threshold in the
-audit is still a guess, `applied` is still zero everywhere, and no second client has yet
-enrolled against a real server. Those are answered by running it, not by writing more of it.
+All phases are built, and so is everything the sections above prescribe: the phase list is not
+the whole plan, and three prescriptions outside it — the secret scan, the positive statement of
+the secrets rule, and a human promotion path — were marked done only after they were written.
+A ✔ against a phase means that phase; check the prose too.
+
+What remains is not more construction but use: every threshold in the audit is still a guess,
+`applied` is still zero everywhere, and no second client has yet enrolled against a real
+server. Those are answered by running it, not by writing more of it.
 
 On 12 being conditional: the plan said to build messaging only if attribution and federation
 left a real gap. They do leave one, and it is narrow. Federation answers "what does that server

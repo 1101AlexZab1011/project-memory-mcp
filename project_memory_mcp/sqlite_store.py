@@ -1337,14 +1337,23 @@ class SqliteMemoryStore:
         private because of who it is for, not because it has not proven itself,
         so no amount of usage should ever route it outward.
         """
-        from . import federation
+        from . import federation, secret_scan
 
         memory_uuid = self._uuid_for(memory_id)
         if self._visibility_of(memory_uuid) != "public":
             return {"id": memory_id, "visibility": "private", "targets": [],
                     "why": "private memories are never promoted; change visibility first"}
-        return {"id": memory_id, "visibility": "public",
-                "targets": federation.choose_remote(self.remotes(), self.get_memory(memory_id), used)}
+        body = self.get_memory(memory_id)
+        result: dict[str, Any] = {
+            "id": memory_id, "visibility": "public",
+            "targets": federation.choose_remote(self.remotes(), body, used)}
+        # Reported here as well as enforced at promotion, so the hold is
+        # something an agent can see coming and fix rather than run into.
+        findings = secret_scan.scan(body)
+        if findings:
+            result["blocked"] = "looks like it contains a secret"
+            result["secret_findings"] = [f.describe() for f in findings]
+        return result
 
     #: A memory must have survived at least this tier before it can be published.
     #: Otherwise "earn your way into the shared store" is decorative: anything
@@ -1353,14 +1362,19 @@ class SqliteMemoryStore:
     MIN_PROMOTION_TIER = 2
 
     def promote(self, memory_id: str, remote: str, private_key: Any = None,
-                force: bool = False) -> dict[str, Any]:
+                force: bool = False, allow_secrets: bool = False) -> dict[str, Any]:
         """Publish one memory to one named remote.
 
         Never to all of them: that is how one lesson ends up duplicated across
         servers with independently diverging edits. If the remote is unreachable
         the work waits in the outbox rather than failing the agent's call.
+
+        ``force`` overrides the tier requirement; ``allow_secrets`` overrides the
+        credential scan. They are separate arguments because they are separate
+        judgments - "this matters more than its usage shows" and "that string is
+        not a secret" are not the same claim, and one should never imply the other.
         """
-        from . import federation
+        from . import federation, secret_scan
 
         memory_uuid = self._uuid_for(memory_id)
         if self._visibility_of(memory_uuid) != "public":
@@ -1387,6 +1401,12 @@ class SqliteMemoryStore:
             raise StoreError(f"Unknown remote '{remote}'. Known: {known}")
 
         body = self.get_memory(memory_id)
+        # Last gate before the memory leaves this machine. A secret in a local
+        # memory sits on the host that already has it; this is the crossing.
+        if not allow_secrets:
+            findings = secret_scan.scan(body)
+            if findings:
+                raise StoreError(secret_scan.explain(memory_id, findings))
         client = federation.RemoteClient(matches[0], self.project, private_key)
         try:
             client.call("create_memory", {"memory": body, "visibility": "public",
@@ -1404,19 +1424,30 @@ class SqliteMemoryStore:
 
     def drain_outbox(self, private_key: Any = None, limit: int = 50) -> dict[str, Any]:
         """Retry queued promotions. Safe to call as often as you like."""
-        from . import federation
+        from . import federation, secret_scan
 
         rows = self.connection.execute(
             "SELECT * FROM outbox WHERE project_id=? ORDER BY id LIMIT ?",
             (self.project, limit)).fetchall()
-        sent, still_waiting = [], []
+        sent, still_waiting, held = [], [], []
         by_name = {r.name: r for r in self.remotes(enabled_only=True)}
         for row in rows:
             remote = by_name.get(row["remote"])
             if remote is None:
                 continue
+            # Scanned again on the way out, not only on the way in: the body is
+            # re-read here, so an edit made while the item sat in the queue would
+            # otherwise ship unexamined.
+            body = self._body_by_uuid(row["memory_id"])
+            findings = secret_scan.scan(body)
+            if findings:
+                held.append(body["id"])
+                with self.connection:
+                    self.connection.execute(
+                        "UPDATE outbox SET last_error=? WHERE id=?",
+                        ("held: " + "; ".join(f.describe() for f in findings), row["id"]))
+                continue
             try:
-                body = self._body_by_uuid(row["memory_id"])
                 federation.RemoteClient(remote, self.project, private_key).call(
                     "create_memory", {"memory": body, "visibility": "public",
                                       "uuid": row["memory_id"]})
@@ -1430,7 +1461,12 @@ class SqliteMemoryStore:
             sent.append(body["id"])
             with self.connection:
                 self.connection.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
-        return {"sent": sent, "still_queued": len(rows) - len(sent)}
+        result = {"sent": sent, "still_queued": len(rows) - len(sent)}
+        if held:
+            # Named separately from a delivery failure: retrying will not help,
+            # somebody has to edit the memory.
+            result["held_for_secrets"] = held
+        return result
 
     def duplicate_candidates(self, limit: int = 25, threshold: float = 0.6) -> dict[str, Any]:
         """Pairs that look like the same lesson written twice.

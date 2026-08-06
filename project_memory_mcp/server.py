@@ -150,7 +150,13 @@ TOOLS = [
          "force": {"type": ["boolean", "null"], "default": False,
                    "description": "Publish a memory that has not yet earned a tier. Use only for "
                                   "a lesson whose value will never show up in usage - hard-won, "
-                                  "rarely needed, expensive to rediscover."}},
+                                  "rarely needed, expensive to rediscover."},
+         "allow_secrets": {"type": ["boolean", "null"], "default": False,
+                           "description": "Publish despite the credential scan. Use only when "
+                                          "the match is provably not a secret - a public key, a "
+                                          "commit hash, a documented sample value. If it is a "
+                                          "real credential, edit the memory instead: record "
+                                          "where the secret lives, never its value."}},
         ["id", "remote"],
     ),
     _tool(
@@ -348,7 +354,8 @@ class McpServer:
                 payload = self.store.promotion_targets(args["id"], args.get("consulted"))
             elif name == "promote_memory":
                 payload = self.store.promote(args["id"], args["remote"],
-                                             force=bool(args.get("force")))
+                                             force=bool(args.get("force")),
+                                             allow_secrets=bool(args.get("allow_secrets")))
             elif name == "set_memory_visibility":
                 payload = self.store.set_visibility(args["id"], args["visibility"])
             elif name == "send_message":

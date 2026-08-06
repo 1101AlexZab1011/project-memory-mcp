@@ -77,10 +77,36 @@ Do not remember:
 - full transcripts;
 - large command outputs;
 - temporary observations;
-- facts already documented clearly elsewhere;
-- secrets, credentials, tokens, or personal data.
+- facts already documented clearly elsewhere.
 
 Rule of thumb: store a memory only if it would save at least 10-20 minutes later or prevent a likely wrong debugging path.
+
+## Secrets: record the location, never the value
+
+This is a harm rule, not a triviality rule, so it is stated on its own rather than sitting in
+the list above beside typos.
+
+A secret is a **value that grants access** — the string where holding it *is* the permission.
+It is not a topic. Where a credential lives, what it is called, who rotates it and how it is
+loaded are ordinary project facts, often exactly the kind worth remembering. Write those.
+
+**Do write:**
+
+> The staging Stripe key is `STRIPE_KEY` in `.env.staging`, rotated quarterly by the platform
+> team; CI reads it from the `stripe-staging` vault path rather than the file, which is why a
+> local `.env` change does not affect the pipeline.
+
+**Never write:** that same memory with `STRIPE_KEY=sk_live_…` in it. The location survives
+rotation and helps forever; the value helps until someone rotates it and harms until then.
+
+The same split applies to personal data. That a teammate owns a subsystem is a project fact;
+their home address is not, and nothing about a task makes it one.
+
+Remember that a memory can be promoted to a shared server later. Something written on a machine
+that already holds the secret is one promotion away from people who do not. Promotion runs an
+automatic scan for credential shapes and refuses to publish a memory that trips it, so a secret
+recorded here does not silently escape — but the scan catches shapes, not meaning, and it is a
+backstop rather than a substitute for this rule.
 
 ## Workflow
 

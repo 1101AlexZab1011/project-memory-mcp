@@ -312,11 +312,22 @@ class _Handler(BaseHTTPRequestHandler):
                     memory = store.get_memory(memory_id)
                     usage = store.load_usage()["memories"].get(memory_id, {})
                     row = store.connection.execute(
-                        "SELECT archived_at, tier FROM memories WHERE project_id=? AND slug=?",
+                        "SELECT archived_at, tier, visibility, origin_remote FROM memories "
+                        "WHERE project_id=? AND slug=?",
                         (store.project, memory_id)).fetchone()
                 self._send(200, {"memory": memory, "usage": usage,
                                  "archived_at": row["archived_at"] if row else None,
-                                 "tier": row["tier"] if row else 1})
+                                 "tier": row["tier"] if row else 1,
+                                 "visibility": row["visibility"] if row else "private",
+                                 # A cached copy belongs to the server it came
+                                 # from; publishing it onward is not ours to do.
+                                 "borrowed": bool(row and row["origin_remote"])})
+                return
+
+            if path == "/api/remotes":
+                with lock:
+                    self._send(200, {"remotes": [r.describe()
+                                                 for r in store.remotes(enabled_only=True)]})
                 return
 
             if path == "/api/audit":
@@ -396,6 +407,29 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/delete":
                 with lock:
                     self._send(200, store.delete_memory(memory_id, memory_id))
+                return
+
+            if path == "/api/visibility":
+                # Without this the promote button is disabled on almost
+                # everything: memories are created private, and nothing else in
+                # the UI could ever change that.
+                with lock:
+                    self._send(200, store.set_visibility(
+                        memory_id, str(payload.get("visibility") or "")))
+                return
+
+            if path == "/api/promote":
+                # The non-statistical path to publication. A lesson that is
+                # hard-won, rarely needed and expensive to rediscover will never
+                # accrue the usage that earns a tier, and a person is the only
+                # thing that can tell that apart from a memory nobody wanted.
+                # force is theirs to give; allow_secrets deliberately is not -
+                # waving a credential through is a decision for whoever can read
+                # the memory next to the code, not for a button in a browser.
+                with lock:
+                    self._send(200, store.promote(
+                        memory_id, str(payload.get("remote") or ""),
+                        force=bool(payload.get("force"))))
                 return
         except StoreError as exc:
             self._send(400, {"error": str(exc)})
