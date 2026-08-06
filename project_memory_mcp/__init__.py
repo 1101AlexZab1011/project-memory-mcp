@@ -3,6 +3,6 @@
 from .sqlite_store import SqliteMemoryStore
 from .validation import StoreError
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = ["SqliteMemoryStore", "StoreError", "__version__"]
