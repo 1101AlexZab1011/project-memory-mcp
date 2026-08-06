@@ -392,3 +392,92 @@ class LockDisciplineTests(ComputerCase):
             longest_wait, elapsed / 2,
             f"a request waited {longest_wait:.2f}s of a {elapsed:.2f}s outbox drain - the "
             "lock is held across the network call")
+
+
+class IntermittentUptimeTests(ComputerCase):
+    """Maintenance has to survive a machine that is not always on.
+
+    The timer used to start at a full interval on every process start, which
+    meant a server up for less than an interval at a time never swept at all -
+    not late, never. Uptime is not the clock; the job log is.
+    """
+
+    def scheduler(self, computer, interval=3600):
+        from project_memory_mcp.computer import Scheduler
+
+        return Scheduler(computer, lambda: ["demo"], interval_seconds=interval)
+
+    def test_a_short_lived_process_still_sweeps(self):
+        from project_memory_mcp.computer import STARTUP_GRACE_SECONDS
+
+        computer = Computer(open_store=self.open_store, database=self.db)
+        # Nothing has ever run, so a sweep is overdue rather than an hour away.
+        self.assertLessEqual(self.scheduler(computer).first_delay(), STARTUP_GRACE_SECONDS)
+
+    def test_a_recent_sweep_is_not_repeated_immediately(self):
+        computer = Computer(open_store=self.open_store, database=self.db)
+        computer.run_one(make_job("rebase", "demo"))
+        delay = self.scheduler(computer, interval=3600).first_delay()
+        self.assertGreater(delay, 3000, "a sweep that just ran is being repeated at startup")
+
+    def test_a_sweep_overdue_since_the_last_run_happens_promptly(self):
+        from project_memory_mcp.computer import STARTUP_GRACE_SECONDS
+
+        computer = Computer(open_store=self.open_store, database=self.db)
+        computer.run_one(make_job("rebase", "demo"))
+        # Backdate the log: two hours of downtime against a one-hour interval.
+        old = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        connection = sqlite3.connect(self.db)
+        try:
+            with connection:
+                connection.execute("UPDATE jobs SET started=?", (old,))
+        finally:
+            connection.close()
+        self.assertLessEqual(self.scheduler(computer, interval=3600).first_delay(),
+                             STARTUP_GRACE_SECONDS)
+
+    def test_a_restart_loop_cannot_become_a_sweep_loop(self):
+        # Overdue must still mean "soon", never "now": a server crash-looping
+        # would otherwise spend all its uptime sweeping.
+        from project_memory_mcp.computer import STARTUP_GRACE_SECONDS
+
+        computer = Computer(open_store=self.open_store, database=self.db)
+        self.assertGreaterEqual(self.scheduler(computer, interval=3600).first_delay(),
+                                min(3600, STARTUP_GRACE_SECONDS))
+
+    def test_a_clock_that_moved_backwards_makes_a_sweep_look_due(self):
+        computer = Computer(open_store=self.open_store, database=self.db)
+        computer.run_one(make_job("rebase", "demo"))
+        future = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        connection = sqlite3.connect(self.db)
+        try:
+            with connection:
+                connection.execute("UPDATE jobs SET started=?", (future,))
+        finally:
+            connection.close()
+        # Clamped to zero elapsed rather than negative, so the wait stays sane.
+        self.assertLessEqual(computer.seconds_since_last_run(), 0.0)
+        self.assertLessEqual(self.scheduler(computer, interval=3600).first_delay(), 3600)
+
+    def test_the_running_scheduler_sweeps_promptly_when_overdue(self):
+        # first_delay() being right is not enough - _run has to use it. An
+        # earlier version of these tests checked the calculation alone and
+        # passed against the very bug they were written for.
+        from project_memory_mcp import computer as computer_module
+
+        computer = Computer(open_store=self.open_store, database=self.db)
+        scheduler = self.scheduler(computer, interval=3600)
+        original = computer_module.STARTUP_GRACE_SECONDS
+        computer_module.STARTUP_GRACE_SECONDS = 0.2
+        try:
+            scheduler.start()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and computer.pending() == 0:
+                time.sleep(0.05)
+        finally:
+            scheduler.stop()
+            computer_module.STARTUP_GRACE_SECONDS = original
+        self.assertGreater(
+            computer.pending(), 0,
+            "the scheduler waited a full interval before its first sweep, so a process that "
+            "lives for less than an interval never sweeps at all")

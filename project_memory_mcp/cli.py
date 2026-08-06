@@ -49,9 +49,14 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_audit(args: argparse.Namespace) -> int:
     """Report which memories have earned their place. Changes nothing."""
-    from .audit import AuditPolicy, format_report, run_audit, with_overrides
+    from .audit import AuditPolicy, format_report, gates_from, run_audit, with_overrides
     from .sqlite_store import SqliteMemoryStore, StoreError
 
+    try:
+        gates = gates_from(args.gate)
+    except StoreError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
     try:
         store = SqliteMemoryStore(args.database, args.project, create=False)
     except StoreError as error:
@@ -59,7 +64,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
         return 1
 
     policy = with_overrides(
-        AuditPolicy(),
+        AuditPolicy(gates=gates),
         min_surfaced_direct=args.min_direct,
         min_applied=args.min_applied,
         min_spread_days=args.min_spread_days,
@@ -602,6 +607,12 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Incoming authored links needed to survive a gate (default 2).")
     audit_parser.add_argument("--max-actions", type=int, default=None,
                               help="Ceiling on memories one run may act on (default 50).")
+    audit_parser.add_argument(
+        "--gate", action="append", default=None, metavar="TIER:QUERIES:DAYS",
+        help="Replace one tier's gate, e.g. --gate 3:600:365. Repeatable; tiers not named keep "
+             "their defaults (1:50:30, 2:500:180, 3:600:365). Both numbers matter and the "
+             "slower one binds: queries ask whether there were enough chances for silence to "
+             "mean anything, days ask whether the work it describes has had time to recur.")
     audit_parser.set_defaults(func=cmd_audit)
 
     serve_parser = subparsers.add_parser("serve", help="Run the MCP server over stdio or HTTP.")

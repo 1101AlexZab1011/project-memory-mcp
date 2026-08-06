@@ -44,6 +44,11 @@ SLICE_SECONDS = 0.25
 #: Pause between slices, so a long job cannot monopolise the interpreter.
 YIELD_SECONDS = 0.01
 
+#: Shortest wait before a sweep that is already overdue at startup. Long enough
+#: that the server has finished coming up, short enough that a machine which is
+#: only on for a few minutes at a time still gets its maintenance.
+STARTUP_GRACE_SECONDS = 15
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,6 +189,37 @@ class Computer:
                     pass
         self._record(job, started, outcome, detail)
         return {"kind": job.kind, "project": job.project, "outcome": outcome, "detail": detail}
+
+    def seconds_since_last_run(self) -> float | None:
+        """How long since any job ran, read from the log rather than from uptime.
+
+        This is what lets the schedule survive a machine that is not always on.
+        Process uptime says nothing about when maintenance last happened; the
+        job log does, and it is already being written.
+
+        None means "no record" - a fresh store, or a worker with no database to
+        log to - which the scheduler treats as overdue rather than as recent.
+        """
+        if self.database is None:
+            return None
+        try:
+            connection = sqlite3.connect(self.database)
+            try:
+                connection.executescript(SCHEMA)
+                row = connection.execute("SELECT MAX(started) AS last FROM jobs").fetchone()
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            return None
+        if not row or not row[0]:
+            return None
+        try:
+            then = datetime.strptime(row[0], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        # Clamped: a clock that moved backwards should make the next sweep look
+        # overdue rather than schedule one in the past.
+        return max(0.0, (datetime.now(timezone.utc) - then).total_seconds())
 
     def _record(self, job: Job, started: str, outcome: str, detail: Any) -> None:
         if self.database is None:
@@ -385,12 +421,32 @@ class Scheduler:
                 submitted += int(self.computer.submit(make_job(kind, project)))
         return submitted
 
+    def first_delay(self) -> float:
+        """How long to wait before the first sweep of this run.
+
+        The timer used to start at a full interval every time the process
+        started, which quietly meant that a machine up for less than an interval
+        at a time never swept at all. Not late - never: no audit, no outbox
+        delivery, nothing, on any laptop that sleeps or any server restarted
+        often. Uptime is not the clock; the job log is.
+        """
+        since = self.computer.seconds_since_last_run()
+        if since is None:
+            # Nothing on record. Treat as overdue - on a fresh store the sweep
+            # finds nothing and costs nothing.
+            return float(min(self.interval, STARTUP_GRACE_SECONDS))
+        # Never sooner than the grace period, so a restart loop cannot turn into
+        # a sweep loop, and never later than one interval.
+        return float(max(STARTUP_GRACE_SECONDS, min(self.interval, self.interval - since)))
+
     def _run(self) -> None:
+        # Short at startup only if a sweep is actually due, so a burst of work
+        # never competes with the server coming up for no reason.
+        delay = self.first_delay()
         while not self._stop.is_set():
-            # Wait first: a burst of work at startup would compete with the
-            # server coming up, and nothing is urgent at second zero.
-            if self._stop.wait(self.interval):
+            if self._stop.wait(delay):
                 return
+            delay = float(self.interval)
             try:
                 self.sweep_now()
             except Exception:  # noqa: BLE001 - a scheduler that dies stops all maintenance

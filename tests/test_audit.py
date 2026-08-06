@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from project_memory_mcp.audit import (
+    DEFAULT_GATES,
+    gates_from,
     VERDICT_ARCHIVE,
     VERDICT_DELETE,
     VERDICT_HOLD,
@@ -26,6 +28,7 @@ from project_memory_mcp.audit import (
 )
 from project_memory_mcp import maintenance
 from project_memory_mcp.sqlite_store import SqliteMemoryStore
+from project_memory_mcp.validation import StoreError
 
 CACHE = "Session cache invalidation races the auth refresh under load."
 SHADER = "Shader compilation stalls on a cold start on the build farm."
@@ -501,3 +504,43 @@ class DuplicateTests(AuditCase):
         self.store.create_memory(self.second)
         self.store.merge_memories("cache-race-a", "cache-race-b", "One fact.")
         self.assertEqual(0, maintenance.duplicate_candidates(self.store)["count"])
+
+
+class GateConfigurationTests(unittest.TestCase):
+    """Gates are settable from the CLI, because a threshold fitted to one store
+    is a constant fitted to one project - which the plan explicitly forbids."""
+
+    def test_a_gate_replaces_only_the_tier_it_names(self):
+        gates = gates_from(["3:600:365"])
+        by_tier = {g.tier: g for g in gates}
+        self.assertEqual(3, len(gates))
+        self.assertEqual((600, 365), (by_tier[3].min_queries, by_tier[3].min_days))
+        # Untouched tiers keep their defaults rather than disappearing.
+        self.assertEqual((50, 30), (by_tier[1].min_queries, by_tier[1].min_days))
+        self.assertEqual((500, 180), (by_tier[2].min_queries, by_tier[2].min_days))
+
+    def test_several_gates_can_be_given_and_stay_ordered(self):
+        gates = gates_from(["2:100:10", "1:5:1"])
+        self.assertEqual([1, 2, 3], [g.tier for g in gates])
+        self.assertEqual(5, gates[0].min_queries)
+        self.assertEqual(100, gates[1].min_queries)
+
+    def test_a_new_tier_can_be_added(self):
+        self.assertEqual([1, 2, 3, 4], [g.tier for g in gates_from(["4:1000:730"])])
+
+    def test_no_gates_given_means_the_defaults(self):
+        self.assertEqual(DEFAULT_GATES, gates_from(None))
+        self.assertEqual(DEFAULT_GATES, gates_from([]))
+
+    def test_malformed_gates_are_refused_with_the_shape_named(self):
+        for bad in ("3:600", "3:600:365:1", "x:600:365", "3:six:365", "0:1:1", "3:-1:365"):
+            with self.subTest(spec=bad):
+                with self.assertRaises(StoreError):
+                    gates_from([bad])
+
+    def test_a_configured_gate_actually_changes_the_verdict(self):
+        # The plumbing is only worth anything if the audit reads it.
+        policy_strict = AuditPolicy(gates=gates_from(["1:1000000:0"]))
+        policy_loose = AuditPolicy(gates=gates_from(["1:0:0"]))
+        self.assertEqual(1000000, policy_strict.gate_for(1).min_queries)
+        self.assertEqual(0, policy_loose.gate_for(1).min_queries)

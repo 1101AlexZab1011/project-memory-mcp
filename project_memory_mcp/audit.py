@@ -38,6 +38,7 @@ from typing import Any
 
 from .sqlite_store import SqliteMemoryStore, _now
 from .usage import SPREAD_MASK, merge_spread
+from .validation import StoreError
 
 VERDICT_PROMOTE = "promote"
 VERDICT_ARCHIVE = "archive"
@@ -450,3 +451,40 @@ def format_report(report: AuditReport, limit: int = 20) -> str:
 def with_overrides(policy: AuditPolicy, **overrides: Any) -> AuditPolicy:
     """Apply CLI overrides, ignoring the ones left unset."""
     return replace(policy, **{k: v for k, v in overrides.items() if v is not None})
+
+
+def parse_gate(text: str) -> TierGate:
+    """`tier:queries:days`, as one `--gate` argument.
+
+    One argument per tier rather than three flat numbers, because a gate is a
+    pair that only means anything together: 500 queries with no time bound and
+    180 days with no exposure bound are different policies, and both are wrong.
+    """
+    parts = text.split(":")
+    if len(parts) != 3:
+        raise StoreError(f"--gate wants tier:queries:days, got '{text}'")
+    try:
+        tier, queries, days = (int(p) for p in parts)
+    except ValueError:
+        raise StoreError(f"--gate wants three whole numbers, got '{text}'") from None
+    if tier < 1:
+        raise StoreError(f"--gate tier must be 1 or more, got {tier}")
+    if queries < 0 or days < 0:
+        raise StoreError(f"--gate queries and days cannot be negative: '{text}'")
+    return TierGate(tier=tier, min_queries=queries, min_days=days)
+
+
+def gates_from(specs: list[str] | None, base: tuple[TierGate, ...] = DEFAULT_GATES,
+               ) -> tuple[TierGate, ...]:
+    """Merge `--gate` arguments over the defaults, one tier at a time.
+
+    Merged rather than replaced, so tuning one tier does not silently delete the
+    others. Passing gates for tiers 1 and 3 leaves tier 2 exactly as it was.
+    """
+    if not specs:
+        return base
+    merged = {gate.tier: gate for gate in base}
+    for spec in specs:
+        gate = parse_gate(spec)
+        merged[gate.tier] = gate
+    return tuple(merged[tier] for tier in sorted(merged))
