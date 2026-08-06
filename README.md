@@ -142,6 +142,30 @@ where the token would travel in the clear.
 Unknown project ids return 404 with the list of known projects, rather than quietly serving an
 empty store.
 
+### Backups
+
+A database-backed store has no redundancy of its own. While memories lived in git every clone
+was a complete replica; a database is one file on one machine, so backup is part of running it
+rather than an operational extra. `serve` warns when no backup directory is configured.
+
+```bash
+# snapshot on a schedule, alongside serving
+project-memory-mcp serve --http --database ~/memory.db --bind 192.168.1.50     --backup-dir ~/memory-backups --backup-interval 3600 --backup-keep 7
+
+# or on demand
+project-memory-mcp backup --database ~/memory.db --out ~/memory-backups
+project-memory-mcp backup --database ~/memory.db --out ~/memory.json --format json
+project-memory-mcp restore --database ~/restored.db --from ~/memory.json
+```
+
+Two forms, for two jobs. A **snapshot** (`--format db`, the default) is a byte-exact copy taken
+through SQLite's online backup API, so it is safe against a live server and restores
+everything — usage counters and revision history included. An **export** (`--format json`) is
+portable text: it survives schema changes, reads in an editor, and can be committed if you want
+memories in git again. It carries memories, labels and usage, but not revision history.
+
+Keep both. Snapshots restore exactly; exports outlive the schema.
+
 **3. (Optional but recommended) Install the agent skills:**
 
 ```bash

@@ -123,9 +123,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if not token:
             print("error: a token is required. Pass --token or set PROJECT_MEMORY_TOKEN.", file=sys.stderr)
             return 1
+        from .backup import BackupScheduler
         from .http_server import run_http_server
 
-        return run_http_server(args.database, args.bind, args.port, token)
+        scheduler = None
+        if args.backup_dir:
+            scheduler = BackupScheduler(args.database, args.backup_dir, args.backup_interval, args.backup_keep)
+            scheduler.start()
+            print(f"project-memory-mcp: snapshotting to {args.backup_dir} every "
+                  f"{scheduler.interval}s, keeping {args.backup_keep}", file=sys.stderr)
+        else:
+            print("project-memory-mcp: WARNING no --backup-dir. Leaving git means every clone "
+                  "stopped being a replica, so an unbacked failure loses the whole store.",
+                  file=sys.stderr)
+        try:
+            return run_http_server(args.database, args.bind, args.port, token)
+        finally:
+            if scheduler is not None:
+                scheduler.stop()
 
     if args.database:
         if not args.project:
@@ -179,6 +194,31 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    from .backup import export_json, snapshot_database
+
+    if args.format == "json":
+        result = export_json(args.database, args.out, args.project)
+        print(f"Wrote {result['written']}")
+        for name, count in result["projects"].items():
+            print(f"  {name}: {count} memories")
+        return 0
+    target = snapshot_database(args.database, args.out, args.keep)
+    print(f"Wrote {target} ({target.stat().st_size / 1024:.0f} KB); keeping the newest {args.keep}")
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    from .backup import import_json
+
+    result = import_json(args.database, args.source)
+    print(f"Restored into {result['database']}")
+    for name, count in result["projects"].items():
+        print(f"  {name}: {count} memories")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="project-memory-mcp",
@@ -207,6 +247,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--bind", default=None,
                               help="Interface address to listen on. Required with --http; no default.")
     serve_parser.add_argument("--port", type=int, default=8765, help="Port to listen on (default: 8765).")
+    serve_parser.add_argument("--backup-dir", default=None,
+                              help="Snapshot the database into this directory while serving.")
+    serve_parser.add_argument("--backup-interval", type=int, default=3600,
+                              help="Seconds between snapshots (default: 3600, minimum 60).")
+    serve_parser.add_argument("--backup-keep", type=int, default=7,
+                              help="How many snapshots to retain (default: 7).")
     serve_parser.add_argument("--token", default=None,
                               help="Shared bearer token. Falls back to PROJECT_MEMORY_TOKEN.")
     serve_parser.set_defaults(func=cmd_serve)
@@ -227,6 +273,21 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_parser.add_argument("--project", required=True, help="Project id to import into (lowercase kebab-case).")
     migrate_parser.add_argument("--database", required=True, help="Path to the SQLite database file.")
     migrate_parser.set_defaults(func=cmd_migrate)
+
+    backup_parser = subparsers.add_parser("backup", help="Snapshot or export a database-backed store.")
+    backup_parser.add_argument("--database", required=True, help="Path to the SQLite database file.")
+    backup_parser.add_argument("--out", required=True,
+                               help="Destination directory (db snapshots) or file path (json export).")
+    backup_parser.add_argument("--format", choices=("db", "json"), default="db",
+                               help="'db' is a byte-exact snapshot; 'json' is a portable export.")
+    backup_parser.add_argument("--project", default=None, help="Export one project only (json format).")
+    backup_parser.add_argument("--keep", type=int, default=7, help="How many db snapshots to retain.")
+    backup_parser.set_defaults(func=cmd_backup)
+
+    restore_parser = subparsers.add_parser("restore", help="Restore a JSON export into a database.")
+    restore_parser.add_argument("--database", required=True, help="Path to the SQLite database file.")
+    restore_parser.add_argument("--from", dest="source", required=True, help="Path to a JSON export.")
+    restore_parser.set_defaults(func=cmd_restore)
 
     return parser
 
