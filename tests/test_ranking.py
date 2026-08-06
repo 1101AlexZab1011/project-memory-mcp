@@ -242,6 +242,20 @@ class RecallTests(unittest.TestCase):
         with self.assertRaises(StoreError):
             self.store.recall(full_count=-1)
 
+    def test_cache_is_invalidated_when_a_memory_is_added_or_removed(self):
+        # The cache key is built from a scandir listing, so appearing and
+        # disappearing files must invalidate it as reliably as edits do.
+        self.assertNotIn("late-arrival", self.store.load_memories())
+        added = self.store.active_root / "late-arrival.json"
+        added.write_text(
+            json.dumps(memory("late-arrival", "A memory written outside this process.", ["area:x"])),
+            encoding="utf-8",
+        )
+        self.assertIn("late-arrival", self.store.load_memories())
+
+        added.unlink()
+        self.assertNotIn("late-arrival", self.store.load_memories())
+
     def test_cache_is_invalidated_when_a_memory_changes(self):
         first = self.store.load_memories()
         self.assertIs(self.store.load_memories(), first)
