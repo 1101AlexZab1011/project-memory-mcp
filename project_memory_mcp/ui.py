@@ -86,6 +86,7 @@ PAGE = """<!doctype html>
       <option value="all">every status</option>
       <option value="active">active</option><option value="stale">stale</option>
       <option value="superseded">superseded</option><option value="wrong">wrong</option>
+      <option value="archived">archived</option>
     </select>
     <select id="label"><option value="">any label</option></select>
     <button class="ghost" id="logout" title="sign out">sign out</button>
@@ -99,13 +100,14 @@ PAGE = """<!doctype html>
       <option value="superseded">superseded</option><option value="wrong">wrong</option>
     </select>
     <button id="save">Set status</button>
+    <button class="ghost" id="archive">Archive</button>
     <button class="danger" id="del">Delete</button>
     <button class="ghost" id="close">Close</button>
   </div>
 </dialog>
 <script>
 const $ = s => document.querySelector(s);
-let current = null, offset = 0, busy = false, done = false;
+let current = null, currentArchived = false, offset = 0, busy = false, done = false;
 
 async function api(path, options) {
   const r = await fetch(path, Object.assign({credentials: 'same-origin'}, options || {}));
@@ -130,6 +132,7 @@ function card(m) {
   const used = m.usage || {};
   el.innerHTML = `<h2>${esc(m.id)}</h2><p>${esc(m.description)}</p><div class="chips">
     <span class="chip s-${esc(m.status)}">${esc(m.status)}</span>
+    ${m.archived_at ? '<span class="chip s-superseded">archived</span>' : ''}
     ${(m.labels||[]).slice(0,4).map(l=>`<span class="chip">${esc(l)}</span>`).join('')}
     <span class="chip">shown ${used.surfaced||0} / used ${used.applied||0}</span></div>`;
   el.onclick = () => open(m.id);
@@ -163,7 +166,9 @@ async function open(id) {
   const u = m.usage || {}, r = m.memory.relationships || {}, s = m.memory.scope || {};
   $('#detailBody').innerHTML = `<h1>${esc(m.memory.id)}</h1>
     <p class="muted">${esc(m.memory.status)} · created ${esc((m.memory.evidence||{}).created || '—')}
-     · shown ${u.surfaced||0}, used ${u.applied||0}</p>
+     · tier ${m.tier || 1}${m.archived_at ? ', archived ' + esc(m.archived_at) : ''}
+     · shown ${u.surfaced||0} (${u.surfaced_direct||0} direct), used ${u.applied||0}
+     · ${u.spread_days||0} distinct days</p>
     <p>${esc(m.memory.description)}</p>
     ${section('labels', m.memory.labels)}${section('tags', m.memory.tags)}
     ${section('triggers', m.memory.triggers)}${section('facts', m.memory.remembered_facts)}
@@ -171,6 +176,8 @@ async function open(id) {
     ${section('files', s.files)}${section('related', r.related)}
     ${section('supersedes', r.supersedes)}${section('superseded by', r.superseded_by)}`;
   $('#newStatus').value = m.memory.status;
+  currentArchived = !!m.archived_at;
+  $('#archive').textContent = currentArchived ? 'Restore' : 'Archive';
   $('#detail').showModal();
 }
 
@@ -194,6 +201,11 @@ $('#close').onclick = () => $('#detail').close();
 $('#save').onclick = async () => {
   await api('/api/status', {method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({project: $('#project').value, id: current, status: $('#newStatus').value})});
+  $('#detail').close(); load(true);
+};
+$('#archive').onclick = async () => {
+  await api('/api/archive', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({project: $('#project').value, id: current, archived: !currentArchived})});
   $('#detail').close(); load(true);
 };
 $('#del').onclick = async () => {

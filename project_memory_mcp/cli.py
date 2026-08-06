@@ -64,18 +64,32 @@ def cmd_audit(args: argparse.Namespace) -> int:
         min_spread_days=args.min_spread_days,
         min_degree=args.min_degree,
         max_actions_per_run=args.max_actions,
+        delete_superseded=args.delete_superseded or None,
     )
+    if args.apply:
+        # Applying is the only step here that moves anything, and the report is
+        # cheap, so the operator reads what will happen before it happens.
+        preview = run_audit(store, policy=policy, apply=False, record=False)
+        print(format_report(preview, limit=args.limit))
+        if not preview.due:
+            print("\nNothing to apply.")
+            store.close()
+            return 0
+        if not args.yes:
+            print(f"\nRe-run with --yes to apply this to '{args.project}'.", file=sys.stderr)
+            store.close()
+            return 1
+        print()
+
     try:
         report = run_audit(store, policy=policy, apply=args.apply, record=not args.no_record)
-    except NotImplementedError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
     finally:
         store.close()
 
     print(format_report(report, limit=args.limit))
     if report.run_id is not None:
-        print(f"\nrecorded as run {report.run_id}; nothing was changed")
+        tail = "changes applied" if report.applied else "nothing was changed"
+        print(f"\nrecorded as run {report.run_id}; {tail}")
     return 0
 
 
@@ -244,7 +258,13 @@ def build_parser() -> argparse.ArgumentParser:
     audit_parser.add_argument("--no-record", action="store_true",
                               help="Print the report without storing the run.")
     audit_parser.add_argument("--apply", action="store_true",
-                              help="Not implemented: acting on verdicts is a later phase.")
+                              help="Carry out the verdicts. Prints the report first and "
+                                   "requires --yes.")
+    audit_parser.add_argument("--yes", action="store_true",
+                              help="Confirm --apply after reading the report.")
+    audit_parser.add_argument("--delete-superseded", action="store_true",
+                              help="Also delete memories whose successor is still active. "
+                                   "Bodies are kept in the revisions table.")
     # Thresholds are deliberately overridable. A store of 200 memories in a solo
     # repo and one of three million share no distribution, so no default here
     # should be trusted without looking at what it would do first.

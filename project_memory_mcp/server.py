@@ -124,6 +124,39 @@ TOOLS = [
     ),
     _tool("get_memory", "Return the full JSON for a memory id.", {"id": {"type": "string"}}, ["id"]),
     _tool(
+        "find_duplicate_memories",
+        "Return pairs of memories that look like the same lesson written twice, with both bodies "
+        "in full. A similarity score is good at finding pairs worth reading and bad at telling "
+        "whether two statements mean the same thing - that judgment is yours. Read both, then use "
+        "merge_memories only for pairs that genuinely say one thing; distinct lessons about the "
+        "same subsystem are not duplicates.",
+        {
+            "limit": {"type": "integer", "minimum": 1, "default": 25},
+            "threshold": {
+                "type": "number",
+                "default": 0.6,
+                "description": "Token-overlap floor, 0 to 1. Lower surfaces more, and more noise.",
+            },
+        },
+    ),
+    _tool(
+        "merge_memories",
+        "Fold one memory into another after deciding they are the same lesson. The kept memory "
+        "gains anything the other had - triggers, facts, pitfalls, files, links - and their usage "
+        "counters add, since both were evidence about one fact. The merged memory is archived with "
+        "a pointer rather than deleted, so a wrong call can be undone.",
+        {
+            "keep_id": {"type": "string", "description": "The memory that survives."},
+            "merge_id": {"type": "string", "description": "The memory folded into it."},
+            "reason": {
+                "type": "string",
+                "description": "Why these are one lesson rather than two. Required: a merge is a "
+                               "judgment, and the next reader needs to see what it rested on.",
+            },
+        },
+        ["keep_id", "merge_id", "reason"],
+    ),
+    _tool(
         "get_memory_neighborhood",
         "Return a bounded relationship tree/graph around a memory.",
         {
@@ -231,6 +264,12 @@ class McpServer:
                 )
             elif name == "record_memory_use":
                 payload = self.store.record_use(args["memory_ids"])
+            elif name == "find_duplicate_memories":
+                payload = self.store.duplicate_candidates(
+                    limit=args.get("limit", 25), threshold=args.get("threshold", 0.6))
+            elif name == "merge_memories":
+                payload = self.store.merge_memories(
+                    args["keep_id"], args["merge_id"], args["reason"])
             elif name == "get_memory":
                 payload = self.store.get_memory(args["id"])
             elif name == "get_memory_neighborhood":

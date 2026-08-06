@@ -147,6 +147,44 @@ class UiTests(unittest.TestCase):
         _, body = self.get("/api/memory?project=demo&id=cache-race")
         self.assertEqual("wrong", json.loads(body)["memory"]["status"])
 
+    def test_archiving_takes_a_memory_out_of_the_listing(self):
+        self.login()
+        status, _ = self.post("/api/archive", {"project": "demo", "id": "cache-race"})
+        self.assertEqual(200, status)
+        _, body = self.get("/api/memories?project=demo&limit=10")
+        self.assertEqual(["shader-stall"], [m["id"] for m in json.loads(body)["memories"]])
+
+    def test_archived_memories_have_their_own_listing(self):
+        # The only way back once something leaves the ranked pool.
+        self.login()
+        self.post("/api/archive", {"project": "demo", "id": "cache-race"})
+        _, body = self.get("/api/memories?project=demo&status=archived&limit=10")
+        rows = json.loads(body)["memories"]
+        self.assertEqual(["cache-race"], [m["id"] for m in rows])
+        self.assertTrue(rows[0]["archived_at"])
+
+    def test_restoring_puts_it_back(self):
+        self.login()
+        self.post("/api/archive", {"project": "demo", "id": "cache-race"})
+        status, _ = self.post("/api/archive", {"project": "demo", "id": "cache-race", "archived": False})
+        self.assertEqual(200, status)
+        _, body = self.get("/api/memories?project=demo&limit=10")
+        self.assertIn("cache-race", [m["id"] for m in json.loads(body)["memories"]])
+
+    def test_detail_reports_archive_state_and_tier(self):
+        self.login()
+        self.post("/api/archive", {"project": "demo", "id": "cache-race"})
+        _, body = self.get("/api/memory?project=demo&id=cache-race")
+        payload = json.loads(body)
+        self.assertTrue(payload["archived_at"])
+        self.assertEqual(1, payload["tier"])
+
+    def test_the_audit_endpoint_reports_the_last_run(self):
+        self.login()
+        status, body = self.get("/api/audit?project=demo")
+        self.assertEqual(200, status)
+        self.assertIsNone(json.loads(body)["run"])
+
     def test_delete_removes_the_memory(self):
         self.login()
         status, body = self.post("/api/delete", {"project": "demo", "id": "cache-race"})

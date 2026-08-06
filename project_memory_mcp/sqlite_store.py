@@ -21,7 +21,7 @@ from typing import Any, Iterable
 from . import validation
 from .validation import ID_RE, LABEL_RE, LabelExpression
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # 64-day window for the spread bitmap: long enough to judge the early tiers,
 # and it fits one SQLite integer.
@@ -62,9 +62,20 @@ CREATE TABLE IF NOT EXISTS memories (
     tier              INTEGER NOT NULL DEFAULT 1,
     tier_since        TEXT,
     tier_since_query  INTEGER NOT NULL DEFAULT 0,
+    -- Archive is orthogonal to status. Status answers "is this true"; archive
+    -- answers "is this in the working set". A memory can be perfectly correct
+    -- and archived for being quiet, or wrong and still live as a warning.
+    -- Archived memories leave the ranked pool entirely - they never compete for
+    -- a top-K slot - but stay readable by id, visible in the UI, and reversible.
+    archived_at       TEXT,
+    -- Set when this memory was folded into another. The row stays: a merge is
+    -- a judgment call, and keeping the loser archived with a pointer makes a
+    -- wrong one visible and reversible instead of silently destructive.
+    merged_into       TEXT,
     PRIMARY KEY (project_id, uuid)
 );
 CREATE INDEX IF NOT EXISTS memories_tier ON memories(project_id, tier);
+CREATE INDEX IF NOT EXISTS memories_archived ON memories(project_id, archived_at);
 -- Unique for now: one writer, so a duplicate slug is a mistake rather than a
 -- merge. Relaxing this is a sync concern, and dropping an index is cheap.
 CREATE UNIQUE INDEX IF NOT EXISTS memories_slug ON memories(project_id, slug);
@@ -146,6 +157,7 @@ CREATE TABLE IF NOT EXISTS audit_runs (
     due        INTEGER NOT NULL DEFAULT 0,
     promoted   INTEGER NOT NULL DEFAULT 0,
     archived   INTEGER NOT NULL DEFAULT 0,
+    deleted    INTEGER NOT NULL DEFAULT 0,
     capped     INTEGER NOT NULL DEFAULT 0,
     policy     TEXT
 );
@@ -276,6 +288,22 @@ def _upgrade(connection: sqlite3.Connection) -> None:
         columns = {r[1] for r in connection.execute("PRAGMA table_info(memories)")}
     if "tier" not in columns:
         _migrate_v2_to_v3(connection)
+        columns = {r[1] for r in connection.execute("PRAGMA table_info(memories)")}
+    if "archived_at" not in columns:
+        _migrate_v3_to_v4(connection)
+
+
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """Add the archive state. Purely additive; nothing starts archived."""
+    connection.execute("ALTER TABLE memories ADD COLUMN archived_at TEXT")
+    connection.execute("ALTER TABLE memories ADD COLUMN merged_into TEXT")
+    if "audit_runs" in {r[0] for r in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}:
+        if "deleted" not in {r[1] for r in connection.execute("PRAGMA table_info(audit_runs)")}:
+            connection.execute("ALTER TABLE audit_runs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+    connection.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+                       (str(SCHEMA_VERSION),))
+    connection.commit()
 
 
 def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
@@ -481,6 +509,21 @@ class SqliteMemoryStore:
         ).fetchall()
         return {row["uuid"]: row["slug"] for row in rows}
 
+    def _live_slugs(self, uuids: Iterable[str]) -> dict[str, str]:
+        """Slugs for the ones still in the working set.
+
+        The graph walk can reach an archived memory through a live neighbour;
+        leaving it out here is what keeps it from taking a result slot.
+        """
+        ids = sorted(set(uuids))
+        if not ids:
+            return {}
+        rows = self.connection.execute(
+            f"SELECT uuid, slug FROM memories WHERE project_id=? AND archived_at IS NULL "
+            f"AND uuid IN ({','.join('?' * len(ids))})", (self.project, *ids),
+        ).fetchall()
+        return {row["uuid"]: row["slug"] for row in rows}
+
     def get_memory(self, memory_id: str) -> dict[str, Any]:
         row = self.connection.execute(
             "SELECT body FROM memories WHERE project_id=? AND slug=?", (self.project, memory_id)
@@ -506,6 +549,7 @@ class SqliteMemoryStore:
         status_filter: list[str] | str | None = None,
         text_query: str | None = None,
         limit: int | None = None,
+        include_archived: bool = False,
     ) -> dict[str, Any]:
         """Filter by label expression, status and substring.
 
@@ -520,6 +564,8 @@ class SqliteMemoryStore:
 
         sql = "SELECT slug, body FROM memories WHERE project_id=?"
         params: list[Any] = [self.project]
+        if not include_archived:
+            sql += " AND archived_at IS NULL"
         if statuses is not None:
             sql += f" AND status IN ({','.join('?' * len(statuses))})"
             params.extend(sorted(statuses))
@@ -641,14 +687,17 @@ class SqliteMemoryStore:
             # No query at all: fall back to the most connected memories, which
             # is the "orient me in this store" answer.
             rows = self.connection.execute(
-                "SELECT src AS uuid, COUNT(*) AS degree FROM edges WHERE project_id=? "
-                "GROUP BY src ORDER BY degree DESC LIMIT ?", (self.project, limit * 4),
+                "SELECT e.src AS uuid, COUNT(*) AS degree FROM edges e "
+                "JOIN memories m ON m.project_id=e.project_id AND m.uuid=e.src "
+                "WHERE e.project_id=? AND m.archived_at IS NULL "
+                "GROUP BY e.src ORDER BY degree DESC LIMIT ?", (self.project, limit * 4),
             ).fetchall()
             combined = {row["uuid"]: float(row["degree"]) for row in rows}
 
         # Tie-break on the slug, not the uuid: which memories survive the limit
         # must not depend on a random identifier.
-        slugs = self._slugs_for(combined)
+        slugs = self._live_slugs(combined)
+        combined = {k: v for k, v in combined.items() if k in slugs}
         results: list[dict[str, Any]] = []
         surfaced: list[str] = []
         direct: list[str] = []
@@ -706,9 +755,15 @@ class SqliteMemoryStore:
         if not match:
             return {}
         weights = ",".join(str(w) for w in FTS_WEIGHTS)
+        # Archived memories are excluded here rather than filtered out of the
+        # results, so they never consume a candidate slot that a live memory
+        # could have used.
         rows = self.connection.execute(
-            f"SELECT memory_id, -bm25(memories_fts, {weights}) AS score FROM memories_fts "
-            f"WHERE memories_fts MATCH ? AND project_id = ? ORDER BY score DESC LIMIT ?",
+            f"SELECT f.memory_id AS memory_id, -bm25(memories_fts, {weights}) AS score "
+            f"FROM memories_fts f JOIN memories m "
+            f"  ON m.project_id=f.project_id AND m.uuid=f.memory_id "
+            f"WHERE memories_fts MATCH ? AND f.project_id = ? AND m.archived_at IS NULL "
+            f"ORDER BY score DESC LIMIT ?",
             (match, self.project, limit),
         ).fetchall()
         if not rows:
@@ -821,7 +876,7 @@ class SqliteMemoryStore:
         query, so cost tracks the window rather than the store.
         """
         params: list[Any] = [self.project]
-        where = "project_id=?"
+        where = "project_id=? AND archived_at IS NULL"
         if anchor is not None:
             row = self.connection.execute(
                 "SELECT created, slug FROM memories WHERE project_id=? AND slug=?", (self.project, anchor)
@@ -849,7 +904,7 @@ class SqliteMemoryStore:
             # Order by the indexed column directly: COALESCE(created, ...) is
             # not sargable and turned this into a full scan and sort. Writes and
             # migration both populate `created`, so the fallback is not needed.
-            "SELECT body FROM memories WHERE project_id=? "
+            "SELECT body FROM memories WHERE project_id=? AND archived_at IS NULL "
             "ORDER BY created DESC, slug DESC LIMIT ? OFFSET ?",
             (self.project, limit, offset),
         ).fetchall()
@@ -888,6 +943,120 @@ class SqliteMemoryStore:
             self._write(merged, memory_uuid)
             self._synchronize_relationships(memory_id)
         return {"updated": memory_id, "related_candidates": []}
+
+    def archive_memory(self, memory_id: str, archived: bool = True) -> dict[str, Any]:
+        """Take a memory out of the working set, or put it back.
+
+        Reversible by design: this is what the audit does instead of deleting,
+        so that acting on thin evidence costs a recoverable mistake rather than
+        a permanent one. The memory keeps its content, its links and its
+        counters - it simply stops competing for a place in results.
+        """
+        memory_uuid = self._uuid_for(memory_id)
+        with self.connection:
+            self.connection.execute(
+                "UPDATE memories SET archived_at=? WHERE project_id=? AND uuid=?",
+                (_now() if archived else None, self.project, memory_uuid),
+            )
+        return {"archived" if archived else "restored": memory_id}
+
+    def archived(self, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """Newest archives first. The recovery path once something leaves the pool."""
+        rows = self.connection.execute(
+            "SELECT body, archived_at FROM memories WHERE project_id=? AND archived_at IS NOT NULL "
+            "ORDER BY archived_at DESC, slug DESC LIMIT ? OFFSET ?",
+            (self.project, limit, offset),
+        ).fetchall()
+        memories = []
+        for row in rows:
+            entry = _light_record(json.loads(row["body"]))
+            entry["archived_at"] = row["archived_at"]
+            memories.append(entry)
+        return {"count": len(memories), "offset": offset, "memories": memories}
+
+    def duplicate_candidates(self, limit: int = 25, threshold: float = 0.6) -> dict[str, Any]:
+        """Pairs that look like the same lesson written twice.
+
+        Similarity nominates; it never decides. A score is good at finding pairs
+        worth reading and bad at telling whether two statements mean the same
+        thing, so this returns both memories in full for an agent to judge.
+
+        Candidates come from the derived edges already materialized on write -
+        the memories that share labels or files - so this costs one pass over a
+        capped edge set rather than comparing every pair.
+        """
+        rows = self.connection.execute(
+            "SELECT DISTINCT CASE WHEN e.src < e.dst THEN e.src ELSE e.dst END AS a, "
+            "       CASE WHEN e.src < e.dst THEN e.dst ELSE e.src END AS b "
+            "FROM edges e "
+            "JOIN memories ma ON ma.project_id=e.project_id AND ma.uuid=e.src AND ma.archived_at IS NULL "
+            "JOIN memories mb ON mb.project_id=e.project_id AND mb.uuid=e.dst AND mb.archived_at IS NULL "
+            "WHERE e.project_id=? AND e.kind='derived'", (self.project,)
+        ).fetchall()
+
+        pairs = []
+        for row in rows:
+            left, right = self._body_by_uuid(row["a"]), self._body_by_uuid(row["b"])
+            score = _text_similarity(left, right)
+            if score >= threshold:
+                pairs.append({"score": round(score, 3), "memories": [left, right]})
+        pairs.sort(key=lambda p: -p["score"])
+        return {"count": len(pairs), "threshold": threshold, "candidates": pairs[:limit]}
+
+    def merge_memories(self, keep_id: str, merge_id: str, reason: str) -> dict[str, Any]:
+        """Fold one memory into another, keeping everything both knew.
+
+        Counters add rather than being picked between: both were evidence about
+        the same underlying fact, so the combined count is the more accurate
+        number. The merged memory is archived with a pointer rather than
+        deleted, because a merge is a judgment and judgments are sometimes wrong.
+        """
+        if keep_id == merge_id:
+            raise StoreError("A memory cannot be merged into itself.")
+        if not reason or not reason.strip():
+            raise StoreError("A merge needs a reason: it is a judgment, not a computation.")
+        keep_uuid, merge_uuid = self._uuid_for(keep_id), self._uuid_for(merge_id)
+        keep, merged = self._body_by_uuid(keep_uuid), self._body_by_uuid(merge_uuid)
+
+        for field in ("tags", "labels", "triggers", "remembered_facts", "solution_pattern", "pitfalls"):
+            seen = list(keep.get(field) or [])
+            seen += [v for v in (merged.get(field) or []) if v not in seen]
+            keep[field] = seen
+        scope = keep.setdefault("scope", {})
+        for field in ("files", "applies_to"):
+            seen = list(scope.get(field) or [])
+            seen += [v for v in ((merged.get("scope") or {}).get(field) or []) if v not in seen]
+            scope[field] = seen
+        relationships = keep.setdefault("relationships", {})
+        related = list(relationships.get("related") or [])
+        known = {e.get("id") for e in related} | {keep_id, merge_id}
+        related += [e for e in (merged.get("relationships") or {}).get("related") or []
+                    if isinstance(e, dict) and e.get("id") not in known]
+        relationships["related"] = related
+
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO revisions(project_id, memory_id, revised_at, body) VALUES (?,?,?,?)",
+                (self.project, merge_uuid, _now(), json.dumps(merged)))
+            # Both counters were evidence about one fact, so they add.
+            self.connection.execute(
+                "INSERT INTO usage(project_id, memory_id, replica_id, surfaced, surfaced_direct, "
+                "applied, last_surfaced, last_applied, spread_bits, spread_epoch) "
+                "SELECT ?, ?, replica_id, surfaced, surfaced_direct, applied, last_surfaced, "
+                "last_applied, spread_bits, spread_epoch FROM usage "
+                "WHERE project_id=? AND memory_id=? "
+                "ON CONFLICT(project_id, memory_id, replica_id) DO UPDATE SET "
+                "surfaced=surfaced+excluded.surfaced, "
+                "surfaced_direct=surfaced_direct+excluded.surfaced_direct, "
+                "applied=applied+excluded.applied",
+                (self.project, keep_uuid, self.project, merge_uuid))
+            self.connection.execute(
+                "UPDATE memories SET archived_at=?, merged_into=? WHERE project_id=? AND uuid=?",
+                (_now(), keep_uuid, self.project, merge_uuid))
+            self._write(keep, keep_uuid)
+
+        self._synchronize_relationships(keep_id)
+        return {"kept": keep_id, "merged": merge_id, "reason": reason}
 
     def delete_memory(self, memory_id: str, confirm_exact_id: str) -> dict[str, Any]:
         if confirm_exact_id != memory_id:
@@ -1221,6 +1390,27 @@ class SqliteMemoryStore:
                 rel[target] = values
             if json.dumps(rel, sort_keys=True) != before:
                 self._write(other, row["uuid"])
+
+
+def _text_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
+    """Token overlap across the fields that carry the lesson.
+
+    Deliberately crude. Its job is to nominate pairs worth an agent's attention,
+    not to decide anything, so a cheap symmetric measure over the text a human
+    would actually compare is the right amount of machinery.
+    """
+    from .ranking import tokenize
+
+    def bag(memory: dict[str, Any]) -> set[str]:
+        parts = [memory.get("description") or ""]
+        for field in ("triggers", "remembered_facts", "solution_pattern", "pitfalls"):
+            parts.extend(memory.get(field) or [])
+        return set(tokenize(" ".join(parts)))
+
+    a, b = bag(left), bag(right)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
 
 
 def _expand(text: str) -> str:

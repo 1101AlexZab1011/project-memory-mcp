@@ -19,10 +19,14 @@ same-day traffic shows. Both clocks must pass before a verdict.
 What survives moves up a tier, where the next review is further away - the
 generational-GC bet that something which lasted a year deserves less scrutiny
 than something written on Tuesday. What does not survive is *archived*: out of
-the ranked pool, still in the database, still visible, still recoverable. This
-sweep never deletes. Deletion needs positive evidence - a duplicate, a live
-successor, a memory marked wrong - and that is a separate decision from "this
-was quiet".
+the ranked pool, still in the database, still visible, still recoverable.
+
+Nothing is ever deleted for being quiet. Deletion requires positive evidence,
+and of the cases that qualify - a duplicate, a live successor, a memory that is
+wrong and carries no warning, a subsystem that no longer exists - a server can
+decide exactly one alone: supersession. The rest need judgment, or a repository
+this process cannot see. So deletion is opt-in, separate from archiving, and
+writes the body to `revisions` on the way out.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from .sqlite_store import SPREAD_MASK, SqliteMemoryStore, _merge_spread, _now
 VERDICT_PROMOTE = "promote"
 VERDICT_ARCHIVE = "archive"
 VERDICT_HOLD = "hold"
+VERDICT_DELETE = "delete"
 
 
 @dataclass(frozen=True)
@@ -81,6 +86,12 @@ class AuditPolicy:
     #: a slice and get noticed, not the store.
     max_actions_per_run: int = 50
     max_action_fraction: float = 0.1
+    #: Deletion is opt-in separately from archiving, and covers exactly one case
+    #: a server can decide alone: a memory whose successor is still standing.
+    #: Everything else that could justify deletion - a duplicate, a memory that
+    #: is wrong and carries no warning, a subsystem that no longer exists -
+    #: needs judgment or a repository this process cannot see.
+    delete_superseded: bool = False
 
     def gate_for(self, tier: int) -> TierGate | None:
         for gate in self.gates:
@@ -101,6 +112,7 @@ class AuditPolicy:
             "min_degree": self.min_degree,
             "max_actions_per_run": self.max_actions_per_run,
             "max_action_fraction": self.max_action_fraction,
+            "delete_superseded": self.delete_superseded,
         }
 
 
@@ -125,13 +137,15 @@ class AuditReport:
     promoted: int
     archived: int
     capped: int
+    deleted: int = 0
     findings: list[Finding] = field(default_factory=list)
 
     def summary(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id, "project": self.project, "applied": self.applied,
             "queries": self.queries, "examined": self.examined, "due": self.due,
-            "promoted": self.promoted, "archived": self.archived, "capped": self.capped,
+            "promoted": self.promoted, "archived": self.archived,
+            "deleted": self.deleted, "capped": self.capped,
         }
 
 
@@ -156,7 +170,7 @@ def _collect(store: SqliteMemoryStore) -> tuple[int, list[dict[str, Any]]]:
         "SELECT queries FROM projects WHERE id=?", (project,)).fetchone()["queries"]
 
     rows = store.connection.execute(
-        "SELECT uuid, slug, status, tier, tier_since, tier_since_query, created "
+        "SELECT uuid, slug, status, tier, tier_since, tier_since_query, created, archived_at "
         "FROM memories WHERE project_id=?", (project,)).fetchall()
 
     counters: dict[str, dict[str, Any]] = {}
@@ -181,6 +195,18 @@ def _collect(store: SqliteMemoryStore) -> tuple[int, list[dict[str, Any]]]:
     ):
         degree[row["dst"]] = row["n"]
 
+    # A memory is safely deletable only if the thing that replaced it is still
+    # standing. If B superseded A and B was later marked wrong, deleting A
+    # leaves nothing: the old answer gone and the new one known to be false.
+    live_successor: dict[str, str] = {}
+    for row in store.connection.execute(
+        "SELECT e.dst AS old, e.src AS new, m.slug AS new_slug FROM edges e "
+        "JOIN memories m ON m.project_id=e.project_id AND m.uuid=e.src "
+        "WHERE e.project_id=? AND e.kind='supersedes' AND m.status='active' "
+        "AND m.archived_at IS NULL", (project,)
+    ):
+        live_successor[row["old"]] = row["new_slug"]
+
     memories = []
     for row in rows:
         counts = counters.get(row["uuid"], {})
@@ -188,11 +214,13 @@ def _collect(store: SqliteMemoryStore) -> tuple[int, list[dict[str, Any]]]:
             "uuid": row["uuid"], "slug": row["slug"], "status": row["status"],
             "tier": row["tier"], "tier_since": row["tier_since"],
             "tier_since_query": row["tier_since_query"], "created": row["created"],
+            "archived_at": row["archived_at"],
             "surfaced": counts.get("surfaced", 0),
             "surfaced_direct": counts.get("surfaced_direct", 0),
             "applied": counts.get("applied", 0),
             "spread_days": bin(counts.get("_bits", 0) & SPREAD_MASK).count("1"),
             "degree": degree.get(row["uuid"], 0),
+            "live_successor": live_successor.get(row["uuid"]),
         })
     return queries, memories
 
@@ -210,6 +238,15 @@ def _judge(memory: dict[str, Any], policy: AuditPolicy, queries: int, now: datet
     }
     make = lambda verdict, reason: Finding(  # noqa: E731
         memory["uuid"], memory["slug"], tier, verdict, reason, evidence)
+
+    if memory["archived_at"]:
+        return make(VERDICT_HOLD, "already archived")
+
+    # Deletion is decided on positive evidence, not on silence, so it is checked
+    # before the exposure gates rather than as a harsher grade of "quiet".
+    if policy.delete_superseded and memory["live_successor"]:
+        return make(VERDICT_DELETE,
+                    f"superseded by '{memory['live_successor']}', which is still active")
 
     if gate is None:
         return make(VERDICT_HOLD, f"tier {tier} is past the last gate; not reviewed")
@@ -242,37 +279,63 @@ def run_audit(store: SqliteMemoryStore, policy: AuditPolicy | None = None,
     code path produces the report either way, so what you observe is what you
     will get.
     """
-    if apply:
-        raise NotImplementedError(
-            "Applying audit verdicts is not implemented yet. Run the report, read it, "
-            "and see docs/memory-lifecycle.md - acting on verdicts is the next phase.")
     policy = policy or AuditPolicy()
     now = datetime.now(timezone.utc)
     queries, memories = _collect(store)
 
     findings = [_judge(memory, policy, queries, now) for memory in memories]
-    due = [f for f in findings if f.verdict != VERDICT_HOLD]
     cap = policy.cap_for(len(memories))
 
     # Archive the weakest first when capped, so a run that cannot do everything
-    # spends its budget where the evidence is thinnest.
-    archives = sorted((f for f in due if f.verdict == VERDICT_ARCHIVE),
-                      key=lambda f: (f.evidence["surfaced"], f.evidence["degree"], f.slug))
-    capped = max(0, len(archives) - cap)
-    for finding in archives[cap:]:
+    # spends its budget where the evidence is thinnest. Deletions count against
+    # the same budget: one run should never be able to empty a store.
+    removals = sorted((f for f in findings if f.verdict in (VERDICT_ARCHIVE, VERDICT_DELETE)),
+                      key=lambda f: (f.verdict != VERDICT_DELETE, f.evidence["surfaced"],
+                                     f.evidence["degree"], f.slug))
+    capped = max(0, len(removals) - cap)
+    for finding in removals[cap:]:
+        finding.reason = f"would {finding.verdict}, held back by the per-run cap of {cap}"
         finding.verdict = VERDICT_HOLD
-        finding.reason = f"would archive, held back by the per-run cap of {cap}"
 
+    count = lambda verdict: len([f for f in findings if f.verdict == verdict])  # noqa: E731
     report = AuditReport(
-        run_id=None, project=store.project, applied=False, queries=queries,
+        run_id=None, project=store.project, applied=bool(apply), queries=queries,
         examined=len(memories), due=len([f for f in findings if f.verdict != VERDICT_HOLD]),
-        promoted=len([f for f in findings if f.verdict == VERDICT_PROMOTE]),
-        archived=len([f for f in findings if f.verdict == VERDICT_ARCHIVE]),
-        capped=capped, findings=findings,
+        promoted=count(VERDICT_PROMOTE), archived=count(VERDICT_ARCHIVE),
+        deleted=count(VERDICT_DELETE), capped=capped, findings=findings,
     )
+    if apply:
+        _apply(store, report, queries, now)
     if record:
         report.run_id = _record(store, report, policy, now)
     return report
+
+
+def _apply(store: SqliteMemoryStore, report: AuditReport, queries: int,
+           now: datetime) -> None:
+    """Carry out the verdicts.
+
+    Idempotent by construction: every decision is re-derived from the tier and
+    archive columns, so a run interrupted halfway leaves a consistent store and
+    the next run simply picks up what is still due.
+    """
+    stamp = _now()
+    for finding in report.findings:
+        if finding.verdict == VERDICT_PROMOTE:
+            # The tier clock restarts on promotion: the next review is measured
+            # from here, which is what makes each tier a longer reprieve.
+            with store.connection:
+                store.connection.execute(
+                    "UPDATE memories SET tier=tier+1, tier_since=?, tier_since_query=? "
+                    "WHERE project_id=? AND uuid=?",
+                    (stamp, queries, store.project, finding.memory_id))
+            finding.tier += 1
+        elif finding.verdict == VERDICT_ARCHIVE:
+            store.archive_memory(finding.slug, archived=True)
+        elif finding.verdict == VERDICT_DELETE:
+            # delete_memory writes the body to `revisions` before removing it,
+            # so even this is recoverable from the database itself.
+            store.delete_memory(finding.slug, finding.slug)
 
 
 def _record(store: SqliteMemoryStore, report: AuditReport, policy: AuditPolicy,
@@ -286,9 +349,10 @@ def _record(store: SqliteMemoryStore, report: AuditReport, policy: AuditPolicy,
     with store.connection:
         cursor = store.connection.execute(
             "INSERT INTO audit_runs(project_id, started, finished, applied, queries, examined, "
-            "due, promoted, archived, capped, policy) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (store.project, stamp, stamp, 0, report.queries, report.examined, report.due,
-             report.promoted, report.archived, report.capped, json.dumps(policy.describe())),
+            "due, promoted, archived, deleted, capped, policy) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (store.project, stamp, stamp, int(report.applied), report.queries, report.examined,
+             report.due, report.promoted, report.archived, report.deleted, report.capped,
+             json.dumps(policy.describe())),
         )
         run_id = cursor.lastrowid
         store.connection.executemany(
@@ -322,16 +386,20 @@ def last_run(store: SqliteMemoryStore, verdicts: tuple[str, ...] | None = None) 
 
 def format_report(report: AuditReport, limit: int = 20) -> str:
     """Human-readable summary for the CLI."""
+    did, would = ("promoted", "archived") if report.applied else ("would promote", "would archive")
     lines = [
-        f"audit of '{report.project}' - report only, nothing changed",
+        f"audit of '{report.project}' - "
+        + ("changes applied" if report.applied else "report only, nothing changed"),
         f"  {report.examined} memories, {report.queries} queries served",
-        f"  would promote {report.promoted}, would archive {report.archived}"
+        f"  {did} {report.promoted}, {would} {report.archived}"
+        + (f", deleted {report.deleted}" if report.applied and report.deleted
+           else f", would delete {report.deleted}" if report.deleted else "")
         + (f", {report.capped} held back by the cap" if report.capped else ""),
     ]
     holds = [f for f in report.findings if f.verdict == VERDICT_HOLD]
     if holds:
         lines.append(f"  {len(holds)} not yet reviewable")
-    for verdict in (VERDICT_ARCHIVE, VERDICT_PROMOTE):
+    for verdict in (VERDICT_DELETE, VERDICT_ARCHIVE, VERDICT_PROMOTE):
         chosen = [f for f in report.findings if f.verdict == verdict]
         if not chosen:
             continue

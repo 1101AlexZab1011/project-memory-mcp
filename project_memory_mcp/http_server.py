@@ -244,6 +244,16 @@ class _Handler(BaseHTTPRequestHandler):
                 limit = max(1, min(100, int(one("limit", "25"))))
                 offset = max(0, int(one("offset", "0")))
                 status = one("status") or None
+                if status == "archived":
+                    # Archived memories are outside the ranked pool, so they
+                    # have their own listing rather than a status filter.
+                    with lock:
+                        rows = store.archived(limit=limit, offset=offset)["memories"]
+                        counters = store.load_usage()["memories"]
+                    for row in rows:
+                        row["usage"] = counters.get(row["id"], {})
+                    self._send(200, {"memories": rows, "offset": offset})
+                    return
                 label = one("label") or None
                 text = one("q").strip()
                 with lock:
@@ -273,7 +283,12 @@ class _Handler(BaseHTTPRequestHandler):
                 with lock:
                     memory = store.get_memory(memory_id)
                     usage = store.load_usage()["memories"].get(memory_id, {})
-                self._send(200, {"memory": memory, "usage": usage})
+                    row = store.connection.execute(
+                        "SELECT archived_at, tier FROM memories WHERE project_id=? AND slug=?",
+                        (store.project, memory_id)).fetchone()
+                self._send(200, {"memory": memory, "usage": usage,
+                                 "archived_at": row["archived_at"] if row else None,
+                                 "tier": row["tier"] if row else 1})
                 return
 
             if path == "/api/audit":
@@ -329,6 +344,13 @@ class _Handler(BaseHTTPRequestHandler):
                     store.update_memory(memory_id, {"status": payload.get("status")})
                 self._send(200, {"ok": True, "id": memory_id})
                 return
+            if path == "/api/archive":
+                archived = bool(payload.get("archived", True))
+                with lock:
+                    result = store.archive_memory(payload["id"], archived=archived)
+                self._send(200, result)
+                return
+
             if path == "/api/delete":
                 with lock:
                     self._send(200, store.delete_memory(memory_id, memory_id))
