@@ -14,6 +14,7 @@ import copy
 import json
 import os
 import re
+import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +48,9 @@ SCOPE_REQUIRED_FIELDS = ("project", "area", "files")
 SCOPE_FIELDS = ("project", "area", "files", "applies_to")
 EVIDENCE_FIELDS = ("created_from_task", "last_validated")
 RELATIONSHIP_FIELDS = ("related", "supersedes", "superseded_by")
+
+# Buffer usage counters this long before writing them out (see flush_usage).
+USAGE_FLUSH_INTERVAL_SECONDS = 5.0
 
 
 class StoreError(ValueError):
@@ -207,6 +211,8 @@ class MemoryStore:
         self._cache_signature: tuple[tuple[str, int, int], ...] | None = None
         self._cache_records: dict[str, dict[str, Any]] | None = None
         self._cache_contexts: dict[bool, RankingContext] = {}
+        self._usage_pending: dict[str, dict[str, Any]] = {}
+        self._usage_last_flush = 0.0
 
     # ------------------------------------------------------------------ reads
 
@@ -383,12 +389,49 @@ class MemoryStore:
     # ------------------------------------------------------------------ usage
 
     def load_usage(self) -> dict[str, Any]:
-        """Read the usage sidecar, or an empty record if it is absent.
+        """Usage counters: what is on disk, plus anything not yet flushed.
 
         Usage lives outside the memory files on purpose: recording a read must
         never dirty a memory's JSON, or every recall would show up in git and
         memory diffs would stop being reviewable.
         """
+        data = self._read_usage_file()
+        if not self._usage_pending:
+            return data
+        entries = data.setdefault("memories", {})
+        for memory_id, pending in self._usage_pending.items():
+            entry = entries.setdefault(memory_id, {})
+            for field, value in pending.items():
+                if field.startswith("last_"):
+                    entry[field] = value
+                else:
+                    entry[field] = int(entry.get(field, 0)) + value
+        return data
+
+    def flush_usage(self, force: bool = False) -> bool:
+        """Write buffered counters to disk. Returns whether anything was written.
+
+        Recalls arrive in bursts, and each write changes the file's bytes, so
+        writing per call cost ~25 ms against ~4 ms of actual ranking work.
+        Buffering collapses a burst into one write; the exposure is losing the
+        last few counts if the process is killed, which is acceptable for
+        telemetry that is already disposable.
+        """
+        if not self._usage_pending:
+            return False
+        now = time.monotonic()
+        if not force and (now - self._usage_last_flush) < USAGE_FLUSH_INTERVAL_SECONDS:
+            return False
+        merged = self.load_usage()
+        try:
+            self._write_json(self.usage_path, merged)
+        except OSError:
+            return False  # a read-only checkout should still be able to recall
+        self._usage_pending.clear()
+        self._usage_last_flush = now
+        return True
+
+    def _read_usage_file(self) -> dict[str, Any]:
         if not self.usage_path.is_file():
             return {"schema_version": 1, "memories": {}}
         try:
@@ -422,17 +465,11 @@ class MemoryStore:
         if not memory_ids:
             return
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        usage = self.load_usage()
-        entries = usage.setdefault("memories", {})
         for memory_id in set(memory_ids):
-            entry = entries.setdefault(memory_id, {})
-            entry[field] = int(entry.get(field, 0)) + 1
-            entry[f"last_{field}"] = stamp
-        try:
-            self._write_json(self.usage_path, usage)
-        except OSError:
-            # A read-only checkout should still be able to recall.
-            pass
+            pending = self._usage_pending.setdefault(memory_id, {})
+            pending[field] = int(pending.get(field, 0)) + 1
+            pending[f"last_{field}"] = stamp
+        self.flush_usage()
 
     # -------------------------------------------------------------- mutations
 

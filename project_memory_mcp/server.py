@@ -276,4 +276,5 @@ def run_server(root: Path | str | None = None) -> int:
         response = server.handle(message)
         if response is not None:
             write_message(response)
+    store.flush_usage(force=True)
     return 0

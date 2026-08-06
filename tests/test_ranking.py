@@ -337,3 +337,30 @@ class UsageTests(unittest.TestCase):
 
         self.assertEqual(1, result["count"])
         self.assertEqual(1, self.store.load_usage()["memories"]["cache-race"]["surfaced"])
+
+    def test_counts_are_visible_before_they_are_flushed(self):
+        # Buffering must not make load_usage lie: pending counts merge on read.
+        self.store._usage_last_flush = 1e9   # far future -> nothing will flush
+        self.store.recall(query="cache invalidation", limit=1, full_count=0)
+
+        self.assertFalse(self.store.usage_path.is_file())
+        self.assertEqual(1, self.store.load_usage()["memories"]["cache-race"]["surfaced"])
+
+    def test_a_burst_of_recalls_writes_once(self):
+        self.store.recall(query="cache invalidation", limit=1, full_count=0)  # first flushes
+        stamp = self.store.usage_path.stat().st_mtime_ns
+        for _ in range(10):
+            self.store.recall(query="cache invalidation", limit=1, full_count=0)
+
+        self.assertEqual(stamp, self.store.usage_path.stat().st_mtime_ns)
+        # ...and none of those counts are lost.
+        self.assertEqual(11, self.store.load_usage()["memories"]["cache-race"]["surfaced"])
+
+    def test_forced_flush_persists_the_buffer(self):
+        self.store._usage_last_flush = 1e9
+        self.store.recall(query="cache invalidation", limit=1, full_count=0)
+
+        self.assertTrue(self.store.flush_usage(force=True))
+        reloaded = MemoryStore(self.store.root).load_usage()
+        self.assertEqual(1, reloaded["memories"]["cache-race"]["surfaced"])
+        self.assertFalse(self.store.flush_usage(force=True))  # nothing left pending
