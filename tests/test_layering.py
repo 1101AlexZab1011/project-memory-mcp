@@ -203,6 +203,58 @@ class ToolSurfaceTests(unittest.TestCase):
                 self.assertTrue((tool.get("description") or "").strip())
 
 
+class DocumentedCommandTests(unittest.TestCase):
+    """The README's command list is a promise too.
+
+    `migrate` was deleted along with its parser and its importer, and the README
+    kept offering it in the reference table, and `cli.py`'s own module docstring
+    kept naming it. Step 4 tested that the *startup banner* names a real command
+    and stopped there - so the two other places that name commands drifted
+    exactly as far as nothing was checking them.
+    """
+
+    @staticmethod
+    def documented() -> set[str]:
+        import re
+
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+        return set(re.findall(r"^project-memory-mcp\s+(\S+)", readme, re.MULTILINE))
+
+    @staticmethod
+    def registered() -> set[str]:
+        import argparse
+
+        from project_memory_mcp.cli import build_parser
+
+        actions = [a for a in build_parser()._actions
+                   if isinstance(a, argparse._SubParsersAction)]
+        return set(actions[0].choices)
+
+    def test_every_documented_command_exists(self):
+        missing = sorted(self.documented() - self.registered())
+        self.assertEqual([], missing,
+                         "the README offers commands this CLI does not have")
+
+    def test_every_command_is_documented(self):
+        undocumented = sorted(self.registered() - self.documented())
+        self.assertEqual([], undocumented,
+                         "these commands exist and the README never mentions them")
+
+    def test_the_two_places_that_declare_a_version_agree(self):
+        # `__version__` is what the server reports on /health and in its MCP
+        # handshake; pyproject is what pip installs. Two statements of one fact
+        # drift, and the symptom is a server that says it is a version nobody
+        # can install.
+        import re
+
+        from project_memory_mcp import __version__
+
+        pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
+            encoding="utf-8")
+        declared = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE).group(1)
+        self.assertEqual(declared, __version__)
+
+
 class LayeringTests(unittest.TestCase):
     def test_the_store_cannot_reach_the_network(self):
         leaked = reachable_from("sqlite_store") & NETWORK

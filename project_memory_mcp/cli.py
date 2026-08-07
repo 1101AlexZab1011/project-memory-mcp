@@ -1,4 +1,4 @@
-"""Command-line interface: init, validate, serve, install-skills, migrate, backup."""
+"""Command-line interface. The subcommands are registered in `build_parser`."""
 
 from __future__ import annotations
 

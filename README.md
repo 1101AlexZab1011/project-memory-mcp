@@ -294,11 +294,15 @@ project-memory-mcp audit           --database DB --project ID [--apply --yes]
                                    [--delete-superseded] [--min-* N] [--max-actions N]
 project-memory-mcp serve           --database DB [--project ID] [--http --bind ADDR [--port N]]
                                    [--token T] [--no-ui] [--backup-dir DIR]
-project-memory-mcp migrate         --from DIR --database DB --project ID
 project-memory-mcp backup          --database DB --out DEST [--format db|json]
                                    [--project ID] [--keep N]
 project-memory-mcp restore         --database DB --from FILE
 project-memory-mcp install-skills  [--root DIR] [--claude] [--codex] [--dest DIR]
+project-memory-mcp compute         --database DB [--project ID] [--kind K] [--once]
+project-memory-mcp remote          --database DB --project ID [--name N --url U]
+                                   [--enable N] [--disable N] [--remove N]
+project-memory-mcp enroll          --database DB [--list] [--revoke ID]
+project-memory-mcp join            --server URL --code CODE [--name N]
 ```
 
 `validate` checks the whole store and exits non-zero on any problem. Use it in CI or a
