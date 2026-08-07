@@ -79,6 +79,37 @@ better and is four lines of `ast`.
 **Done when** both classes are collected, and the suite fails if a module defines the same
 top-level class twice.
 
+### Outcome ✔
+
+The first class is now `ReplicaIdentityTests` — a better name anyway, since the three ask about
+*identity* (is a foreign row summed on read, left alone on write, and does this machine's id survive
+a reopen) while the other class drives `usage.record` under two identities to check the arithmetic.
+
+**All three pass.** The counter code was sound, so steps 6 and 7 stand as scoped. That was the
+question worth asking first, and the answer is the boring one.
+
+But passing was not the whole story, and this is the part worth keeping. Mutation-checking the three
+before trusting them, `test_a_replica_only_ever_writes_its_own_row` **survived** a mutant that keyed
+every write to the constant `"shared"`. The test inserts a row owned by `'other-machine'` and asserts
+it is untouched — and a write to `"shared"` does not touch it either. It proved this replica does not
+write to a row named `other-machine`; it never checked the write landed on *this replica's own id*,
+which is the property in its name. Now asserts both halves, and the mutant is caught.
+
+The stray `if __name__ == "__main__": unittest.main()` sitting mid-file is how the collision happened
+— the second class was appended below it, where nothing reads. Moved to the end.
+
+The guard lives in `tests/test_layering.py`, which already enforces structural rules with `ast`: no
+module in the package or the suite may bind the same class or function name twice at top level. Only
+`def` and `class`, since a reassigned module constant is ordinary. Verified by renaming the class
+back and watching it fail, naming both the module and the duplicated name.
+
+**344 → 348 tests**: three revived, one guard.
+
+A note for the steps below. Two things passed here that a green suite had asserted for months: the
+three tests were never collected, and one of them was decorative. Neither shows up as a failure —
+only as a number nobody counts. Step 2 makes the same kind of claim about authorization, which is
+why its mutation check is not optional.
+
 ## Step 2 — The UI session carries an identity
 
 **The problem.** `_require_project` is called on `/mcp` and nowhere else. `/api/*` gates only on a

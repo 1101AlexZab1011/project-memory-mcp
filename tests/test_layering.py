@@ -1,15 +1,22 @@
-"""The store must not be able to reach the network.
+"""Structural rules about the code, enforced rather than written down.
 
-A store method that opens a socket is a store method that can block on somebody
-else's machine, and in the HTTP server it does that while holding the project
-lock - so one slow remote stalls every request for that project, reads included.
-That was a real bug in `promote`, fixed by the outbox.
+Two of them, both learned from a defect rather than chosen up front.
 
-A rule written in a document gets violated. This one fails the build.
+**The store must not be able to reach the network.** A store method that opens a
+socket is a store method that can block on somebody else's machine, and in the
+HTTP server it does that while holding the project lock - so one slow remote
+stalls every request for that project, reads included. That was a real bug in
+`promote`, fixed by the outbox. The check walks imports rather than trusting the
+top of the file, because the easy way to reintroduce the problem is a
+function-local `from . import federation` - which is invisible to anything that
+only reads module headers.
 
-The check walks imports rather than trusting the top of the file, because the
-easy way to reintroduce the problem is a function-local `from . import
-federation` - which is invisible to anything that only reads module headers.
+**A module must not define the same top-level name twice.** Python rebinds
+silently, so the second definition wins and the first is discarded before pytest
+ever sees it. `test_lifecycle_schema.py` defined `ReplicaCounterTests` twice and
+three tests had never run in any suite, on any commit, while reporting green.
+
+A rule written in a document gets violated. These fail the build.
 """
 
 from __future__ import annotations
@@ -66,6 +73,46 @@ def reachable_from(start: str) -> set[str]:
             if name not in ALLOWED_TO_REACH_THE_NETWORK:
                 queue.append(name)
     return found
+
+
+TESTS = Path(__file__).resolve().parent
+
+
+def redefined_top_level_names(path: Path) -> list[str]:
+    """Names bound more than once at module level, in definition order.
+
+    Only classes and functions. A module-level constant reassigned on purpose is
+    ordinary; a `def` or `class` written twice is always a mistake, because the
+    first one becomes unreachable the moment the second is read.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name in seen and node.name not in duplicates:
+            duplicates.append(node.name)
+        seen.add(node.name)
+    return duplicates
+
+
+class ShadowingTests(unittest.TestCase):
+    """A redefined class or function silently discards the first one.
+
+    In a test file that means tests which never run while the suite reports
+    green - which is the worst failure a test suite has, because it is
+    indistinguishable from success.
+    """
+
+    def test_no_module_defines_the_same_name_twice(self):
+        for path in sorted(list(TESTS.glob("test_*.py")) + list(PACKAGE.glob("*.py"))):
+            with self.subTest(module=path.name):
+                self.assertEqual(
+                    [], redefined_top_level_names(path),
+                    f"{path.name} defines these twice at module level. Python keeps only the "
+                    "second, so the first is dead code - and if it is a TestCase, its tests "
+                    "never run.")
 
 
 class LayeringTests(unittest.TestCase):

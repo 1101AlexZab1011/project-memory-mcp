@@ -125,7 +125,19 @@ class SurfacingSplitTests(StoreCase):
         self.assertEqual(0, entry["surfaced_direct"])
 
 
-class ReplicaCounterTests(StoreCase):
+class ReplicaIdentityTests(StoreCase):
+    """This machine's replica id, and what it may touch.
+
+    Named apart from `ReplicaCounterTests` below because these three ask a
+    different question: given a row that belongs to *another* machine, is it
+    summed on read and left alone on write, and does this machine's own id
+    survive a reopen. The other class drives `usage.record` under two
+    identities to check the arithmetic itself.
+
+    They shared a name until 2026-08-07, which meant the file defined the class
+    twice and Python kept only the second - so none of these three ran.
+    """
+
     def test_counters_from_two_replicas_add_up(self):
         self.store.create_memory(memory("cache-race", CACHE, ["area:x"]))
         self.store.recall("cache invalidation")
@@ -146,9 +158,19 @@ class ReplicaCounterTests(StoreCase):
             "VALUES ('demo', ?, 'other-machine', 7)", (memory_uuid,))
         self.store.connection.commit()
         self.store.recall("cache invalidation")
+
         other = self.store.connection.execute(
             "SELECT surfaced FROM usage WHERE replica_id='other-machine'").fetchone()
-        self.assertEqual(7, other["surfaced"])
+        self.assertEqual(7, other["surfaced"], "the recall wrote over another machine's row")
+        # Both halves, because leaving the other row alone is only half the
+        # property and the cheaper half. Writing to any constant key satisfies
+        # it - so this also pins the write to *this* replica's id, which is what
+        # makes two machines' counts add instead of racing over one row.
+        mine = self.store.connection.execute(
+            "SELECT surfaced FROM usage WHERE replica_id=?", (self.store.replica_id,)).fetchone()
+        self.assertIsNotNone(
+            mine, "the recall recorded nothing under this replica's own id")
+        self.assertEqual(1, mine["surfaced"])
 
     def test_the_replica_id_is_stable_across_reopening(self):
         first = self.store.replica_id
@@ -361,10 +383,6 @@ class MigrationTests(unittest.TestCase):
         self.assertNotIn("usage_v1", tables)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ReplicaCounterTests(unittest.TestCase):
     """Counters are per replica, which is what makes a push idempotent.
 
@@ -418,3 +436,7 @@ class ReplicaCounterTests(unittest.TestCase):
             self.as_replica(replica)
             usage.record(self.store, [self.uuid])
         self.assertEqual(1, self.store.load_usage()["memories"]["cache-race"]["spread_days"])
+
+
+if __name__ == "__main__":
+    unittest.main()
