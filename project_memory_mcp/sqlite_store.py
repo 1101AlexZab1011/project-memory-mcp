@@ -1638,50 +1638,13 @@ def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def migrate_from_files(database: Path | str, project: str, store_dir: Path | str) -> dict[str, Any]:
-    """Import a file-backed .project-memory store into the database.
-
-    The source files are left untouched, so the move is reversible by
-    discarding the database. Memories are written first and validated after:
-    the file store already carries mirrored relationships, and validating each
-    one as it lands would fail on links to memories not imported yet.
-    """
-    store_dir = Path(store_dir)
-    active = store_dir / "active"
-    if not active.is_dir():
-        raise StoreError(f"No active/ directory under {store_dir}")
-
-    store = SqliteMemoryStore(database, project)
-    registry_path = store_dir / "labels.json"
-    labels = 0
-    if registry_path.is_file():
-        registry = json.loads(registry_path.read_text(encoding="utf-8-sig"))
-        for label, data in (registry.get("labels") or {}).items():
-            try:
-                store.add_label(label, (data or {}).get("description") or label)
-                labels += 1
-            except StoreError:
-                pass  # already registered; migration is re-runnable
-
-    imported, skipped = 0, []
-    with store.connection:
-        for path in sorted(active.glob("*.json")):
-            memory = json.loads(path.read_text(encoding="utf-8-sig"))
-            if not isinstance(memory, dict) or "id" not in memory:
-                skipped.append(path.name)
-                continue
-            evidence = memory.setdefault("evidence", {})
-            if isinstance(evidence, dict) and not evidence.get("created"):
-                # Best available creation time for a store written before the
-                # field existed; date-only, but it preserves relative order.
-                evidence["created"] = evidence.get("last_validated") or ""
-            store._write(memory)
-            imported += 1
-    return {
-        "project": project,
-        "database": str(store.path),
-        "labels": labels,
-        "imported": imported,
-        "skipped": skipped,
-        "errors": store.validate_store(),
-    }
+# `migrate_from_files` used to live here, importing the pre-0.4.0
+# `.project-memory` file layout. It called `store._write(memory)` and had done
+# since before schema v2 gave `_write` a required `memory_uuid`, so every
+# invocation raised TypeError - for many releases, with no test covering it and
+# the server's own startup banner recommending it.
+#
+# Deleted rather than repaired. The format is documented as dead in two other
+# places, and an importer nobody has been able to run cannot be something anyone
+# depends on. If a file store ever does surface, write the importer against it
+# as a fixture; that beats keeping an untested one against a guess.

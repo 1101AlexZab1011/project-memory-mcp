@@ -100,13 +100,7 @@ memory:
 PROJECT_MEMORY_TOKEN=$(openssl rand -hex 24) project-memory-mcp serve --http --database ~/memory.db --bind 192.168.1.50 --port 8765
 ```
 
-Coming from a pre-0.4.0 file store, import it first — this leaves the source untouched:
-
-```bash
-project-memory-mcp migrate --from ./.project-memory --project my-project --database ~/memory.db
-```
-
-Each project's `.mcp.json` then points at it:
+Create the project first with `init`, then point each project's `.mcp.json` at it:
 
 ```json
 {

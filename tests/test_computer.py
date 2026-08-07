@@ -312,10 +312,6 @@ class SchedulerTests(ComputerCase):
         self.assertGreaterEqual(scheduler.interval, 60)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LockDisciplineTests(ComputerCase):
     """A job holds the project lock for its database work and nothing else.
 
@@ -550,3 +546,7 @@ class BorrowedAnchorTests(ComputerCase):
                              "another server's memory was marked stale from here")
         finally:
             store.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

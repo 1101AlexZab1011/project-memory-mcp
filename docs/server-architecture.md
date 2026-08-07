@@ -161,9 +161,13 @@ is actually in here" except by asking an agent.
 
 ## Migration
 
-`project-memory-mcp migrate --from <path-to-.project-memory> --project <name>` reads an
-existing file store into the database and leaves the files untouched, so nothing is destroyed
-and the move is reversible by discarding the database.
+There was a `migrate --from <path-to-.project-memory>` for importing the pre-0.4.0 file layout.
+It is gone: it had been raising `TypeError` on every call since schema v2, untested, for many
+releases — so nobody was able to depend on it — and the format it read is one the README calls
+dead and the recall skill instructs agents not to open.
+
+Projects are created with `init`. If a file store ever does surface, write the importer against
+that directory as a fixture rather than reviving an untested one written against a guess.
 
 ## Risks
 

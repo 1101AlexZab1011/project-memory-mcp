@@ -114,6 +114,28 @@ class ShadowingTests(unittest.TestCase):
                     "second, so the first is dead code - and if it is a TestCase, its tests "
                     "never run.")
 
+    def test_nothing_is_defined_after_a_files_main_block(self):
+        """`if __name__ == "__main__"` reads as the end of the file. Make it be.
+
+        This is the *cause* the check above only catches the effect of. A class
+        appended below that block looks appended to the end of the module, so
+        nobody re-reads what is already up there - which is how one file came to
+        define `ReplicaCounterTests` twice and lose three tests. Three test
+        files had definitions sitting below the marker; seven of them.
+        """
+        for path in sorted(list(TESTS.glob("test_*.py")) + list(PACKAGE.glob("*.py"))):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            marker = [i for i, line in enumerate(lines) if line.startswith("if __name__")]
+            if not marker:
+                continue
+            stranded = [line.split("(")[0] for line in lines[marker[0]:]
+                        if line.startswith(("class ", "def "))]
+            with self.subTest(module=path.name):
+                self.assertEqual(
+                    [], stranded,
+                    f"{path.name} defines these below its `if __name__` block, which every "
+                    "reader treats as the end of the file. Move the block to the end.")
+
 
 class LayeringTests(unittest.TestCase):
     def test_the_store_cannot_reach_the_network(self):

@@ -683,7 +683,7 @@ def run_http_server(database: Path | str, bind: str, port: int, token: str,
     print(
         "\n".join([
             f"project-memory-mcp {__version__} serving {Path(database)} on http://{bind}:{port}/mcp",
-            f"  projects: {', '.join(projects) or '(none - create one with `migrate` first)'}",
+            f"  projects: {', '.join(projects) or '(none - create one with `init` first)'}",
             f"  clients:  url http://{bind}:{port}/mcp?project=<id> with an Authorization: Bearer header",
             f"  browser:  {browser}",
             f"  computer: {'running, every %ds' % compute_interval if computer else 'disabled'}",

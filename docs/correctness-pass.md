@@ -299,6 +299,54 @@ creates a project.
 **Done when** `migrate` either works against a fixture or does not exist, and the startup banner
 names a command that works.
 
+### Outcome ✔ — deleted
+
+The question the step asked was answerable from the repository, and the answer was already written
+down twice:
+
+- **README:** a `.project-memory` directory "was the pre-0.4.0 layout and nothing reads it any more."
+- **`project-memory-recall/SKILL.md`:** "it is a leftover from before the database. Do not read it —
+  it is not maintained and its contents may contradict the store."
+
+So the project instructs agents not to open the format, while shipping an importer for it that had
+raised `TypeError` on every call since schema v2 — untested, and recommended by the server's own
+startup banner to anyone with an empty database. Nobody can have depended on a command nobody could
+run. Gone: `cmd_migrate`, its parser, and `migrate_from_files`.
+
+The argument does not rest on "no such directory exists anywhere" — that is not something this
+thread can establish, and one project on this machine is deliberately out of scope. It rests on the
+importer having been unusable for many releases either way. If a file store does surface during a
+future migration, write the importer against that directory as a fixture. That beats keeping an
+untested one written against a guess.
+
+Three documents were pointing at it and now do not: the startup banner (`init`), the README's import
+recipe, and `server-architecture.md`'s Migration section, which now records why it went.
+
+The test asserts the property rather than the word: it reads the banner line out of `http_server.py`,
+extracts the command in backticks, and requires argparse to accept it. Naming `init` in a test would
+have passed just as well while the banner said something else.
+
+**Two structural things fixed on the way through, both the same family as step 1.**
+
+`test_cli.py` had `DestructiveConfirmationTests(CliTests)` — inheriting the parent's tests along with
+its fixture, so seven tests ran twice and my new class would have made it three times. Extracted a
+`CliCase` fixture with no tests of its own. **The file reported 26 tests and had 12.**
+
+And the cause behind step 1's bug: three test files had definitions sitting *below* their
+`if __name__ == "__main__"` block — seven definitions in total. Everyone reads that as the end of the
+file, which is exactly how a class gets appended below one that already exists and shadows it. Moved
+to the end in all three, and `test_layering.py` now fails if anything is defined after the marker.
+Step 1's guard catches the effect; this one catches the cause. Verified by moving a block back.
+
+**361 → 358 tests, and the drop is the point:** −4 duplicate CLI runs, +3 for the removal, +1 guard.
+
+**One honest note.** During this step's first full run,
+`test_concurrent_requests_do_not_corrupt_the_connection` failed once — the known flake from the
+architecture cleanup, historically about one run in four. It did not reproduce: three runs in
+isolation and four full-suite runs since, all clean. Because it did not recur I could not read which
+of the two kinds the instrumentation classified it as, so this is a sighting, not a diagnosis. It is
+unrelated to anything in this step, which touches the CLI, three documents and test structure.
+
 ## Step 5 — Minting a code stops creating a project
 
 **The problem.** `cmd_enroll` opens `SqliteMemoryStore(database, "bootstrap", create=True)` to force

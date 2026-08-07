@@ -507,24 +507,6 @@ def cmd_install_skills(args: argparse.Namespace) -> int:
 
 
 
-def cmd_migrate(args: argparse.Namespace) -> int:
-    from .sqlite_store import migrate_from_files
-
-    source = Path(args.source).resolve()
-    result = migrate_from_files(args.database, args.project, source)
-    print(f"Imported {result['imported']} memories and {result['labels']} labels "
-          f"into project '{result['project']}' at {result['database']}")
-    for name in result["skipped"]:
-        print(f"skipped (not a memory): {name}", file=sys.stderr)
-    if result["errors"]:
-        for error in result["errors"]:
-            print(f"error: {error}", file=sys.stderr)
-        return 1
-    print(f"The source store at {source} was left untouched.")
-    return 0
-
-
-
 def cmd_backup(args: argparse.Namespace) -> int:
     from .backup import export_json, snapshot_database
 
@@ -696,12 +678,20 @@ def build_parser() -> argparse.ArgumentParser:
     skills_parser.add_argument("--dest", action="append", help="Install into a custom skills directory (repeatable).")
     skills_parser.set_defaults(func=cmd_install_skills)
 
-    migrate_parser = subparsers.add_parser(
-        "migrate", help="Import a file-backed .project-memory store into a SQLite database.")
-    migrate_parser.add_argument("--from", dest="source", required=True, help="Path to a .project-memory directory.")
-    migrate_parser.add_argument("--project", required=True, help="Project id to import into (lowercase kebab-case).")
-    migrate_parser.add_argument("--database", required=True, help="Path to the SQLite database file.")
-    migrate_parser.set_defaults(func=cmd_migrate)
+    # There is no `migrate` subcommand. It imported the pre-0.4.0 `.project-memory`
+    # file layout, and it has raised TypeError on every invocation since schema
+    # v2 gave memories uuids and `_write` required one - so nobody has been able
+    # to use it for many releases, and removing it strands no one.
+    #
+    # The format it read is documented as dead in two other places: the README
+    # calls it "the pre-0.4.0 layout and nothing reads it any more", and the
+    # recall skill tells agents a `.project-memory/` directory is a leftover
+    # they must not read. Keeping a broken importer for a format we instruct
+    # agents to ignore was a claim, not a migration path.
+    #
+    # If such a directory ever does turn up, write the importer then, against
+    # the real thing as a fixture. That is strictly better than shipping an
+    # untested one now on the guess that it might be wanted.
 
     backup_parser = subparsers.add_parser("backup", help="Snapshot or export a database-backed store.")
     backup_parser.add_argument("--database", required=True, help="Path to the SQLite database file.")

@@ -8,7 +8,16 @@ from project_memory_mcp.sqlite_store import SqliteMemoryStore
 from test_validation import make_memory
 
 
-class CliTests(unittest.TestCase):
+class CliCase(unittest.TestCase):
+    """Fixture only, no tests of its own.
+
+    The classes below used to inherit `CliTests` to reuse this setUp, which also
+    inherited its seven tests - so they ran three times over and the file
+    reported 26 tests when it had 12. Nothing was wrong with any of them; the
+    count just meant less than it looked like, which is the failure this whole
+    pass keeps running into.
+    """
+
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
@@ -20,6 +29,8 @@ class CliTests(unittest.TestCase):
         self.addCleanup(store.close)
         return store
 
+
+class CliTests(CliCase):
     def test_init_creates_the_project_and_seeds_labels(self):
         exit_code = main(["init", "--database", str(self.db), "--project", "demo"])
 
@@ -79,11 +90,50 @@ class CliTests(unittest.TestCase):
                 self.assertTrue((self.root / base / "skills" / skill / "SKILL.md").is_file(), f"{base}/{skill}")
 
 
-if __name__ == "__main__":
-    unittest.main()
+class RemovedCommandTests(CliCase):
+    """`migrate` is gone, and nothing points at it any more.
+
+    It imported the pre-0.4.0 `.project-memory` layout and had raised TypeError
+    on every call since schema v2 required a uuid in `_write`. Untested, and
+    recommended by the server's own startup banner. The format is one the README
+    calls dead and the recall skill tells agents not to open, so keeping a
+    broken importer for it was a claim rather than a migration path.
+    """
+
+    def test_migrate_is_not_a_command(self):
+        with self.assertRaises(SystemExit) as raised:
+            main(["migrate", "--from", str(self.root), "--project", "demo",
+                  "--database", str(self.db)])
+        self.assertEqual(2, raised.exception.code, "argparse still accepts `migrate`")
+
+    def test_nothing_in_the_package_still_offers_to_import_a_file_store(self):
+        # Both halves went, not just the subcommand: `migrate_from_files` was a
+        # public name on the store and would have stayed importable and broken.
+        import project_memory_mcp.sqlite_store as store_module
+
+        self.assertFalse(hasattr(store_module, "migrate_from_files"))
+
+    def test_the_startup_banner_names_a_command_that_exists(self):
+        # The banner told anyone with an empty database to run `migrate`, which
+        # could not work. Whatever it names has to be a real subcommand - that
+        # is the property, not the particular word.
+        import re
+        from pathlib import Path as _Path
+
+        from project_memory_mcp import http_server
+
+        source = _Path(http_server.__file__).read_text(encoding="utf-8")
+        banner = [line for line in source.splitlines() if "(none - create one with" in line]
+        self.assertEqual(1, len(banner), "the empty-database banner moved or was duplicated")
+        named = re.search(r"`(\w+)`", banner[0]).group(1)
+
+        with self.assertRaises(SystemExit) as raised:
+            main([named, "--help"])
+        self.assertEqual(0, raised.exception.code,
+                         f"the banner sends people to `{named}`, which argparse does not accept")
 
 
-class DestructiveConfirmationTests(CliTests):
+class DestructiveConfirmationTests(CliCase):
     """`audit --apply` must not act without `--yes`.
 
     The one command in this tool that destroys work on its own. Everything else
@@ -122,3 +172,7 @@ class DestructiveConfirmationTests(CliTests):
                           "--gate", "1:5:0", "--apply", "--yes"])
         self.assertEqual(0, exit_code)
         self.assertIsNotNone(self.archived(store), "--apply --yes did nothing")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -425,10 +425,6 @@ class ReportingTests(AuditCase):
         self.assertIn("0 memories", format_report(report))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class DuplicateTests(AuditCase):
     """Similarity nominates; only an agent decides."""
 
@@ -568,3 +564,7 @@ class GateConfigurationTests(unittest.TestCase):
         policy_loose = AuditPolicy(gates=gates_from(["1:0:0"]))
         self.assertEqual(1000000, policy_strict.gate_for(1).min_queries)
         self.assertEqual(0, policy_loose.gate_for(1).min_queries)
+
+
+if __name__ == "__main__":
+    unittest.main()
