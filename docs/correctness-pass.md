@@ -585,6 +585,38 @@ rejection instead of silence — which is the improvement.
 
 **Done when** the string `related_label_query` does not appear in the package.
 
+### Outcome ✔
+
+Gone from both schemas, the dispatcher, both store signatures, and both return payloads.
+
+```text
+create_memory properties: ['memory', 'uuid', 'visibility']
+update_memory properties: ['id', 'patch']
+additionalProperties:     False   (so a caller still passing it is told, not ignored)
+```
+
+**One hazard worth naming.** The dispatcher called `create_memory` positionally, with the dead
+argument *second*. Removing a positional parameter silently promotes whatever came after it — here
+`visibility` would have slid into its place, and every memory created through the tool would have
+been assigned a visibility of `None`-or-worse from an argument meant for something else. Both calls
+are keyword now, and the comment says why.
+
+**The real fix was the guard, not the deletion.** Nothing tested the tool schemas *at all* — they
+are the agent-facing contract and had no coverage, which is why a parameter could be declared,
+accepted, threaded through two layers, and read nowhere for that long. `test_layering.py` now walks
+`McpServer._call_tool` with `ast`, collects every `args[...]` and `args.get(...)` name, and fails if
+any declared property is not among them. It also requires every tool to refuse undeclared arguments
+and to carry a description.
+
+Clean across all 22 tools today. Verified by reinstating the parameter, which fails with
+`['update_memory.related_label_query']`.
+
+An agent cannot tell a parameter that does nothing from one that does. It writes the call it was
+told to write and gets a plausible empty answer back — which is the failure this whole pass keeps
+finding, in a different costume.
+
+**390 → 393 tests.**
+
 ## Step 9 — A remote can be disabled
 
 **The problem.** `remotes.enabled` is read in six places and written by nothing but the schema

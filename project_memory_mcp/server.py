@@ -273,11 +273,6 @@ TOOLS = [
                 "description": "Internal: set only when publishing an existing memory to another "
                                "server, so one lesson keeps one identity everywhere it lives.",
             },
-            "related_label_query": {
-                "type": ["object", "string", "null"],
-                "additionalProperties": True,
-                "description": "Optional label query used to return likely related candidates after creation.",
-            },
         },
         ["memory"],
     ),
@@ -287,11 +282,6 @@ TOOLS = [
         {
             "id": {"type": "string"},
             "patch": {"type": "object", "additionalProperties": True},
-            "related_label_query": {
-                "type": ["object", "string", "null"],
-                "additionalProperties": True,
-                "description": "Optional label query used to return likely related candidates after update.",
-            },
         },
         ["id", "patch"],
     ),
@@ -447,11 +437,13 @@ class McpServer:
                     max_nodes=args.get("max_nodes", 25),
                 )
             elif name == "create_memory":
+                # Keyword, not positional. This call used to pass a dead
+                # `related_label_query` as its second argument, and removing a
+                # positional parameter silently promotes whatever came after it.
                 payload = self.store.create_memory(
-                    args["memory"], args.get("related_label_query"), args.get("visibility"),
-                    args.get("uuid"))
+                    args["memory"], visibility=args.get("visibility"), uuid=args.get("uuid"))
             elif name == "update_memory":
-                payload = self.store.update_memory(args["id"], args["patch"], args.get("related_label_query"))
+                payload = self.store.update_memory(args["id"], args["patch"])
             elif name == "add_label":
                 payload = self.store.add_label(args["label"], args["description"])
             elif name == "delete_memory":

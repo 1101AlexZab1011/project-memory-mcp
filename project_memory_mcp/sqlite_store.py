@@ -1191,8 +1191,22 @@ class SqliteMemoryStore:
 
     # --------------------------------------------------------------- mutations
 
-    def create_memory(self, memory: dict[str, Any], related_label_query: Any = None,
-                      visibility: str | None = None, uuid: str | None = None) -> dict[str, Any]:
+    def create_memory(self, memory: dict[str, Any], visibility: str | None = None,
+                      uuid: str | None = None) -> dict[str, Any]:
+        """Store a memory and mirror its relationships onto their targets.
+
+        There was a `related_label_query` here, on `update_memory`, on both tool
+        schemas, and in the dispatcher - accepted at every layer and read at
+        none. Both methods returned `related_candidates: []`, hardcoded, while
+        the tool description promised the agent "likely related candidates after
+        creation".
+
+        Removed rather than implemented, because `recall(related_to=...)` already
+        answers that question - better, on demand, and after the agent has seen
+        the memory land. A second, weaker path firing automatically on every
+        write would add a query to the hottest write path to answer something
+        nobody asked at that moment.
+        """
         evidence = memory.setdefault("evidence", {})
         if isinstance(evidence, dict) and not evidence.get("created"):
             evidence["created"] = _now()
@@ -1208,10 +1222,9 @@ class SqliteMemoryStore:
             # from different sources fuse instead of duplicating.
             self._write(memory, uuid or str(uuid_module.uuid4()), visibility=visibility)
             self._synchronize_relationships(memory_id)
-        return {"created": memory_id, "visibility": visibility or "private",
-                "related_candidates": []}
+        return {"created": memory_id, "visibility": visibility or "private"}
 
-    def update_memory(self, memory_id: str, patch: dict[str, Any], related_label_query: Any = None) -> dict[str, Any]:
+    def update_memory(self, memory_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         if "id" in patch and patch["id"] != memory_id:
             raise StoreError("update_memory cannot change a memory id.")
         memory_uuid = self._uuid_for(memory_id)
@@ -1227,7 +1240,7 @@ class SqliteMemoryStore:
             )
             self._write(merged, memory_uuid, visibility=self._visibility_of(memory_uuid))
             self._synchronize_relationships(memory_id)
-        return {"updated": memory_id, "related_candidates": []}
+        return {"updated": memory_id}
 
     def set_root_path(self, root: str | None) -> dict[str, Any]:
         """Tell this project where its code is, so anchors can be checked."""

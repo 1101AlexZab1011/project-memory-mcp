@@ -22,6 +22,7 @@ A rule written in a document gets violated. These fail the build.
 from __future__ import annotations
 
 import ast
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -135,6 +136,71 @@ class ShadowingTests(unittest.TestCase):
                     [], stranded,
                     f"{path.name} defines these below its `if __name__` block, which every "
                     "reader treats as the end of the file. Move the block to the end.")
+
+
+def arguments_the_dispatcher_reads() -> set[str]:
+    """Every `args[...]` and `args.get(...)` name in McpServer._call_tool."""
+    import inspect
+
+    from project_memory_mcp.server import McpServer
+
+    source = textwrap.dedent(inspect.getsource(McpServer._call_tool))
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                and node.value.id == "args" and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)):
+            names.add(node.slice.value)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "args" and node.args
+                and isinstance(node.args[0], ast.Constant)):
+            names.add(node.args[0].value)
+    return names
+
+
+class ToolSurfaceTests(unittest.TestCase):
+    """The tool schemas are a promise to an agent. They have to be true.
+
+    `related_label_query` was declared on `create_memory` and `update_memory`,
+    accepted by the dispatcher, threaded into both store methods - and read
+    nowhere. Both returned a hardcoded `related_candidates: []` while the
+    description promised "likely related candidates after creation".
+
+    Nothing tested the schemas at all, which is why it lasted. An agent cannot
+    tell a parameter that does nothing from one that does; it just writes the
+    call it was told to write and gets a plausible empty answer back.
+    """
+
+    def test_every_declared_argument_is_read_by_the_dispatcher(self):
+        from project_memory_mcp.server import TOOLS
+
+        read = arguments_the_dispatcher_reads()
+        unread = sorted(f"{tool['name']}.{prop}"
+                        for tool in TOOLS
+                        for prop in tool["inputSchema"]["properties"]
+                        if prop not in read)
+        self.assertEqual(
+            [], unread,
+            "these tool arguments are declared to agents and never read. Either use them or "
+            "delete them - an argument that does nothing is worse than a missing one, because "
+            "the caller believes it worked.")
+
+    def test_every_tool_refuses_arguments_it_did_not_declare(self):
+        # What makes deleting one an honest change rather than a silent one: a
+        # caller still passing it gets told, instead of having it ignored.
+        from project_memory_mcp.server import TOOLS
+
+        for tool in TOOLS:
+            with self.subTest(tool=tool["name"]):
+                self.assertFalse(tool["inputSchema"]["additionalProperties"])
+
+    def test_every_tool_has_a_description(self):
+        from project_memory_mcp.server import TOOLS
+
+        for tool in TOOLS:
+            with self.subTest(tool=tool["name"]):
+                self.assertTrue((tool.get("description") or "").strip())
 
 
 class LayeringTests(unittest.TestCase):
