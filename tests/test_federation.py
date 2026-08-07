@@ -353,6 +353,90 @@ class TwoServerTests(TierCase):
             "SELECT COUNT(*) AS n FROM outbox").fetchone()["n"])
 
 
+class OutboxSurvivesItsMemoryTests(TierCase):
+    """A queue entry whose memory is gone must not take the queue with it.
+
+    `delete_memory` cleaned six tables and left `outbox` alone. The row that
+    survived could not be delivered or skipped - its LEFT JOIN gave a null slug,
+    `get_memory(None)` raised, and because it sorted first by id it took every
+    promotion behind it down too, on every run, for good. The Computer swallowed
+    the exception, so federation stopped working and every surface said fine.
+
+    A dead server retries, which is right. A deleted memory is not a delivery
+    that failed; it is one that no longer means anything.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = SqliteMemoryStore(Path(self.tmp.name) / "memory.db", "demo")
+        self.addCleanup(self.store.close)
+        self.store.add_label("area:x", "x")
+        # Black-holed, so nothing here depends on a reachable server: every
+        # assertion is about what the queue does before it reaches the network.
+        federation.add_remote(self.store.connection, "team", "http://127.0.0.1:9/", "team")
+
+    def queue(self, slug, description):
+        self.store.create_memory(memory(slug, description), visibility="public")
+        self.earn(slug)
+        federation.promote(self.store, slug, "team")
+
+    def outbox_count(self):
+        return self.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM outbox WHERE project_id='demo'").fetchone()["n"]
+
+    def test_deleting_a_queued_memory_cancels_its_promotion(self):
+        self.queue("cache-race", CACHE)
+        result = self.store.delete_memory("cache-race", "cache-race")
+        self.assertEqual(1, result["cancelled_promotions"],
+                         "the caller was not told a queued promotion was dropped")
+        self.assertEqual(0, self.outbox_count(), "a deleted memory left a row in the outbox")
+
+    def test_delivery_survives_an_orphan_left_by_an_older_version(self):
+        # The state a database written before the fix is already in. The orphan
+        # is inserted first so it sorts ahead - which is what made one of these
+        # able to block everything behind it.
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO outbox(project_id, memory_id, remote, queued_at) "
+                "VALUES ('demo','11111111-dead-dead-dead-111111111111','team','2026-01-01T00:00:00Z')")
+        self.queue("cache-race", CACHE)
+
+        result = federation.deliver_outbox(self.store)
+
+        self.assertEqual(["11111111-dead-dead-dead-111111111111"],
+                         result["dropped_memory_gone"])
+        # The live promotion behind it is untouched and still due a retry. This
+        # is the assertion that matters: not that the orphan went, but that it
+        # stopped being in front of everything else.
+        remaining = self.store.connection.execute(
+            "SELECT memory_id FROM outbox WHERE project_id='demo'").fetchall()
+        self.assertEqual([self.store._uuid_for("cache-race")],
+                         [r["memory_id"] for r in remaining])
+
+    def test_a_memory_merged_away_is_not_published_afterwards(self):
+        # merge archives the loser rather than deleting it, so its slug survives
+        # and the queued promotion stays technically deliverable. Publishing a
+        # lesson that was just folded into another is not what anyone asked for.
+        self.store.create_memory(memory("keep-note", SHADER), visibility="public")
+        self.queue("fold-note", CACHE)
+        self.store.merge_memories("keep-note", "fold-note", "They say one thing twice.")
+
+        result = federation.deliver_outbox(self.store)
+
+        self.assertEqual(["fold-note"], result["dropped_memory_gone"])
+        self.assertEqual(0, self.outbox_count())
+
+    def test_a_dead_remote_still_gets_retried(self):
+        # The counterweight. Dropping everything undeliverable would satisfy the
+        # tests above and destroy the outbox's whole reason for existing.
+        self.queue("cache-race", CACHE)
+        result = federation.deliver_outbox(self.store)
+        self.assertEqual([], result["sent"])
+        self.assertNotIn("dropped_memory_gone", result)
+        self.assertEqual(1, self.outbox_count(), "a promotion to a sleeping server was discarded")
+
+
 class ToolSurfaceTests(TierCase):
     """recall over the real tool dispatch, local and federated."""
 

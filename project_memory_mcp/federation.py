@@ -348,13 +348,30 @@ def deliver_outbox(store: Any, private_key: Any = None, limit: int = 50,
 
     with _held(db_lock):
         rows = store.connection.execute(
-            "SELECT o.id, o.memory_id, o.remote, m.slug FROM outbox o "
+            "SELECT o.id, o.memory_id, o.remote, m.slug, m.archived_at FROM outbox o "
             "LEFT JOIN memories m ON m.project_id=o.project_id AND m.uuid=o.memory_id "
             "WHERE o.project_id=? ORDER BY o.id LIMIT ?", (store.project, limit)).fetchall()
         by_name = {r.name: r for r in list_remotes(store.connection, enabled_only=True)}
     sent: list[str] = []
     held: list[str] = []
+    dropped: list[str] = []
     for row in rows:
+        # A queue entry whose memory is gone or withdrawn is not a delivery that
+        # failed - it is a delivery that no longer means anything, and retrying
+        # it forever is the wrong answer twice over. `delete_memory` now removes
+        # these on the way out, so this handles the rows already sitting in
+        # databases written before it did, and any future path that removes a
+        # memory without going through it.
+        #
+        # Archived counts as gone. `merge_memories` archives the memory it
+        # folded away rather than deleting it, so its slug survives and the
+        # queued promotion stays technically deliverable - publishing a lesson
+        # that was just merged into another is not what anybody asked for.
+        if row["slug"] is None or row["archived_at"] is not None:
+            dropped.append(row["slug"] or row["memory_id"])
+            with _held(db_lock), store.connection:
+                store.connection.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
+            continue
         remote = by_name.get(row["remote"])
         if remote is None:
             continue
@@ -391,11 +408,17 @@ def deliver_outbox(store: Any, private_key: Any = None, limit: int = 50,
             store.connection.execute(
                 "UPDATE remotes SET last_ok=?, last_error=NULL WHERE name=?",
                 (_now(), row["remote"]))
-    result: dict[str, Any] = {"sent": sent, "still_queued": len(rows) - len(sent)}
+    result: dict[str, Any] = {"sent": sent,
+                              "still_queued": len(rows) - len(sent) - len(dropped)}
     if held:
         # Named separately from a delivery failure: retrying will not help,
         # somebody has to edit the memory.
         result["held_for_secrets"] = held
+    if dropped:
+        # Named separately again, and for the opposite reason: nothing is wrong
+        # and nothing needs doing. It goes in the job log so that a promotion
+        # which quietly stopped existing leaves a trace of why.
+        result["dropped_memory_gone"] = dropped
     return result
 
 

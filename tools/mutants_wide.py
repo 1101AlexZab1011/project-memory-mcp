@@ -150,6 +150,30 @@ MUTANTS = [
      "                rows.append((self.project, uuid, body[\"id\"], body.get(\"status\", \"active\"),\n"
      "                             body.get(\"description\", \"\"), stamp, json.dumps(body), None))"),
 
+    # ------------------------------------------------------------------ outbox
+    ("a deleted memory leaves its promotion queued", "sqlite_store.py",
+     "\"memories_fts\", \"outbox\"):",
+     "\"memories_fts\"):"),
+
+    ("an orphaned queue entry is retried instead of dropped", "federation.py",
+     "        if row[\"slug\"] is None or row[\"archived_at\"] is not None:",
+     "        if False:"),
+
+    # The counterweight to the two above. Dropping everything undeliverable
+    # would satisfy them and destroy the reason the outbox exists.
+    ("a promotion to a sleeping server is thrown away", "federation.py",
+     "        if row[\"slug\"] is None or row[\"archived_at\"] is not None:",
+     "        if True:"),
+
+    ("a memory merged away is still published", "federation.py",
+     "        if row[\"slug\"] is None or row[\"archived_at\"] is not None:",
+     "        if row[\"slug\"] is None:"),
+
+    ("a failing job goes back to being silent", "computer.py",
+     "            print(f\"project-memory-mcp: job {job.kind}/{job.project} failed: {error}\",\n"
+     "                  file=sys.stderr, flush=True)",
+     "            pass"),
+
     ("promotion mints a new identity on the remote", "federation.py",
      "                \"create_memory\", {\"memory\": body, \"visibility\": \"public\",\n"
      "                                  \"uuid\": row[\"memory_id\"]})",

@@ -228,6 +228,48 @@ worker whose failures only reach a log nobody opens is a worker you cannot trust
 **Done when** delete-then-deliver drains cleanly, a pre-existing orphan is dropped rather than
 raising, and a failing job is visible without reading the `jobs` table by hand.
 
+### Outcome ✔
+
+All three paths drain:
+
+```text
+delete a queued memory  -> {'deleted': ..., 'cancelled_promotions': 1}, outbox empty
+a pre-existing orphan   -> dropped; the live promotion behind it survives for its retry
+merged away while queued-> dropped; publishing a lesson just folded into another is nobody's ask
+a sleeping server       -> still queued, untouched
+```
+
+`delete_memory` now removes the memory's outbox rows and reports `cancelled_promotions` when there
+were any — whoever deleted it may not have known it was waiting to go somewhere. `deliver_outbox`
+drops rows whose memory is gone *or archived*, which covers databases written before this and any
+future path that removes a memory without going through `delete_memory`.
+
+Five mutants, all caught, including the counterweight: making the drop condition `if True` — throwing
+away every undeliverable promotion — fails, because a promotion to a sleeping server must still be
+retried. Without that one, "drop things that cannot be delivered" would have been satisfied by
+destroying the outbox's entire reason for existing.
+
+**Deviation from this plan, deliberate.** The step above says to surface failures "in `/api/audit` or
+a sibling endpoint". I did not add an endpoint. Checking first: **`/api/audit` has no UI consumer**,
+`Computer.last_error` is written and never read, and `BackupRunner.last_error` likewise. A fourth
+thing nothing reads would have repeated the exact mistake this pass exists to correct.
+
+`Computer.run_one` now writes failures to **stderr** — every occurrence, not the first only, because
+a job still failing on the hundredth sweep is still broken and a message that stops arriving reads
+as a problem that went away. Successes stay quiet: a sweep across every project every hour would
+drown the log it is meant to be readable in. stderr is the one channel this server has that somebody
+is already watching.
+
+The three unread surfaces go to step 10 as a group. A jobs panel in the UI is a real feature and
+belongs in its own plan, not smuggled into a bug fix.
+
+**One related case found and deliberately left.** A remote that is *removed* while promotions to it
+are queued leaves rows that `deliver_outbox` skips forever — `by_name` only contains enabled remotes,
+so they are neither delivered nor dropped nor reported. Same family, different cause, and it is
+step 9 that owns the remote lifecycle. Noted there.
+
+**355 → 361 tests.**
+
 ## Step 4 — Decide what `migrate` is for
 
 **The problem.** `migrate_from_files` calls `store._write(memory)`; `_write` has required
@@ -383,8 +425,19 @@ Small, but it is the difference between "temporarily unreachable, leave it confi
 and those are different intentions. A remote that is down for a week should not require re-typing
 its token to come back.
 
-**Done when** a disabled remote is skipped by recall and delivery, survives a restart, and can be
-re-enabled without re-entering its credentials.
+**Also here, found during step 3.** A remote *removed* while promotions to it are queued leaves
+outbox rows that can never drain: `deliver_outbox` builds `by_name` from enabled remotes only, so
+those rows are skipped every run — never delivered, never dropped, never reported. Same family as
+the orphan step 3 fixed, different cause, and it belongs with the remote lifecycle rather than with
+memory deletion.
+
+Decide which it is, because they are genuinely different: a **disabled** remote's queue should wait,
+that is what disabling means. A **removed** remote's queue should be dropped with a reason, or
+removal should refuse while work is pending. Dropping is the simpler answer and matches what removal
+already implies about the URL and token.
+
+**Done when** a disabled remote is skipped by recall and delivery, survives a restart, can be
+re-enabled without re-entering its credentials, and removing one leaves nothing undeliverable behind.
 
 ## Step 10 — Dead code sweep
 
@@ -393,6 +446,12 @@ describes itself and one that used to.
 
 - **`server.py:495`** — `if hasattr(store, "flush_usage")`. No store has that method; it is a
   leftover from the file backend. Delete both lines.
+- **Three surfaces nothing reads**, found while looking for somewhere to report a failing job in
+  step 3: `/api/audit` is served and never fetched by `app.js`; `Computer.last_error` and
+  `BackupRunner.last_error` are both assigned and never read. Either give them a reader or delete
+  them. A maintenance panel in the UI would give all three one at once and is the better answer —
+  but it is a feature, so it belongs in its own plan rather than being folded in here. What is *not*
+  acceptable is leaving them as they are, because each one reads like the system is being watched.
 - **`sqlite_store.recent()`** — only tests call it. Production uses `recall(order="recent")`. Delete
   it and move its two assertions onto the path that ships.
 - **`sqlite_store.py:217`** — the comment describing `enrollment_codes` sits above `remotes`, and

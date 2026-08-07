@@ -89,6 +89,38 @@ class QueueTests(ComputerCase):
         # The next job still runs.
         self.assertEqual("ok", computer.run_one(make_job("dedup", "demo"))["outcome"])
 
+    def test_a_failing_job_says_so_where_somebody_will_see_it(self):
+        # Swallowed is right - one broken job must not stop the rest. Silent is
+        # not. A single orphaned outbox row could stop this machine publishing
+        # anything at all, indefinitely, leaving nothing but a row in a table
+        # with no reader: the endpoints that could have shown it (/api/audit,
+        # Computer.last_error) are themselves read by nothing. stderr is the one
+        # channel this server has that somebody is already watching.
+        import contextlib
+        import io
+
+        computer = self.computer()
+        boom = Job(priority=1, key="boom:demo", project="demo", kind="boom",
+                   run=lambda store, guard: (_ for _ in ()).throw(RuntimeError("job exploded")))
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            computer.run_one(boom)
+        logged = captured.getvalue()
+        self.assertIn("boom/demo", logged)
+        self.assertIn("job exploded", logged)
+
+    def test_a_job_that_succeeds_stays_quiet(self):
+        # Failures only. A sweep across every project every hour would drown the
+        # log it is supposed to be readable in, and a message that means nothing
+        # trains its reader to skip the one that does.
+        import contextlib
+        import io
+
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            self.assertEqual("ok", self.computer().run_one(make_job("dedup", "demo"))["outcome"])
+        self.assertEqual("", captured.getvalue())
+
     def test_an_unwritable_job_log_does_not_fail_the_job(self):
         computer = Computer(open_store=self.open_store, database=Path("/nonexistent/dir/x.db"))
         self.assertEqual("ok", computer.run_one(make_job("dedup", "demo"))["outcome"])

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import queue
 import sqlite3
+import sys
 import threading
 import time
 import traceback
@@ -164,6 +165,13 @@ class Computer:
 
         Failures are recorded and swallowed: one broken job must not take the
         worker down and leave every other kind of maintenance unrun.
+
+        Swallowed, but not silent. A job that fails every hour forever used to
+        leave nothing but a row in a table nobody queries - which is how a
+        single orphaned outbox entry could stop this machine publishing anything
+        at all, indefinitely, while every surface reported health. Failures go
+        to stderr, because that is the one channel this server has that somebody
+        is already reading.
         """
         started = _now()
         store = None
@@ -181,6 +189,11 @@ class Computer:
             detail = {"error": str(error), "traceback": traceback.format_exc(limit=3)}
             outcome = "failed"
             self.last_error = f"{job.kind}/{job.project}: {error}"
+            # Every occurrence, not the first only: a job still failing on the
+            # hundredth sweep is still broken, and a message that stops arriving
+            # reads as a problem that went away.
+            print(f"project-memory-mcp: job {job.kind}/{job.project} failed: {error}",
+                  file=sys.stderr, flush=True)
         finally:
             if store is not None and hasattr(store, "close"):
                 try:

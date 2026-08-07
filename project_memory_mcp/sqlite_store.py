@@ -1268,7 +1268,16 @@ class SqliteMemoryStore:
                     rel[field] = [v for v in rel[field] if v != memory_id]
                 self._write(other, other_uuid, visibility=self._visibility_of(other_uuid))
                 touched.append(other["id"])
-            for table in ("memories", "labels", "files", "usage", "memories_fts"):
+            # `outbox` is in this list because a queued promotion outlives the
+            # memory otherwise, and the row that is left cannot be delivered or
+            # skipped: its LEFT JOIN yields a null slug, delivery raises on it,
+            # and because it sorts first it takes every promotion behind it down
+            # with it, on every run, silently. You cannot publish what you just
+            # deleted, so the queue entry goes with the memory.
+            cancelled = self.connection.execute(
+                "SELECT COUNT(*) AS n FROM outbox WHERE project_id=? AND memory_id=?",
+                (self.project, memory_uuid)).fetchone()["n"]
+            for table in ("memories", "labels", "files", "usage", "memories_fts", "outbox"):
                 self.connection.execute(
                     f"DELETE FROM {table} WHERE project_id=? AND "
                     f"{'uuid' if table == 'memories' else 'memory_id'}=?",
@@ -1278,7 +1287,12 @@ class SqliteMemoryStore:
                 "DELETE FROM edges WHERE project_id=? AND (src=? OR dst=?)",
                 (self.project, memory_uuid, memory_uuid),
             )
-        return {"deleted": memory_id, "cleaned_references_in": sorted(set(touched))}
+        result = {"deleted": memory_id, "cleaned_references_in": sorted(set(touched))}
+        if cancelled:
+            # Reported rather than done quietly: whoever deleted this may not
+            # have known it was waiting to be published somewhere.
+            result["cancelled_promotions"] = cancelled
+        return result
 
     # ------------------------------------------------------------------- usage
 
