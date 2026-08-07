@@ -541,7 +541,7 @@ class BorrowedAnchorTests(ComputerCase):
                              "a cached copy was checked against the local working tree")
             self.assertEqual([], result["adrift"])
             row = store.connection.execute(
-                "SELECT status FROM memories WHERE slug='their-lesson'").fetchone()
+                "SELECT status FROM cached_memories WHERE slug='their-lesson'").fetchone()
             self.assertEqual("active", row["status"],
                              "another server's memory was marked stale from here")
         finally:

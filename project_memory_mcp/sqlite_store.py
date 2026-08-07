@@ -15,7 +15,7 @@ import json
 import sqlite3
 import threading
 import uuid as uuid_module
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -23,7 +23,49 @@ from . import usage
 from . import validation
 from .validation import ID_RE, LABEL_RE, LabelExpression
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
+
+#: Copies of other servers' memories, kept so that what you recently read stays
+#: readable when the remote is asleep. Its own table, and that is the whole
+#: point.
+#:
+#: These used to live in `memories` with an `origin_remote` column, which meant
+#: every query had to remember they were there. Almost none did. A borrowed copy
+#: could take a slug a local memory wanted (`create_memory` answered "Memory
+#: already exists" for a name that was free), resolve ahead of a real memory
+#: when both had one, fail `validate_store` for links pointing at things never
+#: cached, get swept by the audit that is documented never to touch it, and -
+#: worst - lose `origin_remote` through a backup round-trip, which silently
+#: turned somebody else's lesson into one this machine owned and could publish.
+#:
+#: Separating them turns every one of those into a structural impossibility
+#: rather than a filter somebody has to remember. The failure mode inverts too:
+#: forget to include this table and a cached memory does not show up, which is
+#: visible and harmless. Forgetting a filter was silent and wrong.
+#:
+#: No unique index on slug. Two remotes may each hold a `cache-race` and both
+#: are legitimate; uuid is identity here as everywhere else.
+CACHED_SCHEMA = """
+CREATE TABLE IF NOT EXISTS cached_memories (
+    project_id    TEXT NOT NULL,
+    uuid          TEXT NOT NULL,
+    slug          TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    description   TEXT NOT NULL,
+    body          TEXT NOT NULL,
+    origin_remote TEXT NOT NULL,
+    -- The remote's own creation time, not ours. Stamping these with the moment
+    -- we cached them put borrowed memories at the top of "what have I learned
+    -- lately", which is the opposite of true.
+    created       TEXT,
+    -- When this copy arrived. The eviction clock, and the only date here that
+    -- is about this machine.
+    cached_at     TEXT NOT NULL,
+    PRIMARY KEY (project_id, uuid)
+);
+CREATE INDEX IF NOT EXISTS cached_age  ON cached_memories(project_id, cached_at);
+CREATE INDEX IF NOT EXISTS cached_slug ON cached_memories(project_id, slug);
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -214,9 +256,6 @@ CREATE TABLE IF NOT EXISTS clients (
 CREATE UNIQUE INDEX IF NOT EXISTS clients_fingerprint ON clients(fingerprint)
     WHERE fingerprint IS NOT NULL;
 
--- Single-use, short-lived, and the only thing that travels over an untrusted
--- channel during enrollment. A code leaked after use is worthless; the real
--- credential never crosses the wire in either direction.
 -- Servers this machine federates with. Local configuration, not shared: two
 -- clients of the same server need not know about each other's other remotes.
 -- Zero rows is the normal case - local-only is the default.
@@ -244,6 +283,9 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(project_id, remote);
 
+-- Single-use, short-lived, and the only thing that travels over an untrusted
+-- channel during enrollment. A code leaked after use is worthless; the real
+-- credential never crosses the wire in either direction.
 CREATE TABLE IF NOT EXISTS enrollment_codes (
     code       TEXT PRIMARY KEY,
     name       TEXT,
@@ -254,7 +296,7 @@ CREATE TABLE IF NOT EXISTS enrollment_codes (
     used_at    TEXT,
     used_by    TEXT
 );
-"""
+""" + CACHED_SCHEMA
 
 # bm25() column weights, in the column order above (the two UNINDEXED columns
 # take a weight too). Mirrors ranking.FIELD_WEIGHTS.
@@ -269,6 +311,13 @@ WALK_SEEDS = 5
 DERIVED_MAX_NEIGHBOURS = 10
 DERIVED_CANDIDATE_LIMIT = 200
 DERIVED_THRESHOLD = 0.34
+
+#: How long a borrowed copy stays useful. The remote owns it and may have
+#: changed it since; past this the copy is more likely to mislead than to help.
+CACHE_TTL_DAYS = 30
+#: And a ceiling regardless of age. This machine is not the place to keep
+#: another server's whole store, however fresh the copies are.
+CACHE_MAX_ROWS = 500
 
 # Lifecycle confidence, mirroring ranking.STATUS_FACTORS.
 _STATUS_FACTORS = {"active": 1.0, "stale": 0.7, "superseded": 0.4, "wrong": 0.2}
@@ -363,6 +412,47 @@ def _upgrade(connection: sqlite3.Connection) -> None:
         _migrate_v5_to_v6(connection)
     if "root_path" not in {r[1] for r in connection.execute("PRAGMA table_info(projects)")}:
         _migrate_v6_to_v7(connection)
+    if "cached_memories" not in {r[0] for r in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}:
+        _migrate_v7_to_v8(connection)
+
+
+def _migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
+    """Move borrowed copies out of `memories` into a table of their own.
+
+    They were distinguished only by a nullable column, which every query had to
+    remember and almost none did - see the note on CACHED_SCHEMA.
+
+    `cached_at` takes the old `created` value, because that is exactly what it
+    held: these rows were stamped with the moment they were cached, not with the
+    remote's own creation time. The remote's `created` is recovered from the
+    stored body, where it was there all along.
+    """
+    connection.executescript(CACHED_SCHEMA)
+    rows = connection.execute(
+        "SELECT project_id, uuid, slug, status, description, body, origin_remote, created "
+        "FROM memories WHERE origin_remote IS NOT NULL").fetchall()
+    moved = []
+    for row in rows:
+        try:
+            evidence = (json.loads(row[5]) or {}).get("evidence") or {}
+        except (ValueError, TypeError):
+            evidence = {}
+        moved.append((row[0], row[1], row[2], row[3], row[4], row[5], row[6],
+                      evidence.get("created") or None, row[7]))
+    connection.executemany(
+        "INSERT OR IGNORE INTO cached_memories(project_id, uuid, slug, status, description, "
+        "body, origin_remote, created, cached_at) VALUES (?,?,?,?,?,?,?,?,?)", moved)
+    connection.execute("DELETE FROM memories WHERE origin_remote IS NOT NULL")
+    # Their usage counters go too. Recall used to record surfacings against
+    # borrowed rows, and those counters fed an audit that has no business
+    # judging a memory this machine does not own.
+    connection.executemany(
+        "DELETE FROM usage WHERE project_id=? AND memory_id=?",
+        [(row[0], row[1]) for row in rows])
+    connection.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+                       (str(SCHEMA_VERSION),))
+    connection.commit()
 
 
 def _migrate_v6_to_v7(connection: sqlite3.Connection) -> None:
@@ -611,8 +701,15 @@ class SqliteMemoryStore:
     # ------------------------------------------------------------------- reads
 
     # The tools, the UI and the memory documents all speak slugs; every table
-    # other than `memories` joins on uuid. These three translate at that seam,
-    # and everything below the seam works in uuid.
+    # other than `memories` joins on uuid. These translate at that seam, and
+    # everything below the seam works in uuid.
+    #
+    # A slug identifies a memory *this machine owns*. It has to: the unique
+    # index says so, and two servers will each coin `shader-compile-stall` for
+    # different lessons. So `_uuid_for` looks only at `memories` - it feeds every
+    # mutation, and nothing addressed by slug may ever resolve to a borrowed
+    # copy. Reads that should find one go through `get_memory`, which falls back
+    # to the cache when no local memory has that name.
 
     def _uuid_for(self, slug: str) -> str:
         row = self.connection.execute(
@@ -627,6 +724,13 @@ class SqliteMemoryStore:
             "SELECT body FROM memories WHERE project_id=? AND uuid=?", (self.project, memory_uuid)
         ).fetchone()
         if row is None:
+            # Recall ranks borrowed copies alongside owned ones, so reading a
+            # body by uuid has to reach both. Owned first: a uuid can only be in
+            # one of the two tables, but the common case is the local one.
+            row = self.connection.execute(
+                "SELECT body FROM cached_memories WHERE project_id=? AND uuid=?",
+                (self.project, memory_uuid)).fetchone()
+        if row is None:
             raise StoreError(f"Unknown memory uuid: {memory_uuid}")
         return json.loads(row["body"])
 
@@ -640,25 +744,46 @@ class SqliteMemoryStore:
         ).fetchall()
         return {row["uuid"]: row["slug"] for row in rows}
 
-    def _live_slugs(self, uuids: Iterable[str]) -> dict[str, str]:
-        """Slugs for the ones still in the working set.
+    def _resultable(self, uuids: Iterable[str]) -> dict[str, tuple[str, str | None]]:
+        """(slug, origin) for the uuids allowed to occupy a result slot.
 
-        The graph walk can reach an archived memory through a live neighbour;
-        leaving it out here is what keeps it from taking a result slot.
+        Owned memories still in the working set, plus borrowed copies. The graph
+        walk can reach an archived memory through a live neighbour, and leaving
+        it out here is what stops it taking a slot.
+
+        Borrowed copies carry the remote's name so results can say where each
+        one came from. A reader who cannot tell your own conclusion from a copy
+        of somebody else's has been given the more confident half of the answer
+        and none of the caveat.
         """
         ids = sorted(set(uuids))
         if not ids:
             return {}
-        rows = self.connection.execute(
+        marks = ",".join("?" * len(ids))
+        found: dict[str, tuple[str, str | None]] = {}
+        for row in self.connection.execute(
             f"SELECT uuid, slug FROM memories WHERE project_id=? AND archived_at IS NULL "
-            f"AND uuid IN ({','.join('?' * len(ids))})", (self.project, *ids),
-        ).fetchall()
-        return {row["uuid"]: row["slug"] for row in rows}
+            f"AND uuid IN ({marks})", (self.project, *ids),
+        ):
+            found[row["uuid"]] = (row["slug"], None)
+        for row in self.connection.execute(
+            f"SELECT uuid, slug, origin_remote FROM cached_memories WHERE project_id=? "
+            f"AND uuid IN ({marks})", (self.project, *ids),
+        ):
+            found.setdefault(row["uuid"], (row["slug"], row["origin_remote"]))
+        return found
 
     def get_memory(self, memory_id: str) -> dict[str, Any]:
         row = self.connection.execute(
             "SELECT body FROM memories WHERE project_id=? AND slug=?", (self.project, memory_id)
         ).fetchone()
+        if row is None:
+            # Fall back to the cache so that a memory recall just showed can be
+            # read in full. Owned first and deliberately: if a local memory and
+            # a borrowed copy share a name, yours is the one you meant.
+            row = self.connection.execute(
+                "SELECT body FROM cached_memories WHERE project_id=? AND slug=? "
+                "ORDER BY cached_at DESC LIMIT 1", (self.project, memory_id)).fetchone()
         if row is None:
             raise StoreError(f"Unknown memory id: {memory_id}")
         return json.loads(row["body"])
@@ -829,12 +954,13 @@ class SqliteMemoryStore:
 
         # Tie-break on the slug, not the uuid: which memories survive the limit
         # must not depend on a random identifier.
-        slugs = self._live_slugs(combined)
-        combined = {k: v for k, v in combined.items() if k in slugs}
+        addressable = self._resultable(combined)
+        combined = {k: v for k, v in combined.items() if k in addressable}
         results: list[dict[str, Any]] = []
         surfaced: list[str] = []
         direct: list[str] = []
-        for memory_id, score in sorted(combined.items(), key=lambda i: (-i[1], slugs.get(i[0], i[0]))):
+        for memory_id, score in sorted(
+                combined.items(), key=lambda i: (-i[1], addressable[i[0]][0])):
             if score <= 0.0:
                 continue
             try:
@@ -846,6 +972,7 @@ class SqliteMemoryStore:
             if not expression.matches(memory.get("labels") or []):
                 continue
             factor = _STATUS_FACTORS.get(memory.get("status", "active"), 1.0)
+            origin = addressable[memory_id][1]
             result = _light_record(memory)
             result["uuid"] = memory_id
             result["score"] = round(score * factor, 6)
@@ -854,15 +981,25 @@ class SqliteMemoryStore:
                 "graph": round(graph_scores.get(memory_id, 0.0), 6),
                 "status_factor": factor,
             }
+            if origin:
+                # Said on every result, not only on a federated one. A reader who
+                # cannot tell your own conclusion from a copy of somebody else's
+                # has the confident half of the answer and none of the caveat.
+                result["origin"] = origin
             if len(results) < full_count:
                 result["memory"] = memory
             results.append(result)
-            surfaced.append(memory_id)
-            # Direct means the memory matched the query itself. Everything else
-            # arrived through a neighbour, and riding a popular neighbour's
-            # traffic is not evidence that this memory is worth keeping.
-            if text_scores.get(memory_id, 0.0) > 0.0:
-                direct.append(memory_id)
+            # Only what this machine owns. Counters feed the audit, the audit
+            # governs retention, and retention is not a decision to make about
+            # another server's memory - it is theirs, and this copy is evictable
+            # on its own clock.
+            if not origin:
+                surfaced.append(memory_id)
+                # Direct means the memory matched the query itself. Everything
+                # else arrived through a neighbour, and riding a popular
+                # neighbour's traffic is not evidence it is worth keeping.
+                if text_scores.get(memory_id, 0.0) > 0.0:
+                    direct.append(memory_id)
             if len(results) >= limit:
                 break
         results.sort(key=lambda r: (-r["score"], r["id"]))
@@ -892,11 +1029,18 @@ class SqliteMemoryStore:
         # Archived memories are excluded here rather than filtered out of the
         # results, so they never consume a candidate slot that a live memory
         # could have used.
+        # Left-joined against both tables rather than inner-joined against one:
+        # a borrowed copy is indexed too, and reaching it here is the entire
+        # reason the cache exists. An inner join to `memories` silently dropped
+        # every cached hit, which is how a cache came to be unreachable by the
+        # only query that would have used it.
         rows = self.connection.execute(
             f"SELECT f.memory_id AS memory_id, -bm25(memories_fts, {weights}) AS score "
-            f"FROM memories_fts f JOIN memories m "
-            f"  ON m.project_id=f.project_id AND m.uuid=f.memory_id "
-            f"WHERE memories_fts MATCH ? AND f.project_id = ? AND m.archived_at IS NULL "
+            f"FROM memories_fts f "
+            f"LEFT JOIN memories m ON m.project_id=f.project_id AND m.uuid=f.memory_id "
+            f"LEFT JOIN cached_memories c ON c.project_id=f.project_id AND c.uuid=f.memory_id "
+            f"WHERE memories_fts MATCH ? AND f.project_id = ? "
+            f"  AND ((m.uuid IS NOT NULL AND m.archived_at IS NULL) OR c.uuid IS NOT NULL) "
             f"ORDER BY score DESC LIMIT ?",
             (match, self.project, limit),
         ).fetchall()
@@ -1181,24 +1325,36 @@ class SqliteMemoryStore:
         accessors because they are always wanted together, and because a caller
         that has to make four calls will eventually make three.
         """
-        memory_uuid = self._uuid_for(memory_id)
         row = self.connection.execute(
-            "SELECT tier, visibility, origin_remote FROM memories "
-            "WHERE project_id=? AND uuid=?", (self.project, memory_uuid)).fetchone()
-        if row is None:
-            raise StoreError(f"Unknown memory: {memory_id}")
-        return {"uuid": memory_uuid, "tier": row["tier"], "visibility": row["visibility"],
-                # A cached copy belongs to the server it came from. Publishing it
-                # onward would make this machine a source for something it only
-                # borrowed.
-                "borrowed": row["origin_remote"] is not None}
+            "SELECT uuid, tier, visibility FROM memories WHERE project_id=? AND slug=?",
+            (self.project, memory_id)).fetchone()
+        if row is not None:
+            return {"uuid": row["uuid"], "tier": row["tier"],
+                    "visibility": row["visibility"], "borrowed": False}
+        # Not ours. A cached copy belongs to the server it came from, and
+        # publishing it onward would make this machine a source for something it
+        # only borrowed - so this reports it rather than saying "unknown", which
+        # would be true of the `memories` table and useless to whoever asked.
+        cached = self.connection.execute(
+            "SELECT uuid FROM cached_memories WHERE project_id=? AND slug=? LIMIT 1",
+            (self.project, memory_id)).fetchone()
+        if cached is not None:
+            return {"uuid": cached["uuid"], "tier": 0, "visibility": "public", "borrowed": True}
+        raise StoreError(f"Unknown memory: {memory_id}")
 
     def cache_remote_results(self, answers: dict[str, Any]) -> None:
         """Keep what came back, tagged with where it came from.
 
         The cache is the working set: whatever has recently been needed stays
-        reachable when a remote is not. Cached rows are never audited and never
-        promoted - this machine does not own them.
+        reachable when a remote is not. That only works if it is *searchable*,
+        which for a long time it was not - these rows were written straight into
+        `memories`, bypassing `_write` and therefore `_index_text`, so they were
+        absent from the one query that would have used them while leaking into
+        the three browse paths that should never have shown them.
+
+        Cached rows are never audited and never promoted: this machine does not
+        own them, which is now a property of where they are stored rather than a
+        filter every caller has to remember.
         """
         rows = []
         stamp = _now()
@@ -1209,17 +1365,59 @@ class SqliteMemoryStore:
                 if not uuid or not body.get("id"):
                     continue
                 rows.append((self.project, uuid, body["id"], body.get("status", "active"),
-                             body.get("description", ""), stamp, json.dumps(body), name))
+                             body.get("description", ""), json.dumps(body), name,
+                             (body.get("evidence") or {}).get("created"), stamp))
         if not rows:
             return
         with self.connection:
             self.connection.executemany(
-                "INSERT INTO memories(project_id, uuid, slug, status, description, created, "
-                "body, origin_remote, visibility) VALUES (?,?,?,?,?,?,?,?,'public') "
+                "INSERT INTO cached_memories(project_id, uuid, slug, status, description, "
+                "body, origin_remote, created, cached_at) VALUES (?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(project_id, uuid) DO UPDATE SET status=excluded.status, "
                 "description=excluded.description, body=excluded.body, "
-                "origin_remote=excluded.origin_remote",
+                "origin_remote=excluded.origin_remote, cached_at=excluded.cached_at",
                 rows)
+            # The whole reason for keeping them. Indexed here rather than in
+            # `_write`, which is for memories this machine owns and does far
+            # more than a cache needs.
+            for row in rows:
+                self._index_text(json.loads(row[5]), row[1])
+
+    def evict_cache(self, older_than_days: int = CACHE_TTL_DAYS,
+                    keep_most_recent: int = CACHE_MAX_ROWS) -> dict[str, Any]:
+        """Drop cached copies that are stale or simply too many.
+
+        A cache with no eviction is not a cache, it is a leak: every federated
+        recall added rows and nothing ever removed one.
+
+        Two bounds because they answer different questions. Age says a copy is
+        probably wrong by now - the remote owns it and has had a month to change
+        it. Count says this machine is not the place to keep somebody else's
+        whole store, however fresh.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(0, older_than_days))
+                  ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.connection:
+            stale = self.connection.execute(
+                "SELECT uuid FROM cached_memories WHERE project_id=? AND cached_at < ?",
+                (self.project, cutoff)).fetchall()
+            surplus = self.connection.execute(
+                "SELECT uuid FROM cached_memories WHERE project_id=? "
+                "ORDER BY cached_at DESC LIMIT -1 OFFSET ?",
+                (self.project, max(0, keep_most_recent))).fetchall()
+            doomed = sorted({row["uuid"] for row in stale} | {row["uuid"] for row in surplus})
+            for chunk in (doomed[i:i + 400] for i in range(0, len(doomed), 400)):
+                marks = ",".join("?" * len(chunk))
+                self.connection.execute(
+                    f"DELETE FROM cached_memories WHERE project_id=? AND uuid IN ({marks})",
+                    (self.project, *chunk))
+                self.connection.execute(
+                    f"DELETE FROM memories_fts WHERE project_id=? AND memory_id IN ({marks})",
+                    (self.project, *chunk))
+        remaining = self.connection.execute(
+            "SELECT COUNT(*) AS n FROM cached_memories WHERE project_id=?",
+            (self.project,)).fetchone()["n"]
+        return {"evicted": len(doomed), "remaining": remaining}
 
     def merge_memories(self, keep_id: str, merge_id: str, reason: str) -> dict[str, Any]:
         """Fold one memory into another, keeping everything both knew.

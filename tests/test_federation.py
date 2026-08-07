@@ -260,9 +260,39 @@ class TwoServerTests(TierCase):
     def test_what_came_back_is_cached_and_marked_as_borrowed(self):
         federation.recall_across(self.store, "packaging fails editor open", limit=5)
         row = self.store.connection.execute(
-            "SELECT origin_remote, visibility FROM memories WHERE slug='packaging-editor-open'"
+            "SELECT origin_remote FROM cached_memories WHERE slug='packaging-editor-open'"
         ).fetchone()
         self.assertEqual("team", row["origin_remote"])
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM memories WHERE slug='packaging-editor-open'").fetchone(),
+            "a borrowed copy was written into the table of memories this machine owns")
+
+    def test_a_cached_memory_is_findable_offline_and_says_where_it_came_from(self):
+        # The entire point of caching. This used to fail: cached rows bypassed
+        # _index_text, so they were absent from the one query that would have
+        # used them - the cache was write-only for its stated purpose.
+        federation.recall_across(self.store, "packaging fails editor open", limit=5)
+
+        # No remotes consulted; a purely local recall, as if the server were now
+        # unreachable.
+        found = self.store.recall("packaging editor open", limit=5, record=False)
+        borrowed = [m for m in found["memories"] if m["id"] == "packaging-editor-open"]
+        self.assertEqual(1, len(borrowed), "a cached memory was not findable by local recall")
+        self.assertEqual("team", borrowed[0]["origin"],
+                         "a borrowed result did not say which server it came from")
+
+    def test_a_cached_memory_does_not_age_this_machine_s_counters(self):
+        # Counters feed the audit and the audit governs retention, which is not
+        # a decision to make about a memory this machine does not own.
+        federation.recall_across(self.store, "packaging fails editor open", limit=5)
+        self.store.recall("packaging editor open", limit=5)
+        cached_uuid = self.store.connection.execute(
+            "SELECT uuid FROM cached_memories WHERE slug='packaging-editor-open'").fetchone()["uuid"]
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM usage WHERE memory_id=?", (cached_uuid,)).fetchone(),
+            "surfacing a borrowed copy recorded usage against it")
 
     def test_a_cached_copy_is_not_this_machine_s_to_publish(self):
         federation.recall_across(self.store, "packaging fails editor open", limit=5)
@@ -274,11 +304,33 @@ class TwoServerTests(TierCase):
         # The unique-slug rule covers memories this machine owns, not borrowed
         # copies - otherwise caching would fail the moment two servers happened
         # to name a lesson the same way.
+        #
+        # This test used to assert the *arrangement* - two rows in `memories`,
+        # one with origin_remote set - and passed while the property was broken
+        # in the other order. See the test below.
         self.store.create_memory(memory("packaging-editor-open", "A different local lesson entirely."))
         federation.recall_across(self.store, "packaging fails editor open", limit=5)
-        rows = self.store.connection.execute(
-            "SELECT origin_remote FROM memories WHERE slug='packaging-editor-open'").fetchall()
-        self.assertEqual({None, "team"}, {row["origin_remote"] for row in rows})
+
+        self.assertIn("A different local lesson", self.store.get_memory(
+            "packaging-editor-open")["description"], "a borrowed copy answered to a local name")
+        self.assertEqual(1, self.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM cached_memories WHERE slug='packaging-editor-open'"
+        ).fetchone()["n"], "the borrowed copy was dropped instead of kept alongside")
+
+    def test_caching_a_name_first_does_not_reserve_it(self):
+        # The order the old test did not try, and the one that was broken:
+        # consult a remote, then write your own lesson about what you learned.
+        # `create_memory` checked every row with that slug, so it answered
+        # "Memory already exists" for a name that was free.
+        federation.recall_across(self.store, "packaging fails editor open", limit=5)
+
+        self.store.create_memory(
+            memory("packaging-editor-open", "What we concluded ourselves about packaging."))
+
+        self.assertIn("What we concluded ourselves", self.store.get_memory(
+            "packaging-editor-open")["description"])
+        # And it is a real, editable, promotable memory of this machine's.
+        self.assertFalse(self.store.publication_state("packaging-editor-open")["borrowed"])
 
     def test_promotion_publishes_to_the_named_remote(self):
         self.store.create_memory(memory("cache-race", CACHE), visibility="public")
@@ -494,6 +546,144 @@ class ToolSurfaceTests(TierCase):
         thread.join(timeout=10)
         self.assertEqual([True], seen,
                          "the project lock was held while waiting on a remote")
+
+
+class BorrowedStaysBorrowedTests(unittest.TestCase):
+    """Cached copies are not this machine's memories, structurally.
+
+    They used to sit in `memories` behind a nullable `origin_remote`, which
+    every query had to remember and almost none did. What that cost, all of it
+    found by walking the paths rather than by any failing test:
+
+    - `create_memory` refused a slug that was free locally, because its
+      existence check saw borrowed rows too. Consult a remote, lose the name.
+    - `validate_store` reported dangling links for cached memories pointing at
+      things this machine never cached.
+    - the audit swept them, against a schema comment promising it never would.
+    - a backup round-trip dropped `origin_remote`, quietly turning somebody
+      else's lesson into one this machine owned - and could publish onward.
+
+    A separate table makes each of those impossible rather than filtered.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = SqliteMemoryStore(Path(self.tmp.name) / "memory.db", "demo")
+        self.addCleanup(self.store.close)
+        self.store.add_label("area:x", "x")
+        self.store.create_memory(memory("local-note", "Our own lesson about shader stalls here"))
+
+    def cache(self, slug, description, related=None, uuid="99999999-9999-9999-9999-999999999999"):
+        body = memory(slug, description)
+        if related:
+            body["relationships"]["related"] = [{"id": r, "reason": "They share a subsystem."}
+                                                for r in related]
+        self.store.cache_remote_results({"upstream": {"memories": [{"uuid": uuid, "memory": body}]}})
+        return body
+
+    def test_a_borrowed_name_does_not_reserve_a_local_one(self):
+        self.cache("their-note", "Their lesson about the very same subsystem")
+        self.store.create_memory(memory("their-note", "What we concluded ourselves about it"))
+        self.assertIn("What we concluded ourselves",
+                      self.store.get_memory("their-note")["description"])
+
+    def test_our_own_memory_wins_a_name_it_shares_with_a_copy(self):
+        self.cache("local-note", "Their unrelated lesson that happens to share a name")
+        self.assertIn("Our own lesson", self.store.get_memory("local-note")["description"])
+        self.assertFalse(self.store.publication_state("local-note")["borrowed"])
+
+    def test_a_borrowed_copy_can_still_be_read_by_name(self):
+        # It has to be: recall shows them, and a reader needs the whole thing.
+        self.cache("their-note", "Their lesson, which we should be able to read in full")
+        self.assertIn("read in full", self.store.get_memory("their-note")["description"])
+
+    def test_a_borrowed_link_to_something_uncached_is_not_our_error(self):
+        self.cache("their-note", "Their lesson linking to one we never cached",
+                   related=["never-cached-here"])
+        self.assertEqual([], self.store.validate_store())
+
+    def test_the_audit_does_not_examine_borrowed_copies(self):
+        from project_memory_mcp import audit
+
+        self.cache("their-note", "Their lesson, which this machine must not retire")
+        _queries, rows = audit._collect(self.store)
+        self.assertEqual(["local-note"], sorted(r["slug"] for r in rows))
+
+    def test_a_backup_round_trip_cannot_claim_a_borrowed_copy(self):
+        from project_memory_mcp import backup
+
+        self.cache("their-note", "Their lesson, which a restore must not adopt")
+        out = Path(self.tmp.name) / "export.json"
+        backup.export_json(self.store.path, out)
+        backup.import_json(Path(self.tmp.name) / "restored.db", out)
+
+        restored = SqliteMemoryStore(Path(self.tmp.name) / "restored.db", "demo", create=False)
+        self.addCleanup(restored.close)
+        self.assertEqual(
+            ["local-note"],
+            sorted(r["slug"] for r in restored.connection.execute("SELECT slug FROM memories")),
+            "a restore adopted another server's memory as this machine's own")
+
+    def test_the_cache_is_bounded_by_age_and_by_count(self):
+        for i in range(6):
+            self.cache(f"their-note-{i}", f"Their lesson number {i} about shader stalls",
+                       uuid=f"0000{i:04d}-0000-0000-0000-000000000000")
+        with self.store.connection:
+            self.store.connection.execute(
+                "UPDATE cached_memories SET cached_at='2020-01-01T00:00:00Z' "
+                "WHERE slug IN ('their-note-0','their-note-1')")
+
+        self.assertEqual(2, self.store.evict_cache(older_than_days=30,
+                                                   keep_most_recent=500)["evicted"])
+        self.assertEqual(3, self.store.evict_cache(older_than_days=30,
+                                                   keep_most_recent=1)["evicted"])
+        self.assertEqual(1, self.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM cached_memories").fetchone()["n"])
+
+    def test_an_evicted_copy_stops_being_searchable(self):
+        self.cache("their-note", "Their lesson about shader stalls on the build farm")
+        self.assertTrue(any(m["id"] == "their-note" for m in
+                            self.store.recall("build farm", record=False)["memories"]))
+
+        self.store.evict_cache(older_than_days=30, keep_most_recent=0)
+
+        self.assertFalse(any(m["id"] == "their-note" for m in
+                             self.store.recall("build farm", record=False)["memories"]))
+
+    def test_eviction_takes_the_search_index_row_with_the_body(self):
+        # Asserted directly on the index, because the behavioural check above
+        # cannot see this: recall reads each candidate's body and skips the ones
+        # it cannot find, so a dangling FTS row produces no visible wrong answer.
+        # It is still a leak - the index would grow forever, eviction being the
+        # only thing that ever removes from it - and it wastes candidate slots,
+        # which are capped, so enough of them push real memories out of range.
+        #
+        # Found by mutation: deleting the FTS cleanup left the test above green.
+        self.cache("their-note", "Their lesson about shader stalls on the build farm")
+        cached_uuid = self.store.connection.execute(
+            "SELECT uuid FROM cached_memories WHERE slug='their-note'").fetchone()["uuid"]
+        self.assertIsNotNone(self.store.connection.execute(
+            "SELECT 1 FROM memories_fts WHERE memory_id=?", (cached_uuid,)).fetchone())
+
+        self.store.evict_cache(older_than_days=30, keep_most_recent=0)
+
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM memories_fts WHERE memory_id=?", (cached_uuid,)).fetchone(),
+            "eviction left the search index pointing at a body it had deleted")
+        self.assertIsNotNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM memories_fts WHERE memory_id=?",
+                (self.store._uuid_for("local-note"),)).fetchone(),
+            "eviction removed our own memory from the index")
+
+    def test_our_own_memories_survive_an_eviction(self):
+        # The counterweight. Evicting everything would satisfy the two above.
+        self.cache("their-note", "Their lesson about shader stalls on the build farm")
+        self.store.evict_cache(older_than_days=0, keep_most_recent=0)
+        self.assertIn("Our own lesson", self.store.get_memory("local-note")["description"])
+        self.assertEqual(1, self.store.count())
 
 
 class LayeringGuardTests(unittest.TestCase):

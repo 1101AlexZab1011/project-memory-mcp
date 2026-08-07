@@ -368,17 +368,37 @@ def rebase_job(store: Any, guard: Any, mark_stale: bool = False) -> dict[str, An
         return check_anchors(store, mark_stale=mark_stale)
 
 
+def evict_job(store: Any, guard: Any, older_than_days: int | None = None,
+              keep_most_recent: int | None = None) -> dict[str, Any]:
+    """Drop borrowed copies that have gone stale, or that there are too many of.
+
+    A cache with no eviction is not a cache, it is a leak: every federated
+    recall added rows and nothing ever removed one.
+
+    Cheap and bounded - two indexed deletes - so it is not sliced. If a store
+    ever accumulates enough cached rows for this to be felt, the eviction bound
+    is already doing the wrong thing.
+    """
+    from .sqlite_store import CACHE_MAX_ROWS, CACHE_TTL_DAYS
+
+    with guard:
+        return store.evict_cache(
+            older_than_days=CACHE_TTL_DAYS if older_than_days is None else older_than_days,
+            keep_most_recent=CACHE_MAX_ROWS if keep_most_recent is None else keep_most_recent)
+
+
 JOB_KINDS: dict[str, Callable[..., dict[str, Any]]] = {
     "audit": audit_job,
     "outbox": outbox_job,
     "dedup": dedup_job,
     "reindex": reindex_job,
     "rebase": rebase_job,
+    "evict": evict_job,
 }
 
 #: Lower runs first. Delivering queued work beats tidying, because somebody is
 #: waiting on the far end of a promotion and nobody is waiting on a sweep.
-PRIORITIES = {"outbox": 10, "rebase": 20, "audit": 30, "reindex": 40, "dedup": 50}
+PRIORITIES = {"outbox": 10, "rebase": 20, "audit": 30, "evict": 35, "reindex": 40, "dedup": 50}
 
 
 def make_job(kind: str, project: str, **kwargs: Any) -> Job:
@@ -410,7 +430,7 @@ class Scheduler:
 
     def __init__(self, computer: Computer, projects: Callable[[], list[str]],
                  interval_seconds: int = 3600,
-                 kinds: tuple[str, ...] = ("outbox", "rebase", "audit", "dedup")) -> None:
+                 kinds: tuple[str, ...] = ("outbox", "rebase", "audit", "evict", "dedup")) -> None:
         self.computer = computer
         self.projects = projects
         self.interval = max(60, int(interval_seconds))

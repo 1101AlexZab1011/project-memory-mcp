@@ -150,6 +150,56 @@ MUTANTS = [
      "                rows.append((self.project, uuid, body[\"id\"], body.get(\"status\", \"active\"),\n"
      "                             body.get(\"description\", \"\"), stamp, json.dumps(body), None))"),
 
+    # ------------------------------------------------------------------- cache
+    # Borrowed copies live in their own table so that "this machine does not own
+    # them" is structural rather than a filter every query has to remember.
+    ("cached copies go back into the memories table", "sqlite_store.py",
+     "                \"INSERT INTO cached_memories(project_id, uuid, slug, status, description, \"",
+     "                \"INSERT INTO memories(project_id, uuid, slug, status, description, \""),
+
+    ("a cached copy is never indexed, so nothing can find it", "sqlite_store.py",
+     "            for row in rows:\n                self._index_text(json.loads(row[5]), row[1])",
+     "            pass"),
+
+    ("recall stops reaching the cache", "sqlite_store.py",
+     "            f\"  AND ((m.uuid IS NOT NULL AND m.archived_at IS NULL) OR c.uuid IS NOT NULL) \"",
+     "            f\"  AND m.uuid IS NOT NULL AND m.archived_at IS NULL \""),
+
+    ("a borrowed result stops saying where it came from", "sqlite_store.py",
+     "            if origin:\n                # Said on every result",
+     "            if False:\n                # Said on every result"),
+
+    ("surfacing a borrowed copy ages it like one of ours", "sqlite_store.py",
+     "            if not origin:\n                surfaced.append(memory_id)",
+     "            if True:\n                surfaced.append(memory_id)"),
+
+    ("get_memory prefers a borrowed copy over our own", "sqlite_store.py",
+     "        row = self.connection.execute(\n"
+     "            \"SELECT body FROM memories WHERE project_id=? AND slug=?\", (self.project, memory_id)\n"
+     "        ).fetchone()\n        if row is None:",
+     "        row = None\n        if row is None:"),
+
+    ("the cache grows without bound", "sqlite_store.py",
+     "            doomed = sorted({row[\"uuid\"] for row in stale} | {row[\"uuid\"] for row in surplus})",
+     "            doomed = []"),
+
+    # The counterweight: evicting everything would satisfy the bound tests and
+    # make the cache useless.
+    ("eviction takes the whole cache every time", "sqlite_store.py",
+     "            doomed = sorted({row[\"uuid\"] for row in stale} | {row[\"uuid\"] for row in surplus})",
+     "            doomed = sorted(row[\"uuid\"] for row in self.connection.execute("
+     "\"SELECT uuid FROM cached_memories WHERE project_id=?\", (self.project,)))"),
+
+    ("an evicted copy stays in the search index", "sqlite_store.py",
+     "                self.connection.execute(\n"
+     "                    f\"DELETE FROM memories_fts WHERE project_id=? AND memory_id IN ({marks})\",\n"
+     "                    (self.project, *chunk))",
+     "                pass"),
+
+    ("the v8 migration leaves borrowed rows where they were", "sqlite_store.py",
+     "    connection.execute(\"DELETE FROM memories WHERE origin_remote IS NOT NULL\")",
+     "    pass"),
+
     # ------------------------------------------------------------------- setup
     # `ensure_schema` exists so the server-wide tables can be created without
     # inventing a project. If it stops creating them, a server on an empty

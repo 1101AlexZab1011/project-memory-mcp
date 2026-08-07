@@ -452,6 +452,56 @@ in exchange for nothing.
 **Done when** cached memories are either reachable by `recall` and absent from local browse and
 bounded in number, or gone.
 
+### Outcome ✔ — finished, in a different shape than planned
+
+**This step was ten problems, not five, and the five new ones changed the design.** Walking the
+paths rather than reading the code turned up:
+
+| | |
+|---|---|
+| `create_memory` refused a slug that was free locally | its existence check saw borrowed rows. Consult a remote, lose the name |
+| `_uuid_for` / `get_memory` resolved ambiguously | no `ORDER BY`, no origin filter — which row won was unspecified |
+| `validate_store` reported errors that were not ours | a cached memory's links point at things never cached |
+| the audit swept borrowed rows | against a schema comment promising it never would |
+| **a backup round-trip dropped `origin_remote`** | silently turning somebody else's lesson into one this machine owned, and could publish onward |
+
+All ten had one cause: borrowed copies sat in `memories` behind a nullable column that every query
+had to remember, and almost none did. **So the plan's "Not doing: no second table" was wrong**, and
+wrong for a reason it could not have known when written — it assumed one table meant one set of
+query paths, and one table had in fact produced ten divergent ones, five of them incorrect.
+
+Cached copies now live in `cached_memories` (schema v8, with a migration that moves existing rows,
+recovers the remote's real `created` from the stored body, and drops the usage counters recorded
+against them). Every one of those five became structurally impossible rather than filtered. The
+three places that *do* have to reach both tables — `text_candidates`, `_body_by_uuid`, `get_memory` —
+are the whole cost, and their failure mode is inverted: forget one and a cached memory does not show
+up, which is visible and harmless.
+
+The original five, all fixed as specified: cached rows are indexed at write so `recall` finds them
+offline; they keep the remote's own `created`; results carry `origin`; they are gone from `recent`,
+`search_memories` and the timeline; and an `evict` job bounds them by age (30 days) and count (500).
+Surfacing a borrowed copy no longer records usage — counters feed the audit, and retention is not
+this machine's decision to make about another server's memory.
+
+**Ten mutants, all caught, including two counterweights** — eviction that takes the whole cache, and
+a `get_memory` that prefers a borrowed copy — because "drop what is not ours" is satisfiable by
+dropping everything.
+
+**Two tests were asserting the arrangement rather than the property.**
+`test_a_cached_slug_does_not_collide_with_a_local_one` checked that two rows coexisted in `memories`
+with different `origin_remote` values. It passed for the whole life of the bug because it created
+the local memory *first*. Reverse the order — consult a remote, then write your own lesson, which is
+the ordinary sequence — and `create_memory` raised. Both orders are now tested, by behaviour.
+
+**One mutant survived the first pass**, and the reason is worth keeping. Deleting the FTS cleanup
+from `evict_cache` left `test_an_evicted_copy_stops_being_searchable` green, because `recall` reads
+each candidate's body and skips what it cannot find — a dangling index row produces no visible wrong
+answer. The harm is real but invisible: the index grows forever, and candidate slots are capped, so
+enough stale rows push real memories out of range. Now asserted directly on the index, with a note
+saying why the behavioural check cannot see it.
+
+**362 → 380 tests.**
+
 ## Step 7 — Wire outbound signing
 
 **The problem.** `private_key` is a parameter on `RemoteClient`, `deliver_outbox` and
@@ -600,8 +650,12 @@ Do it when the correctness work is done.
 
 ## Not doing
 
-- **No second table for cached remote memories.** One schema, one set of query paths. If step 6
-  chooses (a), an indexed column is enough to separate them.
+- ~~**No second table for cached remote memories.** One schema, one set of query paths. If step 6
+  chooses (a), an indexed column is enough to separate them.~~ **Overturned by step 6.** The
+  assumption was that one table means one set of query paths. It did not: one table produced ten
+  divergent paths, five of them wrong, including a backup round-trip that laundered other servers'
+  memories into this machine's own. An indexed column separates rows only for queries that remember
+  to ask. See the outcome above.
 - **No role enforcement over HTTP.** The `role` column stays recorded and unenforced. The privileged
   operations are CLI commands, gated by having an account on the machine holding the database, which
   is stronger than a column. Adding a role check to the UI would imply a permission model that does

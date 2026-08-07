@@ -438,7 +438,7 @@ def cmd_compute(args: argparse.Namespace) -> int:
 
     computer.start()
     scheduler = Scheduler(computer, lambda: projects, interval_seconds=args.interval,
-                          kinds=tuple(args.kind) if args.kind else ("outbox", "rebase", "audit", "dedup"))
+                          kinds=tuple(args.kind) if args.kind else ("outbox", "rebase", "audit", "evict", "dedup"))
     scheduler.start()
     print(f"project-memory-mcp computer: {len(projects)} project(s), every {scheduler.interval}s",
           file=sys.stderr)
@@ -650,7 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
     compute_parser.add_argument("--database", required=True, help="Path to the SQLite database.")
     compute_parser.add_argument("--project", default=None, help="One project (default: all).")
     compute_parser.add_argument("--kind", action="append", default=None,
-                                choices=("audit", "outbox", "dedup", "reindex", "rebase"),
+                                choices=("audit", "outbox", "dedup", "reindex", "rebase", "evict"),
                                 help="Run only this job kind. Repeatable.")
     compute_parser.add_argument("--interval", type=int, default=3600,
                                 help="Seconds between sweeps (default: 3600).")

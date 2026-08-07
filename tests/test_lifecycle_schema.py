@@ -6,6 +6,7 @@ that they store something. Each test states the meaning it is protecting.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -381,6 +382,84 @@ class MigrationTests(unittest.TestCase):
         tables = {r[0] for r in store.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertNotIn("memories_v1", tables)
         self.assertNotIn("usage_v1", tables)
+
+
+class BorrowedRowMigrationTests(unittest.TestCase):
+    """v7 kept borrowed copies in `memories`; v8 moves them out.
+
+    Every store that has ever run a federated recall has rows to move, so this
+    is the part of the change that touches real data rather than new writes.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "memory.db"
+        store = SqliteMemoryStore(self.db, "demo")
+        store.add_label("area:x", "x")
+        store.create_memory(memory("local-note", CACHE, ["area:x"]))
+        # Forge the v7 arrangement: a borrowed row inside `memories`, stamped
+        # with the cache time rather than the remote's, plus usage recorded
+        # against it - all three exactly as the old code left them.
+        body = memory("their-note", SHADER, ["area:x"])
+        body["evidence"]["created"] = "2019-03-04T05:06:07Z"
+        with store.connection:
+            store.connection.execute(
+                "INSERT INTO memories(project_id, uuid, slug, status, description, created, "
+                "body, origin_remote, visibility) VALUES ('demo','borrowed-uuid','their-note',"
+                "'active',?, '2026-08-01T00:00:00Z', ?, 'team', 'public')",
+                (SHADER, json.dumps(body)))
+            store.connection.execute(
+                "INSERT INTO usage(project_id, memory_id, replica_id, surfaced) "
+                "VALUES ('demo','borrowed-uuid','someone',4)")
+            store.connection.execute("DROP TABLE cached_memories")
+            store.connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version','7')")
+        store.close()
+
+    def reopened(self):
+        store = SqliteMemoryStore(self.db, "demo", create=False)
+        self.addCleanup(store.close)
+        return store
+
+    def test_the_borrowed_row_moves_out_of_memories(self):
+        store = self.reopened()
+        self.assertEqual(
+            ["local-note"],
+            [r["slug"] for r in store.connection.execute(
+                "SELECT slug FROM memories WHERE project_id='demo' ORDER BY slug")])
+        self.assertEqual(
+            [("their-note", "team")],
+            [(r["slug"], r["origin_remote"]) for r in store.connection.execute(
+                "SELECT slug, origin_remote FROM cached_memories WHERE project_id='demo'")])
+
+    def test_the_remotes_own_creation_date_is_recovered_from_the_body(self):
+        # v7 stamped `created` with the moment of caching, which put borrowed
+        # memories at the top of "what have I learned lately". The real date was
+        # in the stored body the whole time.
+        row = self.reopened().connection.execute(
+            "SELECT created, cached_at FROM cached_memories WHERE slug='their-note'").fetchone()
+        self.assertEqual("2019-03-04T05:06:07Z", row["created"])
+        self.assertEqual("2026-08-01T00:00:00Z", row["cached_at"],
+                         "the old `created` should become the eviction clock, which is what it was")
+
+    def test_counters_recorded_against_a_borrowed_row_are_dropped(self):
+        # They fed an audit that has no business judging another server's
+        # memory, and after the move they would reference nothing.
+        self.assertIsNone(self.reopened().connection.execute(
+            "SELECT 1 FROM usage WHERE memory_id='borrowed-uuid'").fetchone())
+
+    def test_the_local_memory_is_untouched(self):
+        store = self.reopened()
+        self.assertEqual(CACHE, store.get_memory("local-note")["description"])
+        self.assertEqual([], store.validate_store())
+
+    def test_migrating_twice_is_not_a_problem(self):
+        self.reopened()
+        again = SqliteMemoryStore(self.db, "demo", create=False)
+        self.addCleanup(again.close)
+        self.assertEqual(1, again.connection.execute(
+            "SELECT COUNT(*) AS n FROM cached_memories").fetchone()["n"])
 
 
 class ReplicaCounterTests(unittest.TestCase):
