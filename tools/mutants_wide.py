@@ -185,6 +185,21 @@ MUTANTS = [
      "            self._narrowing = set(all_labels) or set(any_labels) or None",
      "            self._narrowing = set(all_labels) or set(any_labels) or set(not_labels) or None"),
 
+    # ------------------------------------------------------------------ backup
+    # An export carries where each memory stands, not only what it says. Losing
+    # that undoes the audit's curation on every restore, silently.
+    ("an export forgets where each memory stands", "backup.py",
+     "\"usage\": usage, \"state\": state}",
+     "\"usage\": usage}"),
+
+    ("a restore ignores the standing it was given", "backup.py",
+     "                    if standing:",
+     "                    if False:"),
+
+    ("a restore forgets who a memory was for", "backup.py",
+     "                                 visibility=standing.get(\"visibility\"))",
+     "                                 visibility=None)"),
+
     # --------------------------------------------------------------- reporting
     ("a failing backup goes back to being silent", "backup.py",
      "            print(f\"project-memory-mcp: BACKUP FAILED to {self.destination}: {exc}\",\n"

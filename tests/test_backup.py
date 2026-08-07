@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from project_memory_mcp import backup
 from project_memory_mcp.backup import (
     BackupScheduler,
     export_json,
@@ -198,6 +199,98 @@ class BackupFailureIsLoudTests(unittest.TestCase):
         scheduler.database = self.db  # whatever was wrong is fixed
         self.assertIsNone(self.run_once(scheduler)[0])
         self.assertIsNone(scheduler.last_error, "a stale error survived a successful run")
+
+
+class ExportCarriesStandingTests(unittest.TestCase):
+    """An export has to carry where a memory stands, not only what it says.
+
+    Tier, archive state and visibility live in columns rather than in the memory
+    body, so exporting the bodies alone dropped them. A restore therefore
+    un-archived everything the audit had retired, reset every tier to 1, and
+    turned every public memory private - undoing months of curation, and one
+    judgment about audience that no statistic can make again.
+
+    Found by the federation simulation, three simulated years in, when memories
+    the audit had archived came back alive through a backup round trip. Every
+    unit test here passed throughout.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.db = self.root / "memory.db"
+        store = SqliteMemoryStore(self.db, "demo")
+        store.add_label("area:x", "x")
+        store.create_memory(memory("proven-note", "A lesson that earned its way to tier three",
+                                   ["area:x"]), visibility="public")
+        store.create_memory(memory("retired-note", "A lesson the audit archived for being quiet",
+                                   ["area:x"]))
+        store.archive_memory("retired-note")
+        store.connection.execute(
+            "UPDATE memories SET tier=3, tier_since='2024-01-01T00:00:00Z', tier_since_query=400 "
+            "WHERE slug='proven-note'")
+        store.connection.commit()
+        store.close()
+
+    def round_trip(self):
+        export = self.root / "export.json"
+        backup.export_json(self.db, export)
+        backup.import_json(self.root / "restored.db", export)
+        restored = SqliteMemoryStore(self.root / "restored.db", "demo", create=False)
+        self.addCleanup(restored.close)
+        return restored
+
+    def standing(self, store, slug):
+        row = store.connection.execute(
+            "SELECT tier, tier_since_query, archived_at, visibility FROM memories WHERE slug=?",
+            (slug,)).fetchone()
+        return (row["tier"], row["tier_since_query"],
+                row["archived_at"] is not None, row["visibility"])
+
+    def test_a_tier_survives_the_round_trip(self):
+        self.assertEqual((3, 400, False, "public"), self.standing(self.round_trip(), "proven-note"))
+
+    def test_an_archived_memory_stays_archived(self):
+        restored = self.round_trip()
+        self.assertEqual((1, 0, True, "private"), self.standing(restored, "retired-note"))
+        found = restored.recall(query="", limit=20, record=False)
+        self.assertEqual([], [m for m in found["memories"] if m["id"] == "retired-note"],
+                         "a restored archive was back in the ranked pool")
+
+    def test_a_public_memory_does_not_become_private(self):
+        # Visibility is a judgment about audience, made by a person. Resetting
+        # it silently means the next promotion is refused for a reason nobody
+        # chose.
+        restored = self.round_trip()
+        self.assertEqual("public", self.standing(restored, "proven-note")[3])
+
+    def test_the_content_still_arrives_too(self):
+        # The counterweight: carrying standing must not cost the memories.
+        restored = self.round_trip()
+        self.assertEqual(["proven-note", "retired-note"],
+                         sorted(r[0] for r in restored.connection.execute(
+                             "SELECT slug FROM memories ORDER BY slug")))
+        self.assertEqual([], restored.validate_store())
+        self.assertIn("tier three", restored.get_memory("proven-note")["description"])
+
+    def test_an_older_export_without_standing_still_restores(self):
+        # Format 1 and 2 carry no `state`. Those memories land at tier 1, active
+        # and private - the old behaviour, and the right fallback when standing
+        # is unrecorded rather than known to be default.
+        export = self.root / "export.json"
+        backup.export_json(self.db, export)
+        payload = json.loads(export.read_text(encoding="utf-8"))
+        payload["format_version"] = 2
+        for data in payload["projects"].values():
+            data.pop("state", None)
+        export.write_text(json.dumps(payload), encoding="utf-8")
+
+        backup.import_json(self.root / "old.db", export)
+        restored = SqliteMemoryStore(self.root / "old.db", "demo", create=False)
+        self.addCleanup(restored.close)
+        self.assertEqual((1, 0, False, "private"), self.standing(restored, "proven-note"))
+        self.assertEqual(2, restored.count())
 
 
 if __name__ == "__main__":

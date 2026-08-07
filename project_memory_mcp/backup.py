@@ -82,9 +82,16 @@ def prune_snapshots(destination: Path | str, keep: int) -> list[Path]:
 def export_json(database: Path | str, destination: Path | str, project: str | None = None) -> dict[str, Any]:
     """Write the durable content of the database as JSON.
 
-    Memories, the label registry and usage counters, per project. Revision
-    history is deliberately left to snapshots: it is large, it is history rather
-    than content, and an export is meant to stay readable.
+    Memories, the label registry, usage counters, and where each memory stands -
+    its tier, whether it is archived, and who it is for. Revision history is
+    deliberately left to snapshots: it is large, it is history rather than
+    content, and an export is meant to stay readable.
+
+    Standing was missing until format 3, because it lives in columns rather than
+    in the memory body. A restore therefore un-archived everything the audit had
+    retired, reset every tier to 1, and turned every public memory private -
+    quietly undoing months of curation and one human judgment that no statistic
+    can make again.
     """
     database = Path(database)
     if not database.is_file():
@@ -100,7 +107,7 @@ def export_json(database: Path | str, destination: Path | str, project: str | No
 
         payload: dict[str, Any] = {
             "format": "project-memory-export",
-            "format_version": 2,
+            "format_version": 3,
             "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "source": str(database),
             "projects": {},
@@ -136,7 +143,29 @@ def export_json(database: Path | str, destination: Path | str, project: str | No
                     "last_applied": row["last_applied"],
                     "spread_bits": row["spread_bits"], "spread_epoch": row["spread_epoch"],
                 }
-            payload["projects"][name] = {"labels": labels, "memories": memories, "usage": usage}
+            # Where each memory stands, separately from what it says. These are
+            # columns rather than body fields, so exporting the bodies alone
+            # dropped them: a restore resurrected everything the audit had
+            # archived, reset every tier to 1, and turned every public memory
+            # private again.
+            #
+            # All of it qualifies as durable content. Tier and archive are the
+            # conclusions drawn from the usage counters this export already
+            # carries - keeping the evidence and discarding the verdict is not a
+            # coherent place to draw the line - and visibility is a human
+            # judgment about audience that no statistic can make again later.
+            state = {
+                row["slug"]: {"tier": row["tier"], "tier_since": row["tier_since"],
+                              "tier_since_query": row["tier_since_query"],
+                              "archived_at": row["archived_at"],
+                              "merged_into": row["merged_into"],
+                              "visibility": row["visibility"]}
+                for row in connection.execute(
+                    "SELECT slug, tier, tier_since, tier_since_query, archived_at, merged_into, "
+                    "visibility FROM memories WHERE project_id=? ORDER BY slug", (name,))
+            }
+            payload["projects"][name] = {"labels": labels, "memories": memories,
+                                         "usage": usage, "state": state}
     finally:
         connection.close()
 
@@ -170,6 +199,10 @@ def import_json(database: Path | str, source: Path | str) -> dict[str, Any]:
     Existing memories with the same id are overwritten: an export is a
     known-good state, so restoring it should converge on that state rather than
     merge into whatever is there.
+
+    Format 1 and 2 exports carry no `state`, so their memories land at tier 1,
+    active and private - the old behaviour, and the right fallback when standing
+    is genuinely unrecorded rather than known to be default.
     """
     from .sqlite_store import SqliteMemoryStore
 
@@ -186,12 +219,28 @@ def import_json(database: Path | str, source: Path | str) -> dict[str, Any]:
                     store.add_label(label, (meta or {}).get("description") or label)
                 except Exception:
                     pass  # already registered; import is re-runnable
+            state = data.get("state") or {}
             with store.connection:
                 for memory in data.get("memories") or []:
                     existing = store.connection.execute(
                         "SELECT uuid FROM memories WHERE project_id=? AND slug=?", (name, memory["id"])
                     ).fetchone()
-                    store._write(memory, existing["uuid"] if existing else str(uuid.uuid4()))
+                    standing = state.get(memory["id"]) or {}
+                    store._write(memory, existing["uuid"] if existing else str(uuid.uuid4()),
+                                 visibility=standing.get("visibility"))
+                    if standing:
+                        # Restored after the write, because `_write` sets
+                        # `tier_since` to now and knows nothing about archiving.
+                        # An export from before format 3 carries no state, and
+                        # then a memory lands at tier 1 and active - the old
+                        # behaviour, which is the right fallback when the
+                        # standing is genuinely unknown.
+                        store.connection.execute(
+                            "UPDATE memories SET tier=?, tier_since=?, tier_since_query=?, "
+                            "archived_at=?, merged_into=? WHERE project_id=? AND slug=?",
+                            (standing.get("tier", 1), standing.get("tier_since"),
+                             standing.get("tier_since_query", 0), standing.get("archived_at"),
+                             standing.get("merged_into"), name, memory["id"]))
                 for slug, by_replica in (data.get("usage") or {}).items():
                     row = store.connection.execute(
                         "SELECT uuid FROM memories WHERE project_id=? AND slug=?", (name, slug)
