@@ -306,10 +306,16 @@ def run_audit(store: SqliteMemoryStore, policy: AuditPolicy | None = None,
               apply: bool = False, record: bool = True) -> AuditReport:
     """Judge every memory that is due, and record what was decided.
 
-    ``apply`` is not implemented yet by design: the sweep is meant to be watched
-    against a real store before it is allowed to move anything, and the same
-    code path produces the report either way, so what you observe is what you
-    will get.
+    ``apply`` defaults to False, and that is the important half: the same code
+    path produces the report either way, so what you observe in a dry run is
+    what you get when you allow it to act. The sweep was report-only for a whole
+    phase so it could be watched against a real store first.
+
+    (This docstring said `apply` was "not implemented yet" until 2026-08-07,
+    long after phase 8 implemented it. A comment that contradicts the code is
+    worse in this module than most: it is the one that decides what gets
+    archived and deleted, and the reader it misleads is deciding whether to let
+    it run.)
     """
     policy = policy or AuditPolicy()
     now = datetime.now(timezone.utc)
