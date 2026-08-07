@@ -39,12 +39,27 @@ def restore_orphans() -> None:
         print(f"  restored {target.name} left mutated by an earlier run", flush=True)
 
 
+class AmbiguousMutation(Exception):
+    """The pattern matches more than once, so which line is broken is a guess."""
+
+
 class Mutation:
     """Applies one edit, and puts the file back however this process ends."""
 
     def __init__(self, path: pathlib.Path, old: str, new: str) -> None:
         self.path, self.good = path, path.read_text(encoding="utf-8")
         self.backup = path.with_suffix(path.suffix + BACKUP_SUFFIX)
+        # Exactly once, or refuse. `replace(old, new, 1)` takes the *first*
+        # match, so an ambiguous pattern quietly sabotages a different function
+        # than the one the mutant is named after - and then reports on it. That
+        # happened: a two-line pattern meant for `cmd_serve` matched `cmd_audit`
+        # three definitions earlier, survived, and was recorded as a gap in the
+        # wrong place. A mutant that tests something other than its own name is
+        # worse than no mutant.
+        found = self.good.count(old)
+        if found != 1:
+            raise AmbiguousMutation(
+                f"{path.name}: pattern matches {found} times, expected exactly 1")
         self.mutated = self.good.replace(old, new, 1)
 
     def __enter__(self) -> "Mutation":
@@ -144,11 +159,12 @@ MUTANTS = [
      "-r[\"description_match\"], r[\"name\"]))",
      "    ranked.sort(key=lambda r: r[\"name\"])"),
 
-    ("cached results lose the source they came from", "sqlite_store.py",
-     "                rows.append((self.project, uuid, body[\"id\"], body.get(\"status\", \"active\"),\n"
-     "                             body.get(\"description\", \"\"), stamp, json.dumps(body), name))",
-     "                rows.append((self.project, uuid, body[\"id\"], body.get(\"status\", \"active\"),\n"
-     "                             body.get(\"description\", \"\"), stamp, json.dumps(body), None))"),
+    # "cached results lose the source they came from" was here. It targeted an
+    # INSERT into `memories` that step 6 replaced when borrowed copies moved to
+    # a table of their own, where `origin_remote` is NOT NULL and cannot be
+    # lost. The property it guarded is now "a borrowed result stops saying where
+    # it came from". Removed rather than left to SKIP: a mutant that no longer
+    # matches anything reports nothing while still looking like coverage.
 
     # -------------------------------------------------------------- prefilter
     # Narrowing on the label index is only sound when the expression cannot be
@@ -284,14 +300,45 @@ MUTANTS = [
      "    connection.execute(\"DELETE FROM memories WHERE origin_remote IS NOT NULL\")",
      "    pass"),
 
+    # ----------------------------------------------------------------- projects
+    # The cleanup deletes a project during an upgrade, so the condition that
+    # decides *which* one is the whole safety argument. It has to be narrow
+    # enough that it cannot match anything anyone created on purpose.
+    ("the upgrade eats any project called bootstrap", "sqlite_store.py",
+     "    if any(held.values()):\n        return None  # somebody's actual project",
+     "    if False:\n        return None  # somebody's actual project"),
+
+    ("the phantom is left where it was", "sqlite_store.py",
+     "    remove_project(connection, _ARTIFACT_PROJECT)\n    return _ARTIFACT_PROJECT",
+     "    return None"),
+
+    ("removing a project takes every project's rows", "sqlite_store.py",
+     "                connection.execute(f\"DELETE FROM {table} WHERE {column}=?\", (project,))",
+     "                connection.execute(f\"DELETE FROM {table}\")"),
+
+    ("removing a project leaves its memories behind", "sqlite_store.py",
+     "\"label_registry\", \"labels\", \"memories\", \"memories_fts\", \"outbox\", \"revisions\",",
+     "\"label_registry\", \"labels\", \"memories_fts\", \"outbox\", \"revisions\","),
+
+    # The distinctive comment is part of the pattern on purpose: without it,
+    # `store = SqliteMemoryStore(args.database, args.project, create=False)`
+    # appears four times in this file and the first match is `cmd_audit`.
+    ("serve creates whatever project it is pointed at", "cli.py",
+     "        # was creating here, so `serve --project my-projct` silently made\n"
+     "        # `my-projct` and served nothing, forever.\n"
+     "        store = SqliteMemoryStore(args.database, args.project, create=False)",
+     "        # was creating here, so `serve --project my-projct` silently made\n"
+     "        # `my-projct` and served nothing, forever.\n"
+     "        store = SqliteMemoryStore(args.database, args.project)"),
+
     # ------------------------------------------------------------------- setup
     # `ensure_schema` exists so the server-wide tables can be created without
     # inventing a project. If it stops creating them, a server on an empty
     # database answers 500 where it means 401; if something goes back to opening
     # a store for the side effect, a phantom project appears in every listing.
     ("preparing a database no longer creates its tables", "sqlite_store.py",
-     "        _prepare(connection)\n        _ensure_replica_id(connection)",
-     "        pass"),
+     "        cleaned = _prepare(connection)\n        _ensure_replica_id(connection)",
+     "        cleaned = None"),
 
     ("enrolling a client invents a project again", "cli.py",
      "    ensure_schema(database)\n    connection = sqlite3.connect(database)",
@@ -401,12 +448,26 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     restore_orphans()
 
-    survived, killed, hung, skipped = [], [], [], []
+    survived, killed, hung, skipped, ambiguous = [], [], [], [], []
+    # Checked up front, all of them, before any run: a stale or ambiguous
+    # pattern is a mutant that is not testing what its name says, and finding
+    # that out forty minutes into a run - or not at all, because SKIP scrolls
+    # past - is how a harness comes to overstate its own coverage.
+    for name, filename, old, _new in MUTANTS:
+        matches = (ROOT / "project_memory_mcp" / filename).read_text(encoding="utf-8").count(old)
+        if matches == 0:
+            skipped.append(name)
+            print(f"  STALE    {name} (pattern gone from {filename})", flush=True)
+        elif matches > 1:
+            ambiguous.append(name)
+            print(f"  AMBIGUOUS {name} ({matches} matches in {filename}; it would break "
+                  f"the first, which may be a different function entirely)", flush=True)
+    if skipped or ambiguous:
+        print("")
+
     for name, filename, old, new in MUTANTS:
         path = ROOT / "project_memory_mcp" / filename
-        if old not in path.read_text(encoding="utf-8"):
-            skipped.append(name)
-            print(f"  SKIP     {name} (pattern not in {filename})", flush=True)
+        if name in skipped or name in ambiguous:
             continue
         with Mutation(path, old, new):
             detected = run_suite()
@@ -424,15 +485,19 @@ def main() -> int:
               flush=True)
 
     print("")
-    print(f"{len(killed)} caught, {len(survived)} survived, "
-          f"{len(hung)} hung, {len(skipped)} skipped")
+    print(f"{len(killed)} caught, {len(survived)} survived, {len(hung)} hung, "
+          f"{len(skipped)} stale, {len(ambiguous)} ambiguous")
     for name in survived:
         print(f"  unguarded: {name}")
     for name in hung:
         print(f"  hung (a test that hangs cannot tell you anything): {name}")
     for name in skipped:
-        print(f"  not tested: {name}")
-    return 0
+        print(f"  stale, so it tested nothing: {name}")
+    for name in ambiguous:
+        print(f"  ambiguous, so it tested the wrong thing: {name}")
+    # Non-zero when the harness itself is wrong, separately from what it found.
+    # A stale mutant is not a passing mutant.
+    return 1 if (skipped or ambiguous) else 0
 
 
 if __name__ == "__main__":

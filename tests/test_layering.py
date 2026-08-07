@@ -203,6 +203,46 @@ class ToolSurfaceTests(unittest.TestCase):
                 self.assertTrue((tool.get("description") or "").strip())
 
 
+class ProjectScopedTableTests(unittest.TestCase):
+    """Removing a project must not leave rows belonging to it.
+
+    `PROJECT_SCOPED_TABLES` is written out rather than discovered at runtime, so
+    a new project-scoped table is a deliberate addition. That only works if
+    something notices when the schema grows one and the list does not - which is
+    what this is. The failure it prevents is the same shape as the outbox row a
+    deleted memory used to leave: rows nothing owns and nothing will ever look
+    at again.
+    """
+
+    def test_the_list_matches_the_schema(self):
+        import sqlite3
+        import tempfile
+
+        from project_memory_mcp.computer import SCHEMA as JOBS_SCHEMA
+        from project_memory_mcp.sqlite_store import PROJECT_SCOPED_TABLES, ensure_schema
+
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "memory.db"
+            ensure_schema(database)
+            connection = sqlite3.connect(database)
+            try:
+                connection.executescript(JOBS_SCHEMA)
+                scoped = set()
+                for (name,) in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"):
+                    columns = {r[1] for r in connection.execute(f"PRAGMA table_info({name})")}
+                    if "project_id" in columns or name == "projects":
+                        scoped.add(name)
+            finally:
+                connection.close()
+
+        self.assertEqual(
+            sorted(scoped), sorted(PROJECT_SCOPED_TABLES),
+            "the schema and PROJECT_SCOPED_TABLES disagree. A table missing from the list "
+            "keeps its rows after a project is removed; one listed that no longer exists "
+            "makes the delete raise.")
+
+
 class DocumentedCommandTests(unittest.TestCase):
     """The README's command list is a promise too.
 

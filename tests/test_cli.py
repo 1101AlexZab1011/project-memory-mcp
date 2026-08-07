@@ -81,6 +81,17 @@ class CliTests(CliCase):
         store = self.open_store()
         self.assertEqual(["demo"], SqliteMemoryStore.list_projects(store.connection))
 
+    def test_audit_reports_an_unknown_project_instead_of_creating_one(self):
+        # `validate` had this and `audit` did not, which a mis-aimed mutant
+        # found: a pattern meant for `serve` matched `cmd_audit` first, made it
+        # auto-create, and no test noticed. Every read-only command that names a
+        # project has to refuse an unknown one rather than conjure it.
+        main(["init", "--database", str(self.db), "--project", "demo"])
+
+        self.assertEqual(1, main(["audit", "--database", str(self.db), "--project", "nope"]))
+        store = self.open_store()
+        self.assertEqual(["demo"], SqliteMemoryStore.list_projects(store.connection))
+
     def test_install_skills_copies_all_skills(self):
         exit_code = main(["install-skills", "--root", str(self.root), "--claude", "--codex"])
 
@@ -184,6 +195,149 @@ class ServerWideSetupTests(CliCase):
                 connection.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
                     (table,)).fetchone(), f"{table} was not created")
+
+
+class ProjectRemovalTests(CliCase):
+    """Projects could be created by accident and never removed.
+
+    `init` makes one deliberately. Two paths made them without anyone asking: a
+    pre-0.8.0 `enroll` opened a store called `bootstrap` purely to force the
+    schema script to run, and `serve --project <typo>` created whatever was
+    typed, because the stdio path passed create=True while the HTTP path had
+    always refused for exactly that reason. Nothing could take either back.
+    """
+
+    def project(self, *args):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                code = main(["project", "--database", str(self.db), *args])
+        return code, out.getvalue() + err.getvalue()
+
+    def projects(self):
+        import sqlite3
+
+        connection = sqlite3.connect(self.db)
+        self.addCleanup(connection.close)
+        return SqliteMemoryStore.list_projects(connection)
+
+    def seed(self, *names):
+        for name in names:
+            SqliteMemoryStore(self.db, name).close()
+
+    def test_an_empty_project_is_removed_without_ceremony(self):
+        main(["init", "--database", str(self.db), "--project", "real-project"])
+        self.seed("my-projct")  # what a typo in serve used to leave
+
+        self.assertEqual(0, self.project("--remove", "my-projct")[0])
+        self.assertEqual(["real-project"], self.projects())
+
+    def test_a_project_holding_anything_needs_confirming(self):
+        # Anything, not just memories: a curated label registry with nothing
+        # written yet is work in progress, and losing it silently is the kind of
+        # damage `init` seeding nine labels exists to distinguish from an
+        # accident.
+        main(["init", "--database", str(self.db), "--project", "real-project"])
+
+        code, output = self.project("--remove", "real-project")
+
+        self.assertEqual(1, code, "a project with a label registry was removed unasked")
+        self.assertIn("--yes", output)
+        self.assertIn("real-project", self.projects())
+
+    def test_yes_removes_it_and_everything_scoped_to_it(self):
+        main(["init", "--database", str(self.db), "--project", "real-project"])
+        store = self.open_store("real-project")
+        label = sorted(store.list_labels()["labels"])[0]
+        store.create_memory(make_memory("a-lesson", [label]))
+        store.close()
+
+        self.assertEqual(0, self.project("--remove", "real-project", "--yes")[0])
+
+        self.assertEqual([], self.projects())
+        import sqlite3
+
+        connection = sqlite3.connect(self.db)
+        self.addCleanup(connection.close)
+        for table in ("memories", "labels", "label_registry", "edges", "usage", "memories_fts"):
+            left = connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE project_id='real-project'").fetchone()[0]
+            self.assertEqual(0, left, f"{table} kept rows for a removed project")
+
+    def test_removing_one_project_leaves_the_others_alone(self):
+        # The counterweight. Emptying every table would satisfy the test above.
+        main(["init", "--database", str(self.db), "--project", "keep-me"])
+        main(["init", "--database", str(self.db), "--project", "drop-me"])
+        store = self.open_store("keep-me")
+        label = sorted(store.list_labels()["labels"])[0]
+        store.create_memory(make_memory("a-lesson", [label]))
+        store.close()
+
+        self.project("--remove", "drop-me", "--yes")
+
+        self.assertEqual(["keep-me"], self.projects())
+        self.assertEqual(1, self.open_store("keep-me").count())
+
+    def test_removing_something_that_is_not_there_fails(self):
+        main(["init", "--database", str(self.db), "--project", "real-project"])
+        self.assertEqual(1, self.project("--remove", "ghost")[0])
+
+    def test_the_phantom_from_an_old_enroll_is_cleaned_up_on_open(self):
+        main(["init", "--database", str(self.db), "--project", "real-project"])
+        self.seed("bootstrap")
+        self.assertIn("bootstrap", self.projects())
+
+        SqliteMemoryStore(self.db, "real-project", create=False).close()
+
+        self.assertEqual(["real-project"], self.projects(),
+                         "opening the database did not clear the pre-0.8.0 phantom")
+
+    def test_a_bootstrap_project_somebody_actually_uses_is_left_alone(self):
+        # The condition has to be narrow enough that it cannot match a project
+        # anyone made on purpose. `init` seeds labels, so a real one is never
+        # empty - and this is what stops an upgrade eating somebody's data.
+        main(["init", "--database", str(self.db), "--project", "bootstrap"])
+
+        store = SqliteMemoryStore(self.db, "bootstrap", create=False)
+        self.addCleanup(store.close)
+
+        self.assertIn("bootstrap", self.projects())
+        self.assertIsNone(store.cleaned_up)
+
+    def test_the_cleanup_is_announced_rather_than_silent(self):
+        main(["init", "--database", str(self.db), "--project", "real-project"])
+        self.seed("bootstrap")
+        self.assertIn("phantom", self.project()[1])
+
+
+class ServeRefusesUnknownProjectTests(CliCase):
+    """stdio `serve` used to create whatever project it was pointed at.
+
+    The HTTP path has always passed create=False, with the reason written beside
+    it: auto-creating turns a typo into an empty store that looks like a working
+    store, which is worse than an error. The same argument applies here, and the
+    same code was doing the opposite.
+    """
+
+    def test_serving_an_unknown_project_fails_instead_of_creating_it(self):
+        import contextlib
+        import io
+
+        main(["init", "--database", str(self.db), "--project", "real-project"])
+
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = main(["serve", "--database", str(self.db), "--project", "my-projct"])
+
+        self.assertEqual(1, code)
+        self.assertIn("init", err.getvalue(), "the error does not say how to fix it")
+        import sqlite3
+
+        connection = sqlite3.connect(self.db)
+        self.addCleanup(connection.close)
+        self.assertEqual(["real-project"], SqliteMemoryStore.list_projects(connection),
+                         "a typo in --project created a project")
 
 
 class RemoteFlagTests(CliCase):

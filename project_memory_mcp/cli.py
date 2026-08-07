@@ -167,9 +167,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if not args.database or not args.project:
         print("error: stdio serving requires --database and --project.", file=sys.stderr)
         return 1
-    from .sqlite_store import SqliteMemoryStore
+    from .sqlite_store import SqliteMemoryStore, StoreError
 
-    store = SqliteMemoryStore(args.database, args.project)
+    try:
+        # create=False, matching what the HTTP path has always done and for the
+        # reason already written there: auto-creating turns a typo into an empty
+        # store that looks like a working one, which is worse than an error. It
+        # was creating here, so `serve --project my-projct` silently made
+        # `my-projct` and served nothing, forever.
+        store = SqliteMemoryStore(args.database, args.project, create=False)
+    except StoreError as error:
+        print(f"error: {error}", file=sys.stderr)
+        print(f"Create it first: project-memory-mcp init --database {args.database} "
+              f"--project {args.project}", file=sys.stderr)
+        return 1
+    if store.cleaned_up:
+        print(f"project-memory-mcp: removed '{store.cleaned_up}', a phantom project left by "
+              f"a pre-0.8.0 enroll", file=sys.stderr)
     print(f"project-memory-mcp: serving project '{args.project}' from {store.path} "
           f"({store.count()} memories)", file=sys.stderr)
     return run_server(store)
@@ -454,6 +468,65 @@ def cmd_compute(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_project(args: argparse.Namespace) -> int:
+    """List the projects in a database, or remove one.
+
+    Removal was missing entirely. `init` creates a project deliberately, but two
+    paths made them by accident - a pre-0.8.0 `enroll` left a phantom called
+    `bootstrap`, and a typo in `serve --project` created whatever was typed -
+    and nothing could take either back short of hand-written SQL.
+    """
+    import sqlite3
+
+    from .sqlite_store import (SqliteMemoryStore, StoreError, ensure_schema,
+                               project_contents, remove_project)
+
+    database = Path(args.database)
+    if not database.is_file():
+        print(f"error: no database at {database}", file=sys.stderr)
+        return 1
+    cleaned = ensure_schema(database)
+    if cleaned:
+        print(f"removed '{cleaned}', a phantom project left by a pre-0.8.0 enroll")
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    try:
+        if args.remove:
+            held = project_contents(connection, args.remove)
+            # Anything at all, not just memories. A project with a curated label
+            # registry and nothing written yet is somebody's work in progress,
+            # and `init` seeding nine labels is exactly what tells an accident
+            # apart from an intention. Empty means empty.
+            if any(held.values()) and not args.yes:
+                # The same discipline as `audit --apply`: what will be destroyed
+                # is shown first, and destroying it is a separate decision.
+                print(f"'{args.remove}' holds {held['memories']} memor(ies), "
+                      f"{held['labels']} label(s) and {held['cached']} cached "
+                      f"cop(ies) from remotes.", file=sys.stderr)
+                print("Re-run with --yes to remove it and everything in it.", file=sys.stderr)
+                return 1
+            result = remove_project(connection, args.remove)
+            print(f"removed '{result['removed']}' "
+                  f"({result['memories']} memories, {result['labels']} labels)")
+            return 0
+
+        names = SqliteMemoryStore.list_projects(connection)
+        if not names:
+            print("No projects. Create one with `project-memory-mcp init`.")
+            return 0
+        for name in names:
+            held = project_contents(connection, name)
+            empty = "" if any(held.values()) else "   (empty)"
+            print(f"{name:24s} {held['memories']:5d} memories  "
+                  f"{held['labels']:3d} labels{empty}")
+        return 0
+    except StoreError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    finally:
+        connection.close()
+
+
 def cmd_remote(args: argparse.Namespace) -> int:
     """Manage the servers this machine federates with. Zero of them is normal."""
     from . import federation
@@ -668,6 +741,15 @@ def build_parser() -> argparse.ArgumentParser:
     compute_parser.add_argument("--once", action="store_true",
                                 help="Run each job once and exit, printing what happened.")
     compute_parser.set_defaults(func=cmd_compute)
+
+    project_parser = subparsers.add_parser(
+        "project", help="List the projects in a database, or remove one.")
+    project_parser.add_argument("--database", required=True, help="Path to the SQLite database.")
+    project_parser.add_argument("--remove", default=None, metavar="ID",
+                                help="Remove a project and everything scoped to it.")
+    project_parser.add_argument("--yes", action="store_true",
+                                help="Confirm removing a project that still holds memories.")
+    project_parser.set_defaults(func=cmd_project)
 
     remote_parser = subparsers.add_parser(
         "remote", help="Add, list or remove servers this machine federates with.")

@@ -346,8 +346,12 @@ def _ensure_replica_id(connection: sqlite3.Connection) -> str:
     return replica
 
 
-def _prepare(connection: sqlite3.Connection) -> None:
-    """Bring a connection's database up to the current schema. No project involved."""
+def _prepare(connection: sqlite3.Connection) -> str | None:
+    """Bring a connection's database up to the current schema. No project involved.
+
+    Returns the name of anything it cleaned up, so a caller can say so rather
+    than changing somebody's database silently.
+    """
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA foreign_keys=ON")
     _upgrade(connection)
@@ -356,9 +360,10 @@ def _prepare(connection: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
     )
+    return _clean_bootstrap_artifact(connection)
 
 
-def ensure_schema(database: Path | str) -> None:
+def ensure_schema(database: Path | str) -> str | None:
     """Create the tables a server needs, without creating a project.
 
     `clients`, `enrollment_codes` and `meta` are server-wide: authentication has
@@ -379,11 +384,91 @@ def ensure_schema(database: Path | str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     try:
-        _prepare(connection)
+        cleaned = _prepare(connection)
         _ensure_replica_id(connection)
         connection.commit()
     finally:
         connection.close()
+    return cleaned
+
+
+#: Every table a project owns, in the order they are emptied. `projects` last,
+#: so an interrupted removal leaves a project whose rows are partly gone rather
+#: than orphaned rows belonging to a project that no longer exists.
+#:
+#: Kept as a list rather than discovered from `sqlite_master` at runtime: a new
+#: project-scoped table should be a deliberate addition here, and a test asserts
+#: this list still matches the schema. Discovery would silently absorb tables
+#: nobody meant to delete from.
+PROJECT_SCOPED_TABLES = (
+    "audit_findings", "audit_runs", "cached_memories", "edges", "files", "jobs",
+    "label_registry", "labels", "memories", "memories_fts", "outbox", "revisions",
+    "usage", "projects",
+)
+
+
+def project_contents(connection: sqlite3.Connection, project: str) -> dict[str, int]:
+    """What a project holds, for deciding whether removing it destroys anything."""
+    def count(table: str) -> int:
+        return connection.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE project_id=?", (project,)).fetchone()[0]
+
+    return {"memories": count("memories"), "cached": count("cached_memories"),
+            "labels": count("label_registry")}
+
+
+def remove_project(connection: sqlite3.Connection, project: str) -> dict[str, Any]:
+    """Delete a project and everything scoped to it.
+
+    Projects could be created and never removed. `init` makes one deliberately,
+    but two paths made them by accident - a pre-0.8.0 `enroll` left a phantom
+    called `bootstrap`, and a typo in `serve --project` created whatever was
+    typed - and there was no way to take either back short of hand-written SQL.
+    """
+    if not connection.execute("SELECT 1 FROM projects WHERE id=?", (project,)).fetchone():
+        raise StoreError(f"Unknown project: {project}")
+    held = project_contents(connection, project)
+    with connection:
+        for table in PROJECT_SCOPED_TABLES:
+            column = "id" if table == "projects" else "project_id"
+            try:
+                connection.execute(f"DELETE FROM {table} WHERE {column}=?", (project,))
+            except sqlite3.OperationalError:
+                # `jobs` is created by the Computer, not by this schema, so a
+                # database that has never run a sweep does not have it yet.
+                pass
+    return {"removed": project, **held}
+
+
+#: A project by this name, holding nothing at all, is the fingerprint of a
+#: pre-0.8.0 `enroll`, which opened a store called `bootstrap` purely to force
+#: the schema script to run. Nothing anyone created on purpose looks like this:
+#: `init` and `setup` both seed a starter label registry, so a deliberate
+#: project has labels from the moment it exists.
+_ARTIFACT_PROJECT = "bootstrap"
+
+
+def _clean_bootstrap_artifact(connection: sqlite3.Connection) -> str | None:
+    """Remove the phantom project a pre-0.8.0 enroll left, if it is still there.
+
+    Runs on open rather than behind a schema-version gate, because it is a data
+    fix with no structural marker to test for, and the version stamp cannot
+    express it: every migration writes the *current* SCHEMA_VERSION rather than
+    its own, which is harmless while all gating is structural and useless for
+    gating on.
+
+    So instead it is idempotent and free: one primary-key lookup that finds
+    nothing on every database that has ever been opened by this version, and on
+    every database that never ran the old `enroll` at all.
+    """
+    if not connection.execute(
+            "SELECT 1 FROM projects WHERE id=?", (_ARTIFACT_PROJECT,)).fetchone():
+        return None
+    held = project_contents(connection, _ARTIFACT_PROJECT)
+    if any(held.values()):
+        return None  # somebody's actual project that happens to be called this
+    remove_project(connection, _ARTIFACT_PROJECT)
+    return _ARTIFACT_PROJECT
 
 
 def _upgrade(connection: sqlite3.Connection) -> None:
@@ -617,7 +702,10 @@ class SqliteMemoryStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path, check_same_thread=check_same_thread)
         self.connection.row_factory = sqlite3.Row
-        _prepare(self.connection)
+        #: Set when opening this database removed the phantom project a
+        #: pre-0.8.0 `enroll` left behind. Read by the CLI and the server so
+        #: the cleanup is announced rather than done behind somebody's back.
+        self.cleaned_up = _prepare(self.connection)
         self.replica_id = _ensure_replica_id(self.connection)
         #: Who the current caller is, set by the transport for the duration of
         #: one request. None means a local write with no authenticated client.

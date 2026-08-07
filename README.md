@@ -298,6 +298,7 @@ project-memory-mcp backup          --database DB --out DEST [--format db|json]
                                    [--project ID] [--keep N]
 project-memory-mcp restore         --database DB --from FILE
 project-memory-mcp install-skills  [--root DIR] [--claude] [--codex] [--dest DIR]
+project-memory-mcp project         --database DB [--remove ID [--yes]]
 project-memory-mcp compute         --database DB [--project ID] [--kind K] [--once]
 project-memory-mcp remote          --database DB --project ID [--name N --url U]
                                    [--enable N] [--disable N] [--remove N]

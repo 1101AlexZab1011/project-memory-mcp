@@ -400,12 +400,52 @@ to opening a "bootstrap" store.
 
 **358 → 362 tests.**
 
-**Note for whoever deploys this.** Existing databases still contain the `bootstrap` row — this stops
-it being created, it does not clean up after the versions that did. Deleting somebody's project row
-as a side effect of an upgrade is not an improvement over an empty project sitting in a list, so it
-is a manual `DELETE FROM projects WHERE id='bootstrap'` on any database that has one, and only after
-confirming it holds no memories. There is no release-notes file to put this in, which is why it is
-here.
+### Follow-up ✔ — the phantom is cleaned up automatically after all
+
+This step originally left existing databases carrying the `bootstrap` row, with a manual `DELETE`
+recorded here. That was the wrong call, and the reason it was wrong is that `bootstrap` is not a
+one-off:
+
+| how a project gets created | memories | labels |
+|---|---|---|
+| `init` / `setup` — deliberate | 0 | **9** |
+| pre-0.8.0 `enroll` — the artifact | 0 | 0 |
+| **`serve --project <typo>`** — still reachable | 0 | 0 |
+
+**Nothing could remove a project at all.** That is the actual missing operation; `bootstrap` was its
+most visible symptom. And the stdio `serve` path passed `create=True`, so a typo silently created a
+project — while the HTTP path has always passed `create=False`, with the reason written beside it:
+*"Auto-creating one turns a typo in a client's URL into an empty store that looks like a working
+store, which is worse than an error."* The same argument, and the same file, doing the opposite.
+
+Three changes:
+
+- **`project --remove ID`**, listing by default. Refuses unless the project is *completely* empty —
+  not merely free of memories, because a curated label registry with nothing written yet is work in
+  progress. `--yes` after seeing what will be lost, the same discipline as `audit --apply`.
+- **The phantom is removed on open**, but only when it is provably the artifact: zero memories, zero
+  cached copies, zero labels. `init` seeds nine labels, so that state cannot describe a project
+  anyone made on purpose. Announced rather than silent. Idempotent, so it needs no version gate —
+  which matters, because the stamp could not have provided one: every migration writes the *current*
+  `SCHEMA_VERSION` rather than its own, harmless while all gating is structural and useless for
+  gating on.
+- **stdio `serve` refuses an unknown project**, matching HTTP, and says which command creates one.
+
+**A mis-aimed mutant found a gap it was not looking for.** The `serve` mutant's pattern —
+`store = SqliteMemoryStore(args.database, args.project, create=False)` plus the following line —
+appears **four times** in `cli.py`, and `Mutation` used `replace(old, new, 1)`. So it broke
+`cmd_audit`, three definitions earlier, reported SURVIVED, and was recorded against the wrong
+function. `audit` turned out to have no test that it refuses an unknown project, where `validate`
+did. Both fixed.
+
+The harness is hardened against the whole class: `Mutation` now refuses a pattern that does not
+match exactly once, and `main` checks every pattern up front, reporting **STALE** (matches nothing)
+and **AMBIGUOUS** (matches several) before running anything, and exiting non-zero for either. That
+audit immediately found two more stale mutants left behind by steps 5 and 6, which had been
+reporting SKIP — a line that scrolls past and looks like coverage. **64 mutants, all now aimed at
+exactly one place.**
+
+**406 → 424 tests.**
 
 ## Step 6 — Finish the remote cache, or drop it
 
