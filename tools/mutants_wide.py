@@ -150,6 +150,20 @@ MUTANTS = [
      "                rows.append((self.project, uuid, body[\"id\"], body.get(\"status\", \"active\"),\n"
      "                             body.get(\"description\", \"\"), stamp, json.dumps(body), None))"),
 
+    # --------------------------------------------------------------- reporting
+    ("a failing backup goes back to being silent", "backup.py",
+     "            print(f\"project-memory-mcp: BACKUP FAILED to {self.destination}: {exc}\",\n"
+     "                  file=sys.stderr, flush=True)",
+     "            pass"),
+
+    # The counterweight: shouting on every run trains its reader to skip it.
+    ("every backup announces itself, failed or not", "backup.py",
+     "            snapshot_database(self.database, self.destination, self.keep)\n"
+     "            self.last_error = None",
+     "            snapshot_database(self.database, self.destination, self.keep)\n"
+     "            self.last_error = None\n"
+     "            print(\"project-memory-mcp: BACKUP FAILED (not really)\", file=sys.stderr)"),
+
     # ------------------------------------------------------------ remote state
     ("disabling a remote throws its queued work away", "federation.py",
      "        connection.execute(\"UPDATE remotes SET enabled=? WHERE name=?\", "

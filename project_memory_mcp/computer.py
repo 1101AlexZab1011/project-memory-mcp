@@ -353,6 +353,19 @@ def reindex_job(store: Any, guard: Any, chunk: int = 500) -> dict[str, Any]:
     whatever threshold was in force when each memory happened to be stored.
     Rebuilding is what makes changing that threshold mean anything - and it is
     precomputation, so it belongs here rather than on the write path.
+
+    It also repairs drift from updates, which is narrower than it first looks.
+    A write deletes every derived edge touching the memory, in both directions,
+    then re-inserts only the ones pointing outward from it. The *pairs* usually
+    survive, since traversal reads edges both ways - but not when the top-K is
+    asymmetric: if B counts A among its ten best neighbours and A does not count
+    B, updating A drops `B->A` and nothing puts it back. Only this does.
+
+    Measured at 0.22s for 200 memories, 0.89s for 500, 2.29s for 1000 - linear,
+    about 2.3ms each, in 500-row slices with the lock handed back between them.
+    Hourly on a 1000-memory store is a 0.06% duty cycle. Somewhere north of tens
+    of thousands that stops being free, and the answer then is a longer interval
+    for this job rather than the whole sweep.
     """
     offset, rebuilt = 0, 0
     while True:
@@ -445,7 +458,7 @@ class Scheduler:
 
     def __init__(self, computer: Computer, projects: Callable[[], list[str]],
                  interval_seconds: int = 3600,
-                 kinds: tuple[str, ...] = ("outbox", "rebase", "audit", "evict", "dedup")) -> None:
+                 kinds: tuple[str, ...] = ("outbox", "rebase", "audit", "evict", "reindex", "dedup")) -> None:
         self.computer = computer
         self.projects = projects
         self.interval = max(60, int(interval_seconds))

@@ -1176,18 +1176,11 @@ class SqliteMemoryStore:
         ).fetchall()
         return [json.loads(row["body"]) for row in rows]
 
-    def recent(self, limit: int = 8, offset: int = 0) -> dict[str, Any]:
-        """Newest first, straight out of an index - no ranking involved."""
-        rows = self.connection.execute(
-            # Order by the indexed column directly: COALESCE(created, ...) is
-            # not sargable and turned this into a full scan and sort. Writes and
-            # migration both populate `created`, so the fallback is not needed.
-            "SELECT body FROM memories WHERE project_id=? AND archived_at IS NULL "
-            "ORDER BY created DESC, slug DESC LIMIT ? OFFSET ?",
-            (self.project, limit, offset),
-        ).fetchall()
-        memories = [_light_record(json.loads(row["body"])) for row in rows]
-        return {"order": "recent", "offset": offset, "count": len(memories), "memories": memories}
+    # There was a `recent()` here, a second newest-first path that no caller
+    # used - the tools, the UI and the CLI all go through
+    # `recall(order="recent")`, which reaches `timeline_window` above. Only a
+    # test reached it, so the assertion guarded the unused copy while the path
+    # that ships had none of its own. The test moved; the method went.
 
     # --------------------------------------------------------------- mutations
 

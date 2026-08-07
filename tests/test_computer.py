@@ -16,7 +16,6 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from project_memory_mcp.audit import AuditPolicy, TierGate
 from project_memory_mcp.computer import Budget, Computer, Job, Scheduler, make_job
 from project_memory_mcp import maintenance
 from project_memory_mcp.sqlite_store import SqliteMemoryStore
@@ -92,10 +91,10 @@ class QueueTests(ComputerCase):
     def test_a_failing_job_says_so_where_somebody_will_see_it(self):
         # Swallowed is right - one broken job must not stop the rest. Silent is
         # not. A single orphaned outbox row could stop this machine publishing
-        # anything at all, indefinitely, leaving nothing but a row in a table
-        # with no reader: the endpoints that could have shown it (/api/audit,
-        # Computer.last_error) are themselves read by nothing. stderr is the one
-        # channel this server has that somebody is already watching.
+        # anything at all, indefinitely, leaving nothing but a row in a `jobs`
+        # table that nothing queries. `last_error` below is an in-process
+        # accessor and no help to a person; stderr is the one channel this
+        # server has that somebody is already watching.
         import contextlib
         import io
 

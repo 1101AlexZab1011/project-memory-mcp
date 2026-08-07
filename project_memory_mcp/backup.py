@@ -19,9 +19,10 @@ Snapshots restore exactly; exports restore the durable content. Keep both.
 from __future__ import annotations
 
 import json
-import uuid
 import sqlite3
+import sys
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -239,14 +240,31 @@ class BackupScheduler:
         if self._thread is not None:
             self._thread.join(timeout=5)
 
+    def snapshot_once(self) -> str | None:
+        """One snapshot. Returns the error if it failed, having reported it.
+
+        Its own method so the failure path can be reached without waiting out an
+        interval on a daemon thread. It was inline, and untested, and silent.
+        """
+        try:
+            snapshot_database(self.database, self.destination, self.keep)
+            self.last_error = None
+        except Exception as exc:  # a failed backup must not take the server down
+            self.last_error = str(exc)
+            # Nor may it be silent, which it was: `last_error` was written here
+            # and read by nothing, so a snapshot failing every hour looked
+            # exactly like one succeeding every hour. This class exists because
+            # losing the store is the failure that matters most, and a backup
+            # nobody knows is broken is worse than no backup - it is the same
+            # risk, plus the belief that it is covered.
+            print(f"project-memory-mcp: BACKUP FAILED to {self.destination}: {exc}",
+                  file=sys.stderr, flush=True)
+        return self.last_error
+
     def _run(self) -> None:
         while not self._stop.is_set():
             # Wait first: a snapshot at startup would duplicate whatever the
             # previous run already wrote.
             if self._stop.wait(self.interval):
                 return
-            try:
-                snapshot_database(self.database, self.destination, self.keep)
-                self.last_error = None
-            except Exception as exc:  # a failed backup must not take the server down
-                self.last_error = str(exc)
+            self.snapshot_once()

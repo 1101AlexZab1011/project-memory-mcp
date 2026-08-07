@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import sys
-from pathlib import Path
 from typing import Any
 
 from . import __version__
@@ -496,6 +495,8 @@ def run_server(store: Any) -> int:
         response = server.handle(message)
         if response is not None:
             write_message(response)
-    if hasattr(store, "flush_usage"):
-        store.flush_usage(force=True)
+    # There was a `if hasattr(store, "flush_usage"): store.flush_usage(force=True)`
+    # here, left over from the file backend. No store has ever had that method,
+    # so the guard was always false - which is exactly why nobody noticed. The
+    # SQLite store commits each write as it happens; there is nothing to flush.
     return 0

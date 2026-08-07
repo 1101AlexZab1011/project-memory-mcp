@@ -709,6 +709,50 @@ describes itself and one that used to.
 **Done when** `pyflakes` is clean on `project_memory_mcp/`, and `reindex` is either scheduled or
 documented as manual.
 
+### Outcome ✔
+
+`pyflakes` is clean across the package, the tools and the suite. `build/` is gone, and the
+non-editable install was replaced with `pip install -e .` — a script run from anywhere now resolves
+to the working tree, closing the trap that made step 2's first verification report the bug still
+open.
+
+**A correction to what step 3 claimed.** I wrote there that three surfaces were read by nothing.
+That was too broad, and checking properly:
+
+- `/api/audit` **is** tested (`test_ui.py`) and `last_run` is well covered. What it lacks is a *UI*
+  consumer — it is a working, tested HTTP endpoint with no button, which is not the same as dead.
+  Kept.
+- `Computer.last_error` **is** read, by a test, and is the in-process accessor a supervising process
+  would want. Kept; the stderr line added in step 3 is what reaches a person.
+- `BackupScheduler.last_error` was the genuinely dead one — and the finding underneath it was worse
+  than clutter. **A failing backup was completely silent.** The class exists because losing the store
+  is the failure that matters most, and it would report a snapshot failing every hour exactly as it
+  reported one succeeding every hour. Same defect as `run_one` before step 3, in the more
+  consequential place. It now says so on stderr, and `snapshot_once` was split out of the thread loop
+  so the failure path can be tested without waiting out an interval.
+
+**`reindex` is now scheduled**, decided on measurement rather than guesswork: 0.22s at 200 memories,
+0.89s at 500, 2.29s at 1000 — linear, ~2.3ms each, in 500-row slices that hand the lock back. Hourly
+on a 1000-memory store is a 0.06% duty cycle.
+
+The drift it repairs is narrower than the plan assumed, and worth recording. A write deletes every
+derived edge touching the memory *in both directions* and re-inserts only the outgoing ones. The
+pairs usually survive, because traversal reads edges both ways — but not when the top-K is
+asymmetric: if B counts A among its ten best and A does not count B, updating A drops `B->A` and
+nothing else puts it back.
+
+Every job kind is now reachable by the scheduler; `reindex` had a priority entry and no way to run.
+
+Also gone: the `flush_usage` hasattr guard (no store has ever had that method, so the guard was
+always false — which is why nobody noticed), and `store.recent()`, a second newest-first path that
+only a test reached. Its assertion moved onto `recall(order="recent")`, which is what actually ships
+— the test had been guarding the unused copy while the used one had no coverage of its own here.
+
+Two mutants, both caught, with a counterweight: a backup that announces itself on every run would
+make the failure message meaningless.
+
+**403 → 406 tests.**
+
 ## Step 11 — `search_memories` stops scanning the project
 
 **The problem.** It selects every body in the project and JSON-parses each one, then filters labels

@@ -438,7 +438,7 @@ def cmd_compute(args: argparse.Namespace) -> int:
 
     computer.start()
     scheduler = Scheduler(computer, lambda: projects, interval_seconds=args.interval,
-                          kinds=tuple(args.kind) if args.kind else ("outbox", "rebase", "audit", "evict", "dedup"))
+                          kinds=tuple(args.kind) if args.kind else ("outbox", "rebase", "audit", "evict", "reindex", "dedup"))
     scheduler.start()
     print(f"project-memory-mcp computer: {len(projects)} project(s), every {scheduler.interval}s",
           file=sys.stderr)

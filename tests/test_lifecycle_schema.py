@@ -369,8 +369,10 @@ class MigrationTests(unittest.TestCase):
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         self.addCleanup(httpd.shutdown)
 
-        from project_memory_mcp.http_server import run_http_server  # noqa: F401  (import proves the path)
-        registry.get("demo")  # what run_http_server does for every project at startup
+        # What run_http_server does for every project before it serves: open
+        # each store, so a pending migration runs at startup rather than
+        # inside somebody's first request.
+        registry.get("demo")
 
         connection = sqlite3.connect(self.db)
         version = connection.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]

@@ -141,3 +141,64 @@ class BackupTests(unittest.TestCase):
         scheduler.start()
         scheduler.stop()
         self.assertFalse(out.exists())
+
+
+class BackupFailureIsLoudTests(unittest.TestCase):
+    """A backup nobody knows is broken is worse than no backup.
+
+    `BackupScheduler.last_error` was written on every failure and read by
+    nothing, so a snapshot failing every hour looked exactly like one succeeding
+    every hour. This class exists because losing the store is the failure that
+    matters most - and the same risk, plus the belief that it is covered, is a
+    worse position than the risk alone.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "memory.db"
+        store = SqliteMemoryStore(self.db, "demo")
+        store.add_label("area:x", "x")
+        store.create_memory(memory("cache-race", CACHE, ["area:x"]))
+        store.close()
+
+    def scheduler(self, database=None, destination=None):
+        from project_memory_mcp.backup import BackupScheduler
+
+        return BackupScheduler(database or self.db,
+                               destination or Path(self.tmp.name) / "snapshots",
+                               interval_seconds=3600, keep=3)
+
+    def run_once(self, scheduler):
+        import contextlib
+        import io
+
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            error = scheduler.snapshot_once()
+        return error, captured.getvalue()
+
+    def test_a_failing_snapshot_says_so_on_stderr(self):
+        error, logged = self.run_once(self.scheduler(database=Path(self.tmp.name) / "gone.db"))
+        self.assertIsNotNone(error, "a snapshot of a missing database reported success")
+        self.assertIn("BACKUP FAILED", logged)
+
+    def test_a_working_snapshot_stays_quiet_and_writes_a_file(self):
+        # The counterweight: printing on every run would make the message above
+        # meaningless, and a scheduler that only ever failed would pass it.
+        scheduler = self.scheduler()
+        error, logged = self.run_once(scheduler)
+        self.assertIsNone(error)
+        self.assertEqual("", logged)
+        self.assertEqual(1, len(list((Path(self.tmp.name) / "snapshots").glob("*.db"))))
+
+    def test_a_failure_does_not_stop_the_next_attempt(self):
+        scheduler = self.scheduler(database=Path(self.tmp.name) / "gone.db")
+        self.run_once(scheduler)
+        scheduler.database = self.db  # whatever was wrong is fixed
+        self.assertIsNone(self.run_once(scheduler)[0])
+        self.assertIsNone(scheduler.last_error, "a stale error survived a successful run")
+
+
+if __name__ == "__main__":
+    unittest.main()

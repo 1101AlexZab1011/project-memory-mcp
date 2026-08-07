@@ -171,10 +171,16 @@ class SqliteStoreTests(unittest.TestCase):
         )
 
     def test_recent_is_newest_first_and_pages(self):
+        # Through recall(order="recent"), which is the path that ships. There
+        # was a separate `store.recent()` doing the same thing, reached only by
+        # this test - so the assertion protected a method nobody used while the
+        # one every caller goes through was covered by nothing here.
         for i in range(3):
             self.store.create_memory(memory("m-" + str(i), "Memory number %d about a failure mode." % i, ["area:x"]))
-        self.assertEqual("m-2", self.store.recent(limit=1)["memories"][0]["id"])
-        self.assertEqual("m-1", self.store.recent(limit=1, offset=1)["memories"][0]["id"])
+        newest = self.store.recall(order="recent", limit=1, record=False)
+        self.assertEqual("m-2", newest["memories"][0]["id"])
+        older = self.store.recall(order="recent", limit=1, offset=1, record=False)
+        self.assertEqual("m-1", older["memories"][0]["id"])
 
     def test_usage_counters_are_upserted(self):
         self.store.create_memory(memory("cache-race", CACHE, ["area:x"]))
