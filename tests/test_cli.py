@@ -186,6 +186,46 @@ class ServerWideSetupTests(CliCase):
                     (table,)).fetchone(), f"{table} was not created")
 
 
+class RemoteFlagTests(CliCase):
+    """The flags are the surface a person touches, so they get their own check."""
+
+    def setUp(self):
+        super().setUp()
+        main(["init", "--database", str(self.db), "--project", "demo"])
+
+    def remote(self, *args):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = main(["remote", "--database", str(self.db), "--project", "demo", *args])
+        return code, out.getvalue()
+
+    def remotes(self):
+        from project_memory_mcp import federation
+
+        return {r.name: r for r in federation.list_remotes(self.open_store().connection)}
+
+    def test_a_remote_can_be_disabled_and_re_enabled(self):
+        self.remote("--name", "team", "--url", "http://127.0.0.1:9/", "--description", "team")
+
+        self.assertEqual(0, self.remote("--disable", "team")[0])
+        self.assertFalse(self.remotes()["team"].enabled)
+
+        self.assertEqual(0, self.remote("--enable", "team")[0])
+        self.assertTrue(self.remotes()["team"].enabled)
+
+    def test_the_listing_says_which_are_disabled(self):
+        # This display branch existed and was unreachable, there being no way to
+        # disable anything.
+        self.remote("--name", "team", "--url", "http://127.0.0.1:9/", "--description", "team")
+        self.remote("--disable", "team")
+        self.assertIn("(disabled)", self.remote()[1])
+
+    def test_disabling_something_that_is_not_there_fails(self):
+        self.assertEqual(1, self.remote("--disable", "ghost")[0])
+
+
 class DestructiveConfirmationTests(CliCase):
     """`audit --apply` must not act without `--yes`.
 

@@ -150,6 +150,31 @@ MUTANTS = [
      "                rows.append((self.project, uuid, body[\"id\"], body.get(\"status\", \"active\"),\n"
      "                             body.get(\"description\", \"\"), stamp, json.dumps(body), None))"),
 
+    # ------------------------------------------------------------ remote state
+    ("disabling a remote throws its queued work away", "federation.py",
+     "        connection.execute(\"UPDATE remotes SET enabled=? WHERE name=?\", "
+     "(1 if enabled else 0, name))",
+     "        connection.execute(\"UPDATE remotes SET enabled=? WHERE name=?\", "
+     "(1 if enabled else 0, name))\n"
+     "        connection.execute(\"DELETE FROM outbox WHERE remote=?\", (name,))"),
+
+    ("disabling a remote does nothing at all", "federation.py",
+     "        connection.execute(\"UPDATE remotes SET enabled=? WHERE name=?\", "
+     "(1 if enabled else 0, name))",
+     "        pass"),
+
+    ("removing a remote strands its queue again", "federation.py",
+     "        connection.execute(\"DELETE FROM outbox WHERE remote=?\", (name,))\n"
+     "        connection.execute(\"DELETE FROM remotes WHERE name=?\", (name,))",
+     "        connection.execute(\"DELETE FROM remotes WHERE name=?\", (name,))"),
+
+    # The counterweight: dropping the whole outbox loses unrelated work.
+    ("removing one remote empties every remote's queue", "federation.py",
+     "        connection.execute(\"DELETE FROM outbox WHERE remote=?\", (name,))\n"
+     "        connection.execute(\"DELETE FROM remotes WHERE name=?\", (name,))",
+     "        connection.execute(\"DELETE FROM outbox\")\n"
+     "        connection.execute(\"DELETE FROM remotes WHERE name=?\", (name,))"),
+
     # ---------------------------------------------------------------- outbound
     # Inbound signature verification was complete and tested for a long time
     # while the outbound half was a parameter nobody passed. These guard the

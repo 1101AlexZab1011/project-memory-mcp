@@ -643,6 +643,36 @@ already implies about the URL and token.
 **Done when** a disabled remote is skipped by recall and delivery, survives a restart, can be
 re-enabled without re-entering its credentials, and removing one leaves nothing undeliverable behind.
 
+### Outcome ✔
+
+The decision the step asked for: **a disabled remote keeps its queue, a removed one does not.** That
+is what the two words mean. Disabling says "not now" — recall stops asking, delivery stops trying,
+and both resume where they left off with the url, token and description intact. Removing says "there
+is nowhere to send this any more", and the queue goes with it, reported rather than silent, because
+whoever removed a remote may not have known there was unpublished work aimed at it.
+
+```text
+disable  -> queued: 1, delivered: none, url and token kept
+enable   -> queued: 1, resumes
+remove   -> {'removed': 'team', 'cancelled_promotions': 1}, and other remotes' queues untouched
+```
+
+**Enabling disabling made a latent bad message reachable.** `promote` checked membership of the
+*enabled* set but listed *all* remotes in its error, so a disabled one produced:
+
+```text
+StoreError: Unknown remote 'team'. Known: team
+```
+
+A message that contradicts itself in the same breath. It could not be reached before this step,
+because nothing could disable a remote. It now says the remote is disabled and how to turn it back
+on. The CLI's `(disabled)` display branch was unreachable for the same reason, and is now tested.
+
+Four mutants, all caught, including the counterweight — removing one remote must not empty every
+remote's queue, which "drop what cannot be delivered" would otherwise be satisfied by.
+
+**393 → 403 tests.**
+
 ## Step 10 — Dead code sweep
 
 Each of these is independently small; together they are the difference between a codebase that

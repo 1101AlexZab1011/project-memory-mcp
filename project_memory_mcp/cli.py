@@ -462,8 +462,19 @@ def cmd_remote(args: argparse.Namespace) -> int:
     store = SqliteMemoryStore(args.database, args.project, create=False)
     try:
         if args.remove:
-            print(federation.remove_remote(store.connection, args.remove)["removed"], "removed")
+            result = federation.remove_remote(store.connection, args.remove)
+            print(result["removed"], "removed")
+            if result.get("cancelled_promotions"):
+                print(f"  {result['cancelled_promotions']} queued promotion(s) dropped with it. "
+                      f"Use --disable next time to stop federating and keep them.")
             return 0
+        for name, enabled in ((args.enable, True), (args.disable, False)):
+            if name:
+                state = federation.set_remote_enabled(store.connection, name, enabled)
+                print(f"remote '{name}' {'enabled' if state['enabled'] else 'disabled'}")
+                if not enabled:
+                    print("  it keeps its url, token and anything queued for it.")
+                return 0
         if args.url:
             federation.add_remote(store.connection, args.name, args.url,
                                   description=args.description, token=args.token)
@@ -668,7 +679,12 @@ def build_parser() -> argparse.ArgumentParser:
                                help="What this server is for. Agents read it to route promotions.")
     remote_parser.add_argument("--token", default=None,
                                help="Bearer token, if this machine has no enrolled key there.")
-    remote_parser.add_argument("--remove", default=None, metavar="NAME", help="Remove a remote.")
+    remote_parser.add_argument("--remove", default=None, metavar="NAME",
+                               help="Forget a remote, and drop anything queued for it.")
+    remote_parser.add_argument("--disable", default=None, metavar="NAME",
+                               help="Stop federating with a remote, keeping its settings and queue.")
+    remote_parser.add_argument("--enable", default=None, metavar="NAME",
+                               help="Resume federating with a disabled remote.")
     remote_parser.set_defaults(func=cmd_remote)
 
     skills_parser = subparsers.add_parser(

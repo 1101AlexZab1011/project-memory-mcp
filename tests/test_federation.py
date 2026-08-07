@@ -548,6 +548,90 @@ class ToolSurfaceTests(TierCase):
                          "the project lock was held while waiting on a remote")
 
 
+class RemoteLifecycleTests(TierCase):
+    """Disabling and removing are different intentions, and now different acts.
+
+    `enabled` was read in six places and written by nothing but the schema
+    default, so the only way to stop talking to a server was `--remove`, which
+    discards its url, token and description. "Down for a week" should not cost
+    the credential you need to come back.
+
+    And removal used to leave its queue behind: `deliver_outbox` builds its
+    lookup from enabled remotes, so promotions to a server that no longer exists
+    were skipped on every run - never delivered, never dropped, never reported.
+    The same shape as the orphan a deleted memory left, deferred here from step
+    3 because it belongs with the remote lifecycle.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = SqliteMemoryStore(Path(self.tmp.name) / "memory.db", "demo")
+        self.addCleanup(self.store.close)
+        self.store.add_label("area:x", "x")
+        federation.add_remote(self.store.connection, "team", "http://127.0.0.1:9/",
+                              "Shared knowledge", token="team-token")
+        self.store.create_memory(memory("cache-race", CACHE), visibility="public")
+        self.earn("cache-race")
+        federation.promote(self.store, "cache-race", "team")
+
+    def queued(self):
+        return self.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM outbox").fetchone()["n"]
+
+    def test_a_disabled_remote_keeps_its_queue(self):
+        federation.set_remote_enabled(self.store.connection, "team", False)
+        federation.deliver_outbox(self.store)
+        self.assertEqual(1, self.queued(), "disabling a remote discarded its queued work")
+
+    def test_a_disabled_remote_is_not_queried_or_delivered_to(self):
+        federation.set_remote_enabled(self.store.connection, "team", False)
+        self.assertEqual([], [r.name for r in federation.list_remotes(
+            self.store.connection, enabled_only=True)])
+        self.assertEqual([], federation.deliver_outbox(self.store)["sent"])
+
+    def test_re_enabling_needs_no_credentials_re_entered(self):
+        federation.set_remote_enabled(self.store.connection, "team", False)
+        federation.set_remote_enabled(self.store.connection, "team", True)
+        remote = federation.list_remotes(self.store.connection)[0]
+        self.assertEqual("http://127.0.0.1:9", remote.url)
+        self.assertEqual("team-token", remote.token)
+        self.assertEqual("Shared knowledge", remote.description)
+        self.assertEqual(1, self.queued(), "the queue did not survive the round trip")
+
+    def test_promoting_to_a_disabled_remote_says_it_is_disabled(self):
+        # This branch was unreachable until remotes could be disabled, and it
+        # answered "Unknown remote 'team'. Known: team" - a message that
+        # contradicts itself in the same breath.
+        federation.set_remote_enabled(self.store.connection, "team", False)
+        with self.assertRaises(StoreError) as caught:
+            federation.promote(self.store, "cache-race", "team")
+        self.assertIn("is disabled", str(caught.exception))
+
+    def test_removing_a_remote_drops_what_was_queued_for_it(self):
+        result = federation.remove_remote(self.store.connection, "team")
+        self.assertEqual(1, result["cancelled_promotions"],
+                         "the caller was not told queued work went with the remote")
+        self.assertEqual(0, self.queued(),
+                         "a promotion was left queued to a server that no longer exists")
+
+    def test_removing_a_remote_leaves_other_remotes_queues_alone(self):
+        # The counterweight. Dropping the whole outbox would satisfy the test
+        # above and lose unrelated work.
+        federation.add_remote(self.store.connection, "personal", "http://127.0.0.1:9/", "mine")
+        federation.promote(self.store, "cache-race", "personal")
+        self.assertEqual(2, self.queued())
+
+        federation.remove_remote(self.store.connection, "team")
+
+        rows = self.store.connection.execute("SELECT remote FROM outbox").fetchall()
+        self.assertEqual(["personal"], [r["remote"] for r in rows])
+
+    def test_enabling_an_unknown_remote_is_an_error_not_a_no_op(self):
+        with self.assertRaises(StoreError):
+            federation.set_remote_enabled(self.store.connection, "ghost", True)
+
+
 class TokenFreeFederationTests(TierCase):
     """Federating with a key and no bearer token at all.
 

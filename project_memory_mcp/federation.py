@@ -91,10 +91,49 @@ def add_remote(connection: sqlite3.Connection, name: str, url: str,
     return {"added": name, "url": url}
 
 
-def remove_remote(connection: sqlite3.Connection, name: str) -> dict[str, Any]:
+def set_remote_enabled(connection: sqlite3.Connection, name: str, enabled: bool) -> dict[str, Any]:
+    """Stop or resume federating with a remote without forgetting it.
+
+    `enabled` was read in six places and written by nothing but the schema
+    default, so the only way to stop talking to a server was to remove it -
+    which discards its url, token and description. Those are different
+    intentions: "down for a week" should not cost you the credential you need to
+    come back.
+
+    A disabled remote keeps its queue. That is what disabling means: recall
+    stops asking it and delivery stops trying, and both resume where they left
+    off. Contrast `remove_remote`, which drops the queue because there is no
+    longer anywhere for it to go.
+    """
+    if not connection.execute("SELECT 1 FROM remotes WHERE name=?", (name,)).fetchone():
+        raise StoreError(f"Unknown remote: {name}")
     with connection:
+        connection.execute("UPDATE remotes SET enabled=? WHERE name=?", (1 if enabled else 0, name))
+    return {"remote": name, "enabled": bool(enabled)}
+
+
+def remove_remote(connection: sqlite3.Connection, name: str) -> dict[str, Any]:
+    """Forget a remote, and anything queued for it.
+
+    The queue has to go with it. `deliver_outbox` builds its lookup from enabled
+    remotes, so a promotion queued to a server that no longer exists was skipped
+    on every run - never delivered, never dropped, never reported. Same family
+    as the orphan a deleted memory used to leave, different cause: there is
+    nowhere to send it, and no url or token left to reach anywhere with.
+
+    Use `set_remote_enabled(..., False)` to stop federating and keep the queue.
+    """
+    with connection:
+        cancelled = connection.execute(
+            "SELECT COUNT(*) AS n FROM outbox WHERE remote=?", (name,)).fetchone()["n"]
+        connection.execute("DELETE FROM outbox WHERE remote=?", (name,))
         connection.execute("DELETE FROM remotes WHERE name=?", (name,))
-    return {"removed": name}
+    result: dict[str, Any] = {"removed": name}
+    if cancelled:
+        # Said out loud: removing a remote is not obviously a decision about
+        # unpublished work, and whoever did it may not have known there was any.
+        result["cancelled_promotions"] = cancelled
+    return result
 
 
 def list_remotes(connection: sqlite3.Connection, enabled_only: bool = False) -> list[Remote]:
@@ -282,6 +321,14 @@ def promote(store: Any, memory_id: str, remote: str,
             f"matters more than its usage will ever show.")
 
     known = list_remotes(store.connection)
+    if remote in {r.name for r in known if not r.enabled}:
+        # Distinguished from unknown, which it is not. This branch could not be
+        # reached until remotes could be disabled at all, and it answered
+        # "Unknown remote 'team'. Known: team" - a message that contradicts
+        # itself in the same breath.
+        raise StoreError(
+            f"Remote '{remote}' is disabled. Re-enable it with "
+            f"`project-memory-mcp remote --enable {remote}`, or promote somewhere else.")
     if remote not in {r.name for r in known if r.enabled}:
         names = ", ".join(r.name for r in known) or "(none configured)"
         raise StoreError(f"Unknown remote '{remote}'. Known: {names}")
