@@ -153,11 +153,21 @@ class Report:
     def truthy(self, claim: str, got) -> bool:
         return self.check(claim, bool(got), True)
 
-    def summary(self) -> int:
+    def summary(self, expected: int) -> int:
         total = len(self.passed) + len(self.failed)
-        print(f"\n{len(self.passed)}/{total} invariants held")
+        print("\n%d/%d invariants held" % (len(self.passed), total))
         for claim, detail in self.failed:
-            print(f"  BROKEN  {claim}\n          {detail}")
+            print("  BROKEN  %s\n          %s" % (claim, detail))
+        if total != expected:
+            # A check that does not run is not a check that passed. Several of
+            # these sit behind an `if`, and a regression that empties the
+            # condition deletes them silently while the ratio still reads N/N.
+            # Removing the audit's per-run cap did exactly that: 98/98, green,
+            # three checks gone.
+            print("  BROKEN  the run made %d checks, expected %d" % (total, expected))
+            print("          A check that stopped being reached is a regression,")
+            print("          not a smaller test.")
+            return 1
         return 1 if self.failed else 0
 
 
@@ -310,6 +320,25 @@ def act_day_zero(report: Report, world: dict) -> None:
                 machine.call(store, "create_memory", memory=document,
                              visibility="public" if index % 3 else "private")
                 written.append(slug)
+            if name == "laptop":
+                # A keystone: never queried, never applied, but pointed at by
+                # others. The audit keeps it on incoming links alone, and that
+                # is the branch a usage-only retention policy gets wrong -
+                # "load-bearing even if rarely matched on its own". Breaking
+                # that branch changed nothing here until this existed, because
+                # every other memory survived on an earlier one.
+                machine.call(store, "create_memory", memory=memory_document(
+                    "laptop-keystone", "tooling", "build graph",
+                    "the build graph is what every other tooling note ends up "
+                    "depending on", labels=["area:tooling", "kind:gotcha"]))
+                for index in (0, 1):
+                    machine.call(store, "create_memory", memory=memory_document(
+                        "laptop-depends-%d" % index, "tooling", "build graph",
+                        "a tooling note that only makes sense beside the build "
+                        "graph note, number %d" % index,
+                        labels=["area:tooling", "kind:gotcha"],
+                        related=["laptop-keystone"]))
+                written.extend(["laptop-keystone", "laptop-depends-0", "laptop-depends-1"])
             machine.written = written
             report.note(f"{name}: wrote {len(written)} memories")
             report.check(f"{name} validates clean after writing",
@@ -500,6 +529,16 @@ def act_first_audit(report: Report, world: dict) -> None:
     try:
         preview = run_audit(probe, policy=AuditPolicy(), apply=False, record=False)
         report.note("audit sees %d due of %d examined" % (preview.due, preview.examined))
+        reasons = {f.slug: f.reason for f in preview.findings}
+        report.truthy("a memory kept alive by matching queries says so",
+                      any("matched a query directly" in reasons.get(s, "")
+                          for s in laptop.written[:3]))
+        report.truthy("the per-run cap holds back what one sweep may touch",
+                      [f for f in preview.findings if "per-run cap" in f.reason])
+        # Never queried and never applied. If it survives, it survives on the
+        # one signal that is not usage at all.
+        report.check("a memory nothing queries but others depend on is kept",
+                     reasons.get("laptop-keystone", ""), "2 other memories link to it")
         for finding in preview.findings:
             report.note("  %-28s %-8s %s" % (finding.slug, finding.verdict, finding.reason))
     finally:
@@ -1035,6 +1074,10 @@ def act_backup_and_projects(report: Report, world: dict) -> None:
 
 # ------------------------------------------------------------------------ main
 
+#: Every check the run should make. Asserted, so that a check which stops being
+#: reached fails rather than quietly shrinking the total.
+EXPECTED_INVARIANTS = 104
+
 ACTS = (
     act_day_zero,
     act_enrollment,
@@ -1091,7 +1134,7 @@ def main() -> int:
             shutil.rmtree(root, ignore_errors=True)
         else:
             print("world kept at %s" % root)
-    return report.summary()
+    return report.summary(EXPECTED_INVARIANTS)
 
 
 if __name__ == "__main__":
