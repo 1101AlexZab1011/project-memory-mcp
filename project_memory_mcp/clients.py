@@ -184,16 +184,33 @@ def authenticate(connection: sqlite3.Connection, headers: Any, method: str, path
     raise StoreError("invalid token")
 
 
-def token_is_valid(connection: sqlite3.Connection, presented: str) -> bool:
-    """Whether any live client holds this bearer token. Used by the UI login."""
+def client_for_token(connection: sqlite3.Connection, presented: str,
+                     shared_token: str | None = None) -> Client | None:
+    """Which client holds this bearer token, or None. The UI login path.
+
+    Replaces a `token_is_valid` that answered yes or no. That was the whole bug:
+    the browser session it authorised remembered *that* somebody signed in and
+    not *who*, so a client scoped to one project got a session scoped to all of
+    them - and the UI, unlike /mcp, never checked.
+
+    Deliberately not merged with `authenticate` even though the token lookup is
+    the same. That one raises to say which of "unknown" and "revoked" happened,
+    because an MCP client needs to know whether to re-enroll or give up. This
+    one returns None either way: an unauthenticated browser must not be told
+    that a token it presented was real but withdrawn.
+    """
     if not presented:
-        return False
+        return None
     digest = _hash_token(presented)
-    for row in connection.execute(
-            "SELECT token_hash, revoked_at FROM clients WHERE token_hash IS NOT NULL"):
-        if hmac.compare_digest(digest, row["token_hash"]) and not row["revoked_at"]:
-            return True
-    return False
+    for row in connection.execute("SELECT * FROM clients WHERE token_hash IS NOT NULL"):
+        if hmac.compare_digest(digest, row["token_hash"]):
+            return None if row["revoked_at"] else _row_to_client(row)
+    # Last, and only if configured, matching the order in `authenticate`: the
+    # shared token is the legacy credential and holds no scope, so a deployment
+    # that has moved to per-client tokens should not find it shadowing one.
+    if shared_token and hmac.compare_digest(presented, shared_token):
+        return SHARED_TOKEN_CLIENT
+    return None
 
 
 def _touch(connection: sqlite3.Connection, client_id: str) -> None:

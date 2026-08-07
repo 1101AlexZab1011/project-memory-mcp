@@ -12,6 +12,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from project_memory_mcp import clients
 from project_memory_mcp.http_server import _Handler, _Sessions, _StoreRegistry
 from project_memory_mcp.sqlite_store import SqliteMemoryStore
 
@@ -323,8 +324,15 @@ class UiTests(unittest.TestCase):
         self.assertEqual(200, self.get("/api/projects")[0])
         sessions: _Sessions = self.httpd.RequestHandlerClass.sessions
         with sessions._guard:
-            for sid in list(sessions._issued):
-                sessions._issued[sid] = _time.time() - 1
+            # Age the expiry and keep the identity beside it. Rewriting the
+            # whole entry is how this test broke when sessions started carrying
+            # the client that opened them: it wrote a bare float, `client_for`
+            # raised unpacking it, and the request failed at the transport - so
+            # the test still "failed on an expired session", for the wrong
+            # reason. A white-box test has to be re-read whenever the state it
+            # reaches into changes shape.
+            for sid, (_expiry, client) in list(sessions._issued.items()):
+                sessions._issued[sid] = (_time.time() - 1, client)
         self.assertEqual(401, self.get("/api/projects")[0],
                          "an expired session still worked")
 
@@ -333,6 +341,134 @@ class UiTests(unittest.TestCase):
         self.assertEqual(200, self.get("/api/projects")[0])
         self.post("/api/logout")
         self.assertEqual(401, self.get("/api/projects")[0])
+
+
+class UiProjectScopeTests(unittest.TestCase):
+    """A scoped credential buys a scoped session.
+
+    The UI used to gate on "is there a session" and nothing else, while /mcp
+    checked `project_scope` properly. So a client enrolled for one project could
+    sign in to the browser UI and read, edit and *delete* every other project on
+    the server. Confirmed against a real server before the fix, deletion
+    included.
+
+    Both transports are asserted here on purpose. The /mcp assertion existed
+    throughout the bug's life and passed the whole time - which is exactly why a
+    second one, on the path that was actually open, is what closes it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "memory.db"
+        for project in ("mine", "theirs"):
+            seed = SqliteMemoryStore(self.db, project)
+            seed.add_label("area:x", "x")
+            seed.create_memory(memory(project + "-note", CACHE, ["area:x"]))
+            seed.close()
+
+        registry = self.registry = _StoreRegistry(self.db)
+        self.addCleanup(registry.close)
+        code = clients.create_code(registry.control(), name="scoped", projects=["mine"])
+        self.scoped_token = clients.redeem_code(
+            registry.control(), code["code"], "scoped")["token"]
+
+        handler = type("H", (_Handler,), {"registry": registry, "token": TOKEN,
+                                          "sessions": _Sessions(), "ui_enabled": True})
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.addCleanup(self.httpd.server_close)
+        self.base = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.shutdown)
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+
+    def sign_in(self, token):
+        request = urllib.request.Request(
+            self.base + "/api/login", data=("token=" + token).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with self.opener.open(request, timeout=10) as response:
+            self.assertEqual(200, response.status)
+
+    def get(self, path):
+        try:
+            with self.opener.open(self.base + path, timeout=10) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode()
+
+    def post(self, path, payload):
+        request = urllib.request.Request(
+            self.base + path, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        try:
+            with self.opener.open(request, timeout=10) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode()
+
+    # ------------------------------------------------------------------ tests
+
+    def test_a_scoped_client_can_still_reach_its_own_project(self):
+        # The check that keeps the others honest: refusing everything would
+        # satisfy them and would not be a fix.
+        self.sign_in(self.scoped_token)
+        status, body = self.get("/api/memories?project=mine")
+        self.assertEqual(200, status)
+        self.assertEqual(["mine-note"], [m["id"] for m in json.loads(body)["memories"]])
+
+    def test_a_scoped_client_cannot_read_another_project(self):
+        self.sign_in(self.scoped_token)
+        status, body = self.get("/api/memories?project=theirs")
+        self.assertEqual(403, status, "the UI served a project this client is not scoped to")
+        self.assertNotIn("theirs-note", body)
+
+    def test_a_scoped_client_cannot_delete_in_another_project(self):
+        self.sign_in(self.scoped_token)
+        status, _ = self.post("/api/delete", {"project": "theirs", "id": "theirs-note"})
+        self.assertEqual(403, status)
+        survivor = SqliteMemoryStore(self.db, "theirs", create=False)
+        self.addCleanup(survivor.close)
+        self.assertEqual(1, survivor.count(), "the memory was deleted across a scope boundary")
+
+    def test_a_scoped_client_is_not_told_which_other_projects_exist(self):
+        self.sign_in(self.scoped_token)
+        status, body = self.get("/api/projects")
+        self.assertEqual(200, status)
+        self.assertEqual(["mine"], json.loads(body)["projects"])
+
+    def test_the_shared_token_is_still_unscoped(self):
+        # It carries no scope by definition, and the deployment that uses it has
+        # no per-client identities to scope against. Narrowing it here would
+        # break every existing single-token setup to fix nothing.
+        self.sign_in(TOKEN)
+        self.assertEqual(200, self.get("/api/memories?project=theirs")[0])
+        self.assertEqual(["mine", "theirs"], json.loads(self.get("/api/projects")[1])["projects"])
+
+    def test_a_revoked_clients_token_no_longer_signs_in(self):
+        listed = clients.list_clients(self.registry.control())
+        clients.revoke(self.registry.control(), listed[0]["client_id"])
+        request = urllib.request.Request(
+            self.base + "/api/login", data=("token=" + self.scoped_token).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with self.opener.open(request, timeout=10) as response:
+                self.fail(f"a revoked token was accepted ({response.status})")
+        except urllib.error.HTTPError as error:
+            self.assertEqual(401, error.code)
+
+    def test_mcp_refuses_the_same_project_for_the_same_client(self):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "recall", "arguments": {"query": "cache"}}}).encode()
+        request = urllib.request.Request(
+            self.base + "/mcp?project=theirs", data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + self.scoped_token})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                self.fail(f"MCP served an out-of-scope project ({response.status})")
+        except urllib.error.HTTPError as error:
+            self.assertEqual(403, error.code)
 
 
 class UiDisabledTests(unittest.TestCase):

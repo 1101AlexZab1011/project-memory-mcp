@@ -17,7 +17,6 @@ Security posture, deliberately narrow:
 
 from __future__ import annotations
 
-import hmac
 import json
 import secrets
 import sqlite3
@@ -103,35 +102,53 @@ def _talks_to_other_machines(message: dict[str, Any]) -> bool:
     return bool((params.get("arguments") or {}).get("include_remotes"))
 
 
+class _Forbidden(Exception):
+    """Authenticated, but not for this project.
+
+    Distinct from StoreError so the UI routes answer 403 rather than the 404 or
+    400 they map storage failures to. Which code comes back matters here: "not
+    yours" and "not found" are different facts and a client acts differently on
+    each.
+    """
+
+
 class _Sessions:
-    """Browser sessions for the UI.
+    """Browser sessions for the UI, each carrying the identity that opened it.
 
     The cookie carries a random id, not the token: a leaked session expires and
     can be revoked, whereas a leaked master token is the whole store. MCP
     clients keep using the Bearer header and never touch this.
+
+    A session stores *who* signed in, not merely that somebody did. Holding only
+    an expiry is what let a client scoped to one project read and delete every
+    other one through the UI: the credential was scoped, the session it bought
+    was not, and nothing downstream could tell the difference because there was
+    nothing left to ask.
     """
 
     def __init__(self) -> None:
-        self._issued: dict[str, float] = {}
+        self._issued: dict[str, tuple[float, clients.Client]] = {}
         self._guard = threading.Lock()
 
-    def create(self) -> str:
+    def create(self, client: clients.Client) -> str:
         sid = secrets.token_urlsafe(32)
         with self._guard:
-            self._issued[sid] = time.time() + SESSION_TTL_SECONDS
+            self._issued[sid] = (time.time() + SESSION_TTL_SECONDS, client)
         return sid
 
-    def valid(self, sid: str | None) -> bool:
+    def client_for(self, sid: str | None) -> clients.Client | None:
+        """The signed-in client, or None if there is no live session."""
         if not sid:
-            return False
+            return None
         with self._guard:
-            expiry = self._issued.get(sid)
-            if expiry is None:
-                return False
+            entry = self._issued.get(sid)
+            if entry is None:
+                return None
+            expiry, client = entry
             if expiry < time.time():
                 del self._issued[sid]
-                return False
-            return True
+                return None
+            return client
 
     def drop(self, sid: str | None) -> None:
         if sid:
@@ -178,8 +195,16 @@ class _Handler(BaseHTTPRequestHandler):
                 return value
         return None
 
-    def _has_session(self) -> bool:
-        return self.sessions.valid(self._cookie())
+    def _adopt_session(self) -> bool:
+        """Resolve the browser session onto `self.client`, as `_identify` does for MCP.
+
+        Both entry points therefore leave the caller's identity in the same
+        place, and `_require_project` stays a single gate. It was already the
+        single gate in name; it was only ever reached from one of the two paths,
+        which is not a thing you can see by reading it.
+        """
+        self.client = self.sessions.client_for(self._cookie())
+        return self.client is not None
 
     def _read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length") or 0)
@@ -196,6 +221,13 @@ class _Handler(BaseHTTPRequestHandler):
     def _store_for(self, project: str):
         if not project:
             raise StoreError("missing project")
+        # The scope check lives here rather than in each route because this is
+        # the one call every project-scoped route already has to make. A route
+        # added later cannot forget it - and forgetting it, once, in a place
+        # that looked like it had no security responsibility, is precisely how
+        # the UI came to be unscoped while /mcp was not.
+        if not self._may_access(project):
+            raise _Forbidden(f"this client has no access to project '{project}'")
         return self.registry.get(project)
 
     def _identify(self, method: str, path: str, body: bytes = b"") -> bool:
@@ -228,8 +260,21 @@ class _Handler(BaseHTTPRequestHandler):
     # should call clients.Client.is_admin at the point it matters rather than
     # trusting a helper to have been used.
 
+    def _may_access(self, project: str) -> bool:
+        """The one place the scoping rule is written.
+
+        Both transports ask it. They differ only in how they refuse: /mcp is
+        answering a JSON-RPC client and sends its own 403, while the UI routes
+        raise so that the check can sit in `_store_for` and be unskippable.
+        Two spellings of one rule is how they drift apart, so there is one.
+
+        `None` means an unauthenticated local caller - stdio, a test, the CLI -
+        which is not scoped because there is no client to scope it to.
+        """
+        return self.client is None or self.client.may_access(project)
+
     def _require_project(self, project: str) -> bool:
-        if self.client is None or self.client.may_access(project):
+        if self._may_access(project):
             return True
         self._send(403, {"error": f"this client has no access to project '{project}'"})
         return False
@@ -256,13 +301,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_html(200, ui.login_page())
             return
         if path == "/":
-            if not self._has_session():
+            if not self._adopt_session():
                 self._send_html(303, "", {"Location": "/login"})
                 return
             self._send_html(200, ui.app_page())
             return
         if path.startswith("/api/"):
-            if not self._has_session():
+            if not self._adopt_session():
                 self._send(401, {"error": "not signed in"})
                 return
             self._api_get(path, query)
@@ -275,13 +320,16 @@ class _Handler(BaseHTTPRequestHandler):
 
         try:
             if path == "/api/projects":
-                import sqlite3
-
                 connection = sqlite3.connect(str(self.registry.database))
                 try:
-                    self._send(200, {"projects": SqliteMemoryStore.list_projects(connection)})
+                    names = SqliteMemoryStore.list_projects(connection)
                 finally:
                     connection.close()
+                # Filtered, not merely unclickable. A scoped client should not
+                # learn the names of projects it cannot open - and the routes
+                # would refuse anyway, so listing them offers nothing but the
+                # names.
+                self._send(200, {"projects": [p for p in names if self._may_access(p)]})
                 return
 
             store, lock = self._store_for(one("project"))
@@ -363,6 +411,9 @@ class _Handler(BaseHTTPRequestHandler):
                 with lock:
                     self._send(200, last_run(store, verdicts or None))
                 return
+        except _Forbidden as exc:
+            self._send(403, {"error": str(exc)})
+            return
         except StoreError as exc:
             self._send(404, {"error": str(exc)})
             return
@@ -384,15 +435,16 @@ class _Handler(BaseHTTPRequestHandler):
                 key, _, value = pair.partition("=")
                 if key == "token":
                     presented = unquote_plus(value)
-            accepted = bool(self.token) and hmac.compare_digest(presented, self.token)
-            if not accepted:
-                # A per-client token works here too: whoever holds a credential
-                # for this server can read it in a browser.
-                accepted = clients.token_is_valid(self.registry.control(), presented)
-            if not accepted:
+            # A per-client token works here too: whoever holds a credential for
+            # this server can read it in a browser. What it buys is a session
+            # carrying that client's scope, not a session carrying everything -
+            # so the credential means the same thing in both transports.
+            client = clients.client_for_token(
+                self.registry.control(), presented, shared_token=self.token)
+            if client is None:
                 self._send_html(401, ui.login_page("That token was not accepted."))
                 return
-            sid = self.sessions.create()
+            sid = self.sessions.create(client)
             # SameSite=Strict is what defends the status and delete routes: a
             # cross-site request will not carry this cookie, so no separate CSRF
             # token is needed. HttpOnly keeps it out of reach of page scripts.
@@ -405,7 +457,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True})
             return
 
-        if not self._has_session():
+        if not self._adopt_session():
             self._send(401, {"error": "not signed in"})
             return
         try:
@@ -454,6 +506,9 @@ class _Handler(BaseHTTPRequestHandler):
                         store, memory_id, str(payload.get("remote") or ""),
                         force=bool(payload.get("force"))))
                 return
+        except _Forbidden as exc:
+            self._send(403, {"error": str(exc)})
+            return
         except StoreError as exc:
             self._send(400, {"error": str(exc)})
             return

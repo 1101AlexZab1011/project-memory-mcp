@@ -62,9 +62,14 @@ class Mutation:
 
 MUTANTS = [
     # ------------------------------------------------------------------- auth
-    ("the UI accepts any token", "http_server.py",
-     "            accepted = bool(self.token) and hmac.compare_digest(presented, self.token)",
-     "            accepted = True"),
+    # The token comparison moved into clients.client_for_token when the UI login
+    # started resolving a token to *which* client holds it rather than to yes or
+    # no. Mutating the tail to hand back the unscoped shared client is the same
+    # property in its new home: any string signs in, as anyone.
+    ("the UI accepts any token", "clients.py",
+     "    if shared_token and hmac.compare_digest(presented, shared_token):\n"
+     "        return SHARED_TOKEN_CLIENT\n    return None",
+     "    return SHARED_TOKEN_CLIENT"),
 
     ("expired sessions stay valid", "http_server.py",
      "            if expiry < time.time():",
@@ -78,9 +83,22 @@ MUTANTS = [
     # _require_admin was called by nothing - dead code, not an untested guard -
     # and it has been deleted. See the note where it used to live.
 
+    # One predicate now, asked by both transports. It used to be spelled inside
+    # _require_project, which only the /mcp path ever called - so this mutant
+    # passed while the UI was wide open. Pointing it at the shared predicate is
+    # what makes it cover both.
     ("project scoping is not enforced", "http_server.py",
-     "        if self.client is None or self.client.may_access(project):\n            return True",
-     "        if True:\n            return True"),
+     "        return self.client is None or self.client.may_access(project)",
+     "        return True"),
+
+    ("a browser session forgets which client opened it", "http_server.py",
+     "            self._issued[sid] = (time.time() + SESSION_TTL_SECONDS, client)",
+     "            self._issued[sid] = (time.time() + SESSION_TTL_SECONDS, "
+     "clients.SHARED_TOKEN_CLIENT)"),
+
+    ("the UI login accepts a revoked client's token", "clients.py",
+     "            return None if row[\"revoked_at\"] else _row_to_client(row)",
+     "            return _row_to_client(row)"),
 
     ("a revoked client can still authenticate", "clients.py",
      "        if row[\"revoked_at\"]:\n            raise StoreError(\"This client has been revoked.\")",

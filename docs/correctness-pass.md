@@ -148,6 +148,52 @@ exists and passed throughout this bug's life, which is precisely why a second on
 **Done when** the repro above returns 403 on all three UI calls, and `/api/projects` shows one
 project.
 
+### Outcome ✔
+
+```text
+GET  /api/memories?project=theirs : 403 this client has no access to project 'theirs'
+GET  /api/projects                : 200 ["mine"]
+POST /api/delete   on theirs      : 403, and the memory is still there
+```
+
+The scoping rule is now written once, in `_Handler._may_access`. Both transports ask it and differ
+only in how they refuse: `/mcp` sends its own 403, while the UI raises `_Forbidden` so the check can
+live inside `_store_for` — the one call every project-scoped route already makes. A route added
+later cannot forget it. Forgetting it once, in a place that looked like it had no security
+responsibility, is the whole shape of this bug.
+
+`_Forbidden` is separate from `StoreError` so "not yours" answers 403 rather than the 404 or 400 the
+UI maps storage failures to. A scoped client is authenticated, not anonymous, so confirming the
+project exists tells it nothing it could not get from `/mcp` — which has always answered 403 by
+name.
+
+`token_is_valid` is gone, replaced by `client_for_token`, which returns *who* holds the token. It is
+deliberately not merged with `authenticate` even though the lookup is identical: that one raises to
+distinguish "unknown" from "revoked" because an MCP client needs to know whether to re-enroll, while
+this one returns None either way, because an unauthenticated browser must not learn that a token it
+presented was real but withdrawn.
+
+Seven mutants, all caught, including three new ones: scoping not enforced, a session that forgets
+which client opened it, and a UI login that accepts a revoked client's token. The pre-existing
+"project scoping is not enforced" mutant had to be repointed — it targeted text inside
+`_require_project`, which only `/mcp` ever called, so it passed throughout the bug's life. That is
+the same failure as step 1: an assertion aimed at the path that was already correct.
+
+**Two process notes, both of which produced a wrong answer before they produced a right one.**
+
+The first verification of the fix showed the bug still open. The repro script lived in a temp
+directory, so Python put *that* directory first on `sys.path` and fell through to a released 0.7.0
+in site-packages — same `__version__`, different code. Added to step 10.
+
+`test_an_expired_session_is_rejected` broke, because it reaches into `_Sessions._issued` and wrote a
+bare float where the entry is now `(expiry, client)`. It failed at the transport instead of the
+assertion — and a test that raises on unpacking "catches" every mutant, so the `expired sessions
+stay valid` result from the first run was worthless. Re-checked after fixing it, and it now fails on
+the assertion. White-box tests have to be re-read whenever the state they reach into changes shape;
+they do not announce it.
+
+**348 → 355 tests.**
+
 ## Step 3 — A deleted memory cannot jam the outbox
 
 **The problem.** `delete_memory` cleans `memories`, `labels`, `files`, `usage`, `memories_fts` and
@@ -355,6 +401,13 @@ describes itself and one that used to.
   `import sqlite3`, already imported at module scope.
 - **`build/`** — 394K of pre-refactor package copy, untracked and gitignored, but grep and every
   editor index read it and it answers questions with stale code. Delete it.
+- **The non-editable install in site-packages** — a released 0.7.0 copy shadows the working tree for
+  any script whose own directory is not the repo, because Python puts the *script's* directory on
+  `sys.path` first and the repo is never on it at all. It reports the same `__version__` as the
+  working tree, so nothing distinguishes them at a glance. This cost real time during step 2: the
+  first verification of the fix appeared to show the bug still open, because it was testing the
+  released build. Reinstall editable (`pip install -e .`) so there is one copy of this package on
+  the machine.
 - **`reindex`** — has a priority entry but appears in no scheduler default, so the similarity graph
   is never rebuilt unless somebody runs `compute --kind reindex` by hand. Either add it to the
   default kinds at a low frequency, or delete the priority entry and document it as a manual
