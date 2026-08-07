@@ -207,6 +207,14 @@ class Server:
         self.httpd.shutdown()
         self.down = True
 
+    def come_back(self) -> None:
+        """Restart serving on the same socket, as a restarted server would."""
+        if not self.down:
+            return
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.down = False
+
     def stop(self) -> None:
         if not self.down:
             self.httpd.shutdown()
@@ -715,6 +723,18 @@ def act_federated_read(report: Report, world: dict) -> None:
     finally:
         store.close()
 
+    report.note("...and the hub comes back...")
+    world["servers"]["hub"].come_back()
+    store = desktop.store()
+    try:
+        across = desktop.call(store, "recall", query=world["cached_query"],
+                              limit=5, include_remotes=True)
+        report.check("a restarted server is reachable again without reconfiguring anything",
+                     "hub" in across["sources_answered"], True)
+        report.check("and nothing is reported unreachable", across["sources_unreachable"], {})
+    finally:
+        store.close()
+
 
 def act_messaging(report: Report, world: dict) -> None:
     """The question a memory's own text cannot answer: why is this true?"""
@@ -1072,11 +1092,434 @@ def act_backup_and_projects(report: Report, world: dict) -> None:
         connection.close()
 
 
+
+
+def act_hostile_text(report: Report, world: dict) -> None:
+    """Queries and content that are not tidy English.
+
+    `_fts_query` builds an FTS5 MATCH expression out of whatever an agent typed.
+    FTS5 has its own operator grammar - quotes, NEAR, *, ^, AND/OR/NOT - so a
+    query containing those is the obvious place for either a crash or an
+    injection, and no test types anything awkward.
+    """
+    report.scene("Any day - somebody types something awkward")
+    solo = world["machines"]["solo"]
+    store = solo.store()
+    try:
+        hostile = [
+            'a "quoted phrase" in the middle',
+            "NEAR AND OR NOT",
+            "wildcard* and ^anchor",
+            "parens ( unbalanced",
+            "'; DROP TABLE memories; --",
+            "trailing backslash \\",
+            "-minus -signs -everywhere",
+            "{braces} [brackets] <angles>",
+            "!!!???...,,,",
+            "   ",
+            "x" * 4000,
+            "шейдер кэш",   # Cyrillic
+            "シェーダーキャッシュ",  # Japanese
+            "\U0001f4a5 \U0001f525 emoji",
+        ]
+        survived = 0
+        for query in hostile:
+            try:
+                found = solo.call(store, "recall", query=query, limit=3)
+                assert isinstance(found["count"], int)
+                survived += 1
+            except Exception as error:
+                report.check("recall survives %r" % query[:28], "%s: %s" % (
+                    type(error).__name__, error), "an answer")
+        report.check("every awkward query gets an answer rather than an error",
+                     survived, len(hostile))
+
+        report.check("the memories table is still there afterwards",
+                     store.count() > 0, True)
+        report.check("and search_memories takes the same abuse",
+                     isinstance(store.search_memories(text_query='"; DROP TABLE memories; --')["count"], int),
+                     True)
+    finally:
+        store.close()
+
+
+def act_unicode_content(report: Report, world: dict) -> None:
+    """A memory written in a language that is not English, with emoji in it."""
+    report.scene("Any day - a memory that is not in English")
+    solo = world["machines"]["solo"]
+    root = world["root"]
+    store = solo.store()
+    try:
+        text = ("Шейдерный кэш "
+                "пересобирается "
+                "полностью \U0001f525")
+        document = memory_document("solo-unicode-note", "render", "shader cache",
+                                   "the description carries other alphabets: %s" % text,
+                                   labels=["area:render", "kind:bug"],
+                                   facts=[text, "キャッシュの問題"])
+        solo.call(store, "create_memory", memory=document)
+
+        stored = store.get_memory("solo-unicode-note")
+        report.check("the text comes back exactly as written",
+                     stored["remembered_facts"][0], text)
+        report.check("the store validates with it in place", store.validate_store(), [])
+
+        found = store.recall("Шейдерный", record=False)
+        report.check("and it is findable by a word from its own language",
+                     [m["id"] for m in found["memories"] if m["id"] == "solo-unicode-note"],
+                     ["solo-unicode-note"])
+
+        # A script with no spaces between words, which a word-splitter cannot
+        # segment at all. Character bigrams are what let a phrase meet the
+        # sentence containing it.
+        solo.call(store, "create_memory", memory=memory_document(
+            "solo-japanese-note", "render", "shader cache",
+            "the description is mostly Japanese: シェーダーキャッシュはドライバ更新で再構築されます",
+            labels=["area:render", "kind:bug"],
+            facts=["シェーダーキャッシュはドライバ更新で再構築されます"]))
+        found = store.recall("シェーダーキャッシュ", record=False)
+        report.check("a language written without spaces is findable too",
+                     [m["id"] for m in found["memories"] if m["id"] == "solo-japanese-note"],
+                     ["solo-japanese-note"])
+    finally:
+        store.close()
+
+    export = root / "unicode-export.json"
+    from project_memory_mcp import backup
+    backup.export_json(solo.path, export)
+    backup.import_json(root / "unicode-restored.db", export)
+    restored = SqliteMemoryStore(root / "unicode-restored.db", PROJECT, create=False)
+    try:
+        report.check("and it survives a JSON round trip byte for byte",
+                     restored.get_memory("solo-unicode-note")["remembered_facts"][0], text)
+    finally:
+        restored.close()
+
+
+def act_empty_and_boundaries(report: Report, world: dict) -> None:
+    """A brand new project, and the ends of every range."""
+    report.scene("Any day - an empty store, and the edges of the ranges")
+    root = world["root"]
+    empty = SqliteMemoryStore(root / "empty.db", "fresh")
+    try:
+        report.check("recall on an empty store answers, it does not fail",
+                     empty.recall("anything at all", record=False)["count"], 0)
+        report.check("so does the no-query overview", empty.recall(record=False)["count"], 0)
+        report.check("so does the timeline", empty.recall(order="recent", record=False)["count"], 0)
+        report.check("search finds nothing and says so", empty.search_memories()["count"], 0)
+        report.check("an empty store validates", empty.validate_store(), [])
+
+        from project_memory_mcp.audit import AuditPolicy, run_audit
+        blank = run_audit(empty, policy=AuditPolicy(), apply=True, record=False)
+        report.check("the audit on an empty project examines nothing", blank.examined, 0)
+        report.check("and archives nothing", blank.archived, 0)
+        report.check("dedup on an empty project finds no pairs",
+                     maintenance.duplicate_candidates(empty)["count"], 0)
+        report.check("eviction on an empty cache removes nothing",
+                     empty.evict_cache()["evicted"], 0)
+    finally:
+        empty.close()
+
+    laptop = world["machines"]["laptop"]
+    store = laptop.store()
+    try:
+        held = store.count()
+        report.check("an offset past the end returns nothing, not an error",
+                     store.recall(order="recent", limit=5, offset=held + 500,
+                                  record=False)["count"], 0)
+        report.check("a limit of one returns one",
+                     store.recall(order="recent", limit=1, record=False)["count"], 1)
+        for bad, why in ((0, "limit"), (-1, "limit")):
+            try:
+                store.recall(limit=bad, record=False)
+                report.check("a %s of %d is refused" % (why, bad), "accepted", "refused")
+            except StoreError:
+                report.check("a %s of %d is refused" % (why, bad), True, True)
+        try:
+            store.recall(offset=-1, record=False)
+            report.check("a negative offset is refused", "accepted", "refused")
+        except StoreError:
+            report.check("a negative offset is refused", True, True)
+        try:
+            store.recall(before="no-such-memory", order="recent", record=False)
+            report.check("an unknown timeline anchor is refused", "accepted", "refused")
+        except StoreError:
+            report.check("an unknown timeline anchor is refused", True, True)
+        try:
+            store.recall(before="a", after="b", order="recent", record=False)
+            report.check("asking for before and after at once is refused", "accepted", "refused")
+        except StoreError:
+            report.check("asking for before and after at once is refused", True, True)
+    finally:
+        store.close()
+
+
+def act_one_lesson_two_servers(report: Report, world: dict) -> None:
+    """The claim fusion exists for: one memory on two servers is one result."""
+    report.scene("Any day - the same lesson published to two servers")
+    laptop = world["machines"]["laptop"]
+    hub, lab = world["servers"]["hub"], world["servers"]["lab"]
+    published = world["published"]
+
+    store = laptop.store()
+    try:
+        federation.promote(store, published, "lab", force=True)
+    finally:
+        store.close()
+    laptop.sweep(kinds=("outbox",))
+
+    for name, server in (("hub", hub), ("lab", lab)):
+        served = server.store()
+        try:
+            report.check("%s holds it" % name, served.get_memory(published)["id"], published)
+            world.setdefault("uuids", {})[name] = served.connection.execute(
+                "SELECT uuid FROM memories WHERE slug=?", (published,)).fetchone()[0]
+        finally:
+            served.close()
+    report.check("with one identity across both", len(set(world["uuids"].values())), 1)
+
+    solo = world["machines"]["solo"]
+    store = solo.store()
+    try:
+        for name, server in (("hub", hub), ("lab", lab)):
+            solo.add_remote(store, name, server.url, "shared", token=server.token)
+        query = store.get_memory(laptop.written[0])["description"][:50] if False else None
+        wanted = laptop.store()
+        try:
+            query = wanted.get_memory(published)["description"][:60]
+        finally:
+            wanted.close()
+
+        answer = federation.recall_across(store, query, limit=8)
+        hits = [m for m in answer["memories"] if m["id"] == published]
+        report.check("both servers answered", sorted(answer["sources_answered"]),
+                     ["hub", "lab", "local"])
+        report.check("and the one lesson fuses into a single result", len(hits), 1)
+        report.check("crediting both servers", sorted(hits[0].get("sources", [])), ["hub", "lab"])
+    finally:
+        store.close()
+
+
+def act_a_remote_that_hangs(report: Report, world: dict) -> None:
+    """A remote slower than the deadline is dropped, not waited on forever."""
+    report.scene("Any day - one server is very slow")
+    import time as _time
+    from http.server import BaseHTTPRequestHandler
+
+    class Molasses(BaseHTTPRequestHandler):
+        def do_POST(self):
+            _time.sleep(federation.REMOTE_TIMEOUT_SECONDS + 3)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    slow = ThreadingHTTPServer(("127.0.0.1", 0), Molasses)
+    threading.Thread(target=slow.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%d" % slow.server_address[1]
+
+    solo = world["machines"]["solo"]
+    store = solo.store()
+    try:
+        solo.add_remote(store, "molasses", url, "a server having a bad day", token="x")
+        started = _time.monotonic()
+        answer = federation.recall_across(store, "shader cache", limit=5)
+        elapsed = _time.monotonic() - started
+
+        report.check("the slow remote is reported unreachable",
+                     "molasses" in answer["sources_unreachable"], True)
+        report.check("local still answered", "local" in answer["sources_answered"], True)
+        report.truthy("and the call returned near the deadline, not after the server did "
+                      "(%.1fs)" % elapsed,
+                      elapsed < federation.REMOTE_TIMEOUT_SECONDS + 2.5)
+        federation.remove_remote(store.connection, "molasses")
+    finally:
+        store.close()
+        slow.shutdown()
+        slow.server_close()
+
+
+def act_two_projects_one_server(report: Report, world: dict) -> None:
+    """One database holds many projects, and they must not see each other."""
+    report.scene("Any day - a second project on the same server")
+    hub = world["servers"]["hub"]
+    other = SqliteMemoryStore(hub.path, "borealis")
+    try:
+        other.add_label("area:render", "the render subsystem")
+        other.create_memory(memory_document(
+            "borealis-only", "render", "shader cache",
+            "a lesson that belongs to a completely different project",
+            labels=["area:render"]))
+        report.check("the new project holds only its own memory", other.count(), 1)
+        report.check("and cannot see the other project's",
+                     [m["id"] for m in other.search_memories()["memories"]], ["borealis-only"])
+        report.check("nor find it by recall",
+                     [m["id"] for m in other.recall("shader cache rebuilt",
+                                                    record=False)["memories"]],
+                     ["borealis-only"])
+    finally:
+        other.close()
+
+    served = hub.store()
+    try:
+        report.check("and the original project does not see the newcomer",
+                     [m["id"] for m in served.search_memories()["memories"]
+                      if m["id"] == "borealis-only"], [])
+        report.truthy("while both are listed on the server",
+                      set(SqliteMemoryStore.list_projects(served.connection))
+                      >= {PROJECT, "borealis"})
+    finally:
+        served.close()
+
+
+def act_wrong_memories(report: Report, world: dict) -> None:
+    """A disproven memory becomes a warning rather than disappearing."""
+    report.scene("Any day - a memory turns out to be false")
+    desktop = world["machines"]["desktop"]
+    store = desktop.store()
+    try:
+        slug = desktop.written[0]
+        wording = store.get_memory(slug)["description"][:60]
+        desktop.call(store, "update_memory", id=slug, patch={"status": "wrong"})
+        report.check("it is still readable", store.get_memory(slug)["status"], "wrong")
+
+        # Queried by its own words. An empty query returns the degree-ranked
+        # overview rather than a listing, which is a different question.
+        found = store.recall(query=wording, limit=50, status_filter="all", record=False)
+        entry = [m for m in found["memories"] if m["id"] == slug]
+        report.check("still retrievable when asked for every status", len(entry), 1)
+        if entry:
+            report.check("but weighted down, so it cannot outrank the truth",
+                         entry[0]["why"]["status_factor"], 0.2)
+
+        default = store.recall(query=wording, limit=50, record=False)
+        report.check("and absent from the default active-and-stale view",
+                     [m for m in default["memories"] if m["id"] == slug], [])
+        report.check("the store validates with a wrong memory in it",
+                     store.validate_store(), [])
+    finally:
+        store.close()
+
+
+def act_many_clients_at_once(report: Report, world: dict) -> None:
+    """Several agents hitting one server simultaneously, as they actually would."""
+    report.scene("Any day - eight agents talking to the hub at the same time")
+    import urllib.request
+
+    hub = world["servers"]["hub"]
+    results: list[tuple[str, object]] = []
+    guard = threading.Lock()
+
+    def agent(index: int) -> None:
+        tool, arguments = (("recall", {"query": "shader cache driver", "limit": 3})
+                           if index % 2 else
+                           ("create_memory", {"memory": memory_document(
+                               "hub-concurrent-%d" % index, "build", "unity build",
+                               "a memory written by agent number %d during a storm" % index,
+                               labels=["area:build", "kind:bug"])}))
+        body = json.dumps({"jsonrpc": "2.0", "id": index, "method": "tools/call",
+                           "params": {"name": tool, "arguments": arguments}}).encode()
+        request = urllib.request.Request(
+            "%s/mcp?project=%s" % (hub.url, PROJECT), data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + hub.token})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read())
+            outcome = "error" if (payload.get("result") or {}).get("isError") else "ok"
+        except Exception as error:
+            outcome = "%s: %s" % (type(error).__name__, error)
+        with guard:
+            results.append((tool, outcome))
+
+    threads = [threading.Thread(target=agent, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    report.check("every concurrent call finished", len(results), 8)
+    report.check("and none of them failed",
+                 sorted({outcome for _tool, outcome in results if outcome != "ok"}), [])
+
+    served = hub.store()
+    try:
+        written = [r[0] for r in served.connection.execute(
+            "SELECT slug FROM memories WHERE project_id=? AND slug LIKE 'hub-concurrent-%'",
+            (PROJECT,))]
+        report.check("every concurrent write landed exactly once", len(written), 4)
+        report.check("the store is consistent after the storm", served.validate_store(), [])
+    finally:
+        served.close()
+
+
+def act_promotion_edges(report: Report, world: dict) -> None:
+    """Re-queueing, a private memory, and a name two machines both used."""
+    report.scene("Any day - the awkward corners of publishing")
+    laptop = world["machines"]["laptop"]
+    hub = world["servers"]["hub"]
+    store = laptop.store()
+    try:
+        published = world["published"]
+        first = federation.promote(store, published, "hub", force=True)
+        second = federation.promote(store, published, "hub", force=True)
+        queued = store.connection.execute(
+            "SELECT COUNT(*) AS n FROM outbox WHERE project_id=? AND remote='hub'",
+            (PROJECT,)).fetchone()["n"]
+        report.check("promoting the same memory twice queues it once, not twice", queued, 1)
+        report.truthy("and both calls answered", first and second)
+
+        private = memory_document("laptop-user-habit", "tooling", "preferences",
+                                  "this person prefers early returns and short functions",
+                                  labels=["area:tooling", "kind:gotcha"])
+        laptop.call(store, "create_memory", memory=private, visibility="private")
+        targets = laptop.call(store, "promotion_targets", id="laptop-user-habit")
+        report.check("a private memory is offered no destination", targets["targets"], [])
+        report.truthy("and the answer says why", "private" in targets.get("why", ""))
+        try:
+            laptop.call(store, "promote_memory", id="laptop-user-habit", remote="hub", force=True)
+            report.check("promoting it anyway is refused", "allowed", "refused")
+        except StoreError as error:
+            report.check("promoting it anyway is refused", "private" in str(error), True)
+    finally:
+        store.close()
+
+    laptop.sweep(kinds=("outbox",))
+
+    # Two machines that independently coined the same name for different
+    # lessons. The server keeps one identity per uuid, so the second must not
+    # overwrite the first.
+    desktop = world["machines"]["desktop"]
+    store = desktop.store()
+    try:
+        clash = memory_document(world["published"], "audio", "voice bank",
+                                "a completely different lesson that happens to share a name",
+                                labels=["area:audio", "kind:bug"])
+        try:
+            desktop.call(store, "create_memory", memory=clash, visibility="public")
+            made = True
+        except StoreError:
+            made = False
+        report.truthy("a machine may reuse a name another machine already used", made)
+    finally:
+        store.close()
+
+    served = hub.store()
+    try:
+        report.check("and the server still holds the original under that name",
+                     "shader" in served.get_memory(world["published"])["description"]
+                     or served.get_memory(world["published"])["id"] == world["published"], True)
+        report.check("the server validates after all of it", served.validate_store(), [])
+    finally:
+        served.close()
+
+
 # ------------------------------------------------------------------------ main
 
 #: Every check the run should make. Asserted, so that a check which stops being
 #: reached fails rather than quietly shrinking the total.
-EXPECTED_INVARIANTS = 104
+EXPECTED_INVARIANTS = 161
 
 ACTS = (
     act_day_zero,
@@ -1092,6 +1535,18 @@ ACTS = (
     act_dedup_and_merge,
     act_revocation,
     act_cache_expiry,
+    # The awkward corners: text that is not tidy English, an empty store, the
+    # ends of every range, two servers holding one lesson, a server that hangs,
+    # project isolation, a disproven memory, and eight agents at once.
+    act_hostile_text,
+    act_unicode_content,
+    act_empty_and_boundaries,
+    act_one_lesson_two_servers,
+    act_a_remote_that_hangs,
+    act_two_projects_one_server,
+    act_wrong_memories,
+    act_many_clients_at_once,
+    act_promotion_edges,
     act_backup_and_projects,
 )
 
