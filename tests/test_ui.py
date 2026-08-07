@@ -312,6 +312,22 @@ class UiTests(unittest.TestCase):
         self.assertEqual(404, status)
         self.assertIn("Unknown project", json.loads(body)["error"])
 
+    def test_an_expired_session_is_rejected(self):
+        # The TTL is the reason a leaked cookie is survivable. Nothing checked
+        # that it is ever enforced.
+        import time as _time
+
+        from project_memory_mcp.http_server import _Sessions
+
+        self.login()
+        self.assertEqual(200, self.get("/api/projects")[0])
+        sessions: _Sessions = self.httpd.RequestHandlerClass.sessions
+        with sessions._guard:
+            for sid in list(sessions._issued):
+                sessions._issued[sid] = _time.time() - 1
+        self.assertEqual(401, self.get("/api/projects")[0],
+                         "an expired session still worked")
+
     def test_logout_invalidates_the_session(self):
         self.login()
         self.assertEqual(200, self.get("/api/projects")[0])

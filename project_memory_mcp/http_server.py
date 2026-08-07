@@ -216,11 +216,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(401, {"error": str(error)})
             return False
 
-    def _require_admin(self) -> bool:
-        if self.client is not None and self.client.is_admin:
-            return True
-        self._send(403, {"error": "this needs an admin client"})
-        return False
+    # There is no _require_admin here, deliberately. It existed, was called by
+    # nothing, and a mutation run that made it return True for everyone changed
+    # no test - which is how dead code looks from the outside.
+    #
+    # Nothing over HTTP is admin-only. The privileged operations - minting
+    # enrollment codes, revoking a client - are CLI commands, so they are
+    # already gated by having an account on the machine holding the database,
+    # which is a stronger check than a role column. The `role` on a client is
+    # therefore recorded and not yet enforced anywhere; anything that needs it
+    # should call clients.Client.is_admin at the point it matters rather than
+    # trusting a helper to have been used.
 
     def _require_project(self, project: str) -> bool:
         if self.client is None or self.client.may_access(project):

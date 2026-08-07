@@ -481,3 +481,40 @@ class IntermittentUptimeTests(ComputerCase):
             computer.pending(), 0,
             "the scheduler waited a full interval before its first sweep, so a process that "
             "lives for less than an interval never sweeps at all")
+
+
+class BorrowedAnchorTests(ComputerCase):
+    """A cached copy describes another machine's repository."""
+
+    def test_a_borrowed_memory_is_not_checked_against_this_working_tree(self):
+        # Its file paths belong to whoever wrote it. Checking them here finds
+        # nothing, every time, and would mark the whole cache adrift - or with
+        # mark_stale, quietly rewrite another server's memories.
+        root = Path(self.tmp.name) / "repo"
+        root.mkdir()
+        store = self.open_store("demo")
+        try:
+            store.set_root_path(str(root))
+            store.cache_remote_results({"team": {"memories": [{
+                "uuid": "borrowed-uuid",
+                "memory": {
+                    "schema_version": 1, "id": "their-lesson", "status": "active",
+                    "description": "A lesson from a repository this machine cannot see.",
+                    "tags": [], "labels": [],
+                    "scope": {"project": "p", "area": "a",
+                              "files": ["Source/TheirFile.cpp"], "applies_to": []},
+                    "triggers": ["theirs"], "remembered_facts": ["a fact"],
+                    "solution_pattern": [], "pitfalls": [],
+                    "evidence": {"created_from_task": "t", "last_validated": "2026-01-01"},
+                    "relationships": {"related": [], "supersedes": [], "superseded_by": []},
+                }}]}})
+            result = maintenance.check_anchors(store, mark_stale=True)
+            self.assertEqual(0, result["checked"],
+                             "a cached copy was checked against the local working tree")
+            self.assertEqual([], result["adrift"])
+            row = store.connection.execute(
+                "SELECT status FROM memories WHERE slug='their-lesson'").fetchone()
+            self.assertEqual("active", row["status"],
+                             "another server's memory was marked stale from here")
+        finally:
+            store.close()

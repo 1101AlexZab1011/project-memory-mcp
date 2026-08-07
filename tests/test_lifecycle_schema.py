@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 
 from project_memory_mcp.sqlite_store import SCHEMA_VERSION, SqliteMemoryStore
+from project_memory_mcp import usage
 from project_memory_mcp.usage import SPREAD_WINDOW_DAYS, merge_spread, touch_spread
 
 CACHE = "Session cache invalidation races the auth refresh."
@@ -362,3 +363,58 @@ class MigrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReplicaCounterTests(unittest.TestCase):
+    """Counters are per replica, which is what makes a push idempotent.
+
+    Every other test runs with one replica, where keying by replica and keying
+    by a constant behave identically - so the property was invisible. Two
+    replicas is the smallest fixture that can tell them apart.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = SqliteMemoryStore(Path(self.tmp.name) / "m.db", "demo")
+        self.addCleanup(self.store.close)
+        self.store.add_label("area:x", "x")
+        self.store.create_memory(memory("cache-race", CACHE, ["area:x"]))
+        self.uuid = self.store._uuid_for("cache-race")
+
+    def as_replica(self, replica_id):
+        self.store.replica_id = replica_id
+
+    def test_two_replicas_keep_separate_rows_and_their_counts_add(self):
+        self.as_replica("laptop")
+        usage.record(self.store, [self.uuid], direct=[self.uuid])
+        self.as_replica("desktop")
+        usage.record(self.store, [self.uuid], direct=[self.uuid])
+
+        rows = self.store.connection.execute(
+            "SELECT replica_id, surfaced FROM usage WHERE memory_id=? ORDER BY replica_id",
+            (self.uuid,)).fetchall()
+        self.assertEqual(["desktop", "laptop"], [r["replica_id"] for r in rows],
+                         "counters are not being kept per replica")
+        self.assertEqual([1, 1], [r["surfaced"] for r in rows])
+
+        entry = self.store.load_usage()["memories"]["cache-race"]
+        self.assertEqual(2, entry["surfaced"], "replica counters did not sum on read")
+        self.assertEqual(2, entry["surfaced_direct"])
+
+    def test_one_replica_recording_twice_does_not_look_like_two(self):
+        self.as_replica("laptop")
+        usage.record(self.store, [self.uuid])
+        usage.record(self.store, [self.uuid])
+        rows = self.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM usage WHERE memory_id=?", (self.uuid,)).fetchone()
+        self.assertEqual(1, rows["n"])
+        self.assertEqual(2, self.store.load_usage()["memories"]["cache-race"]["surfaced"])
+
+    def test_spread_from_two_replicas_on_one_day_is_one_day(self):
+        # The reason spread is a bitmap rather than a counter: two machines
+        # using a memory today is one day of spread, not two.
+        for replica in ("laptop", "desktop"):
+            self.as_replica(replica)
+            usage.record(self.store, [self.uuid])
+        self.assertEqual(1, self.store.load_usage()["memories"]["cache-race"]["spread_days"])

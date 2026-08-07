@@ -244,3 +244,132 @@ class SqliteStoreTests(unittest.TestCase):
             self.store.recall(order="recent", before="a", after="b")
         with self.assertRaises(StoreError):
             self.store.recall(offset=-1)
+
+
+class StoreCase(unittest.TestCase):
+    """Fixture only. Kept separate from SqliteStoreTests so that subclassing it
+    for a new group does not re-run every test in that class as well."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "memory.db"
+        self.store = SqliteMemoryStore(self.db, project="demo")
+        self.addCleanup(self.store.close)
+        for label in ("area:x", "area:z", "kind:bug"):
+            self.store.add_label(label, "description for " + label)
+
+
+class ReindexOnWriteTests(StoreCase):
+    """An edit must replace a memory's derived rows, not add to them.
+
+    Nothing covered this. The failure is quiet in the worst way: the memory
+    looks correct when read back, while its old text stays searchable and its
+    old files stay attached, so recall keeps matching a version that no longer
+    exists.
+    """
+
+    def test_editing_the_text_stops_the_old_wording_matching(self):
+        body = memory("a", "Shader compilation stalls on a cold start.", ["area:x"])
+        self.store.create_memory(body)
+        self.assertEqual(["a"], [m["id"] for m in self.store.recall(
+            "shader compilation", limit=5, record=False)["memories"]])
+
+        # Every field carrying the old wording, or the index is right to keep
+        # matching and the test is measuring nothing.
+        self.store.update_memory("a", {
+            "description": "Audio mixing clips on the title screen.",
+            "remembered_facts": ["Audio mixing clips on the title screen."],
+            "triggers": ["audio mixing"]})
+        found = [m["id"] for m in self.store.recall(
+            "shader compilation", limit=5, record=False)["memories"]]
+        self.assertEqual([], found, "the replaced wording is still in the search index")
+        self.assertEqual(["a"], [m["id"] for m in self.store.recall(
+            "audio mixing clips", limit=5, record=False)["memories"]])
+
+    def test_editing_the_scope_detaches_the_files_it_dropped(self):
+        body = memory("a", FIRST, ["area:x"])
+        body["scope"]["files"] = ["Source/Old.cpp"]
+        self.store.create_memory(body)
+        self.store.update_memory("a", {"scope": {"project": "p", "area": "a",
+                                                 "files": ["Source/New.cpp"], "applies_to": []}})
+        rows = [r["path"] for r in self.store.connection.execute(
+            "SELECT path FROM files WHERE project_id='demo'")]
+        self.assertEqual(["Source/New.cpp"], rows,
+                         "the dropped file is still attached to the memory")
+
+
+class RankingShapeTests(StoreCase):
+    """Properties of the ranker that are decisions rather than tuning."""
+
+    def test_a_memory_marked_wrong_ranks_below_an_equal_one(self):
+        # Status is a multiplier for a reason: a memory somebody marked wrong
+        # must not sit above an active one that matches just as well.
+        for slug, status in (("good-note", "active"), ("bad-note", "wrong")):
+            self.store.create_memory(memory(slug, "Cache invalidation races the auth refresh.",
+                                            ["area:x"]))
+            if status != "active":
+                self.store.update_memory(slug, {"status": status})
+        found = self.store.recall("cache invalidation races", limit=5,
+                                  status_filter="all", record=False)["memories"]
+        order = [m["id"] for m in found]
+        self.assertEqual(["good-note", "bad-note"], order,
+                         "status is not weighing on the ranking at all")
+        self.assertLess([m for m in found if m["id"] == "bad-note"][0]["score"],
+                        [m for m in found if m["id"] == "good-note"][0]["score"])
+
+    def test_the_graph_walk_stays_bounded_by_default(self):
+        """The walk must stop expanding, using the bound recall actually runs under.
+
+        Two earlier versions of this were wrong in different ways. The first
+        passed `max_nodes` explicitly, which proves the parameter works and says
+        nothing about the default. The second built a real 500-memory store, and
+        under an unbounded walk it did not fail - it ran for over two minutes,
+        which is useless as a signal and hangs anything driving it.
+
+        The walk reads only the edges table, so the graph is written straight
+        into it. That is instant, and it lets the shape be chosen precisely: one
+        seed, a first level wide enough to exhaust the bound, and a second level
+        that only an unbounded walk would ever reach.
+        """
+        from project_memory_mcp.sqlite_store import WALK_MAX_NODES
+
+        wide = WALK_MAX_NODES + 50
+        edges = [("demo", "seed", f"L1-{i}", "related") for i in range(wide)]
+        edges += [("demo", f"L1-{i}", f"L2-{i}-{j}", "related")
+                  for i in range(wide) for j in range(10)]
+        with self.store.connection:
+            self.store.connection.executemany(
+                "INSERT OR REPLACE INTO edges(project_id, src, dst, kind) VALUES (?,?,?,?)", edges)
+
+        adjacency = self.store.neighbourhood(["seed"])
+        self.assertLess(
+            len(adjacency), wide * 2,
+            "the walk expanded past its bound into the second level - ranking cost is no "
+            "longer independent of how large and connected the store is")
+
+    def test_unrelated_memories_are_not_linked_by_similarity(self):
+        # The derived-edge threshold. At zero every candidate becomes a
+        # neighbour and the graph stops carrying information.
+        # They have to be *candidates* first, or the threshold is never
+        # consulted and the test passes at any value. Sharing one label out of
+        # three scores 0.23 - a real candidate, below the 0.34 cutoff.
+        self.store.create_memory(memory("broad-note", "Cache invalidation races auth.",
+                                        ["area:x", "area:z", "kind:bug"]))
+        self.store.create_memory(memory("narrow-note", "Shader stalls on cold start.", ["area:x"]))
+        edges = self.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM edges WHERE project_id='demo' AND kind='derived'"
+        ).fetchone()["n"]
+        self.assertEqual(0, edges, "two unrelated memories were linked as similar")
+
+    def test_a_memory_keeps_only_its_strongest_neighbours(self):
+        # Without the cap one popular label makes every memory a hub, and the
+        # walk degenerates into "everything is related to everything".
+        for i in range(25):
+            body = memory(f"sib-{i:02d}", f"{FIRST} variation {i}", ["area:x"])
+            body["scope"]["files"] = ["Source/Shared.cpp"]
+            self.store.create_memory(body)
+        worst = self.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM edges WHERE project_id='demo' AND kind='derived' "
+            "GROUP BY src ORDER BY n DESC LIMIT 1").fetchone()["n"]
+        self.assertLessEqual(worst, 10, "a memory kept more derived neighbours than the cap")

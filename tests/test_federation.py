@@ -66,6 +66,41 @@ class FusionTests(unittest.TestCase):
         quiet = fuse({"quiet": [{"uuid": "u1", "id": "m", "score": 0.0001}]}, 5)
         self.assertEqual(loud[0]["fused_score"], quiet[0]["fused_score"])
 
+    def test_position_within_a_list_decides_the_order(self):
+        # Every other fusion test compares "in two lists" against "in one", and
+        # passes even if rank is discarded entirely. This is the one that needs
+        # the 1/(k+rank) actually to be there.
+        fused = fuse({"a": [{"uuid": "first", "id": "first"},
+                            {"uuid": "second", "id": "second"},
+                            {"uuid": "third", "id": "third"}]}, limit=5)
+        self.assertEqual(["first", "second", "third"], [m["id"] for m in fused])
+        self.assertGreater(fused[0]["fused_score"], fused[1]["fused_score"])
+        self.assertGreater(fused[1]["fused_score"], fused[2]["fused_score"])
+
+    def test_agreement_helps_but_does_not_override_a_large_rank_gap(self):
+        # Two sources agreeing on a mid-list result *should* beat one source's
+        # top hit - that is what fusion is for, and my first version of this
+        # test had it backwards. What rank still has to buy is that the
+        # agreement stops paying once the gap is wide enough: with k=60, two
+        # hits at rank 200 score 2/261 against one at 1/61.
+        def scores(depth):
+            # Padding is per source, or the padding itself appears in two lists
+            # and outscores everything the test is actually about.
+            pad = lambda tag: [{"uuid": f"{tag}-{i}", "id": f"{tag}-{i}"} for i in range(depth)]
+            fused = fuse({
+                "a": [{"uuid": "sharp", "id": "sharp"}],
+                "b": pad("b") + [{"uuid": "shared", "id": "shared"}],
+                "c": pad("c") + [{"uuid": "shared", "id": "shared"}],
+            }, limit=10_000)
+            return {m["id"]: m["fused_score"] for m in fused}
+
+        deep = scores(200)
+        self.assertGreater(deep["sharp"], deep["shared"])
+
+        # And the shallow case, where agreement is meant to win.
+        shallow = scores(5)
+        self.assertGreater(shallow["shared"], shallow["sharp"])
+
     def test_one_source_dropping_out_still_returns_the_rest(self):
         self.assertEqual(1, len(fuse({"a": [{"uuid": "u1", "id": "m"}], "b": []}, 5)))
 
