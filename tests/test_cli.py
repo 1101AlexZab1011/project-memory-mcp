@@ -81,3 +81,44 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DestructiveConfirmationTests(CliTests):
+    """`audit --apply` must not act without `--yes`.
+
+    The one command in this tool that destroys work on its own. Everything else
+    the CLI does is additive or reversible by re-running it; this archives
+    memories, and with --delete-superseded it deletes them. Nothing tested the
+    confirmation, so removing it would have gone unnoticed - and the failure is
+    silent, because somebody previewing a report would simply have applied it.
+    """
+
+    def seed_something_due(self):
+        main(["init", "--database", str(self.db), "--project", "demo"])
+        store = self.open_store()
+        label = sorted(store.list_labels()["labels"])[0]
+        store.create_memory(make_memory("quiet-note", [label]))
+        # Give it exposure so a gate can be reached, without waiting a month.
+        for _ in range(6):
+            store.recall("nothing that matches this at all", limit=1, full_count=0)
+        return store
+
+    def archived(self, store):
+        return store.connection.execute(
+            "SELECT archived_at FROM memories WHERE slug='quiet-note'").fetchone()["archived_at"]
+
+    def test_apply_without_yes_changes_nothing_and_fails(self):
+        store = self.seed_something_due()
+        exit_code = main(["audit", "--database", str(self.db), "--project", "demo",
+                          "--gate", "1:5:0", "--apply"])
+        self.assertEqual(1, exit_code, "--apply without --yes reported success")
+        self.assertIsNone(self.archived(store),
+                          "--apply acted on the store without being confirmed")
+
+    def test_apply_with_yes_does_act(self):
+        # The negative above is only worth anything if applying works at all.
+        store = self.seed_something_due()
+        exit_code = main(["audit", "--database", str(self.db), "--project", "demo",
+                          "--gate", "1:5:0", "--apply", "--yes"])
+        self.assertEqual(0, exit_code)
+        self.assertIsNotNone(self.archived(store), "--apply --yes did nothing")
