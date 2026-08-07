@@ -13,6 +13,7 @@ from typing import Any
 
 from . import __version__
 from . import federation
+from . import identity
 from . import maintenance
 from . import messages
 from .validation import StoreError
@@ -310,9 +311,15 @@ TOOLS = [
 
 
 class McpServer:
-    def __init__(self, store: Any, db_lock: Any = None) -> None:
+    def __init__(self, store: Any, db_lock: Any = None, key_path: Any = None) -> None:
         # Any backend exposing the store API: file or SQLite.
         self.store = store
+        # Where this machine's signing key lives; None means the default path.
+        # A parameter rather than a constant read at the call site so a test can
+        # drive the real tool dispatch against a key-only remote - the defect
+        # being fixed here was an argument nobody passed, and it is reachable
+        # again one level up if the wiring is only ever asserted from below.
+        self.key_path = key_path
         # Only set by a transport that serialises store access. It is handed to
         # the one call that talks to other machines, so that call can hold it for
         # its database work and drop it for the network. Every other tool runs
@@ -389,8 +396,13 @@ class McpServer:
                     # recall_across queries local first and always, so this
                     # degrades to a local answer rather than failing when every
                     # remote is unreachable.
+                    #
+                    # The key is this machine's identity to the servers it asks,
+                    # and None - never having enrolled anywhere - is the normal
+                    # case, so remotes fall back to their configured token.
                     payload = federation.recall_across(
-                        self.store, db_lock=self.db_lock, **options)
+                        self.store, db_lock=self.db_lock,
+                        private_key=identity.load_if_present(self.key_path), **options)
                 else:
                     payload = self.store.recall(**options)
                 self._attach_message_notice(payload)

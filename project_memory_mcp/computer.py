@@ -280,7 +280,7 @@ def audit_job(store: Any, guard: Any, apply: bool = True, policy: Any = None) ->
     return report.summary()
 
 
-def outbox_job(store: Any, guard: Any) -> dict[str, Any]:
+def outbox_job(store: Any, guard: Any, key_path: Any = None) -> dict[str, Any]:
     """Deliver everything queued for publication.
 
     Not a retry path but the only path: `promote` never sends, so this is how a
@@ -291,10 +291,25 @@ def outbox_job(store: Any, guard: Any) -> dict[str, Any]:
     `deliver_outbox` takes the guard per item and releases it across each send,
     so a queue of promotions to a dead server costs its connect timeouts without
     blocking a single read.
+
+    The signing key is loaded here rather than inside `deliver_outbox`, because
+    "which key is this machine's" is a fact about the installation and delivery
+    should stay a function of its arguments. None is the ordinary case - a store
+    that has never enrolled anywhere - and means the remote's bearer token is
+    the credential.
+
+    ``key_path`` names it, defaulting to this machine's. It is a parameter and
+    not a constant read inside because a test has to be able to say where the
+    key is: the whole defect this fixes was a `private_key` argument that every
+    caller left at None, and asserting the fix at `deliver_outbox` rather than
+    here would reproduce exactly that gap one level up. It did, in the first
+    version of this change - a mutant that reverted this line survived.
     """
+    from . import identity
     from .federation import deliver_outbox
 
-    return deliver_outbox(store, db_lock=guard)
+    return deliver_outbox(store, private_key=identity.load_if_present(key_path),
+                          db_lock=guard)
 
 
 def dedup_job(store: Any, guard: Any, threshold: float = 0.6, limit: int = 25,

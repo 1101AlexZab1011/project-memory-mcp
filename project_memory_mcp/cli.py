@@ -361,7 +361,7 @@ def cmd_join(args: argparse.Namespace) -> int:
 
     from . import identity
 
-    key_path = Path(args.key) if args.key else DEFAULT_HOME / "client_key.pem"
+    key_path = Path(args.key) if args.key else identity.DEFAULT_KEY_PATH
     try:
         private_key = identity.load_or_create(key_path)
     except identity.IdentityError as error:
@@ -642,7 +642,7 @@ def build_parser() -> argparse.ArgumentParser:
     join_parser.add_argument("--code", required=True, help="Enrollment code from the server admin.")
     join_parser.add_argument("--name", default=None, help="How this machine should be listed.")
     join_parser.add_argument("--key", default=None,
-                             help=f"Private key path (default: {DEFAULT_HOME / 'client_key.pem'}).")
+                             help="Private key path (default: ~/.project-memory/client_key.pem).")
     join_parser.set_defaults(func=cmd_join)
 
     compute_parser = subparsers.add_parser(

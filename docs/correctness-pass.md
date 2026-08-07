@@ -529,6 +529,42 @@ configured. That is the property — token-free federation — and it is current
 
 **Done when** a promotion is delivered to a remote where the only credential is an enrolled key.
 
+### Outcome ✔
+
+Token-free federation works and is attributed to the key that signed it — the far side records the
+`client_id` and fingerprint, which is the point of signing over a shared secret: it knows *who*, not
+merely that somebody knew the password.
+
+**One thing the plan did not anticipate, and it inverted an ordering.** `RemoteClient` preferred the
+key over the token. Wiring the key in naively would therefore make any machine that had ever run
+`join` — against *any* server — start signing to *every* remote, including token-configured ones
+whose server has never seen that fingerprint. Those would begin answering 401. A silent break of
+every working setup, caused by a fix.
+
+The CLI already had the answer written down: `remote --token` is documented as *"Bearer token, if
+this machine has no enrolled key there."* A token configured for a remote is the operator saying
+which credential works there. So the order is now token-when-configured, sign otherwise — which
+preserves today's behaviour exactly (tokens were always used, keys never loaded) and adds signing
+only where no token exists. Zero regression risk, and it is what the help text always claimed.
+
+`identity.load_if_present` reads the key each call rather than caching: it is a small file, callers
+are about to wait on a network, and caching would mean a key enrolled while the server runs does
+nothing until a restart. It never creates one — `join` is where a person asks for an identity, and a
+background sweep minting a keypair would be enrolling a client nobody asked for.
+
+**A mutant survived the first pass, and it was this same defect one level up.** Reverting
+`outbox_job` to stop passing the key changed no test, because every test called
+`deliver_outbox(private_key=...)` **directly**. The argument worked perfectly and nothing exercised
+the caller — which is precisely how the original bug lived for so long. Fixed by making the key path
+a parameter of `outbox_job` and of `McpServer`, so tests drive the real job and the real tool
+dispatch rather than the layer beneath them. No mocking: this suite has none, and a patched module
+constant would have hidden the wiring again.
+
+Both halves are now guarded, with counterweights — a recall without a key must get only a local
+answer, or a remote that answers unauthenticated would make the signing test pass for free.
+
+**380 → 390 tests.**
+
 ## Step 8 — Delete `related_label_query`
 
 **The problem.** It is a parameter on the `create_memory` and `update_memory` tool schemas, on

@@ -92,6 +92,39 @@ def load_or_create(path: Path | str):
     return load_private_key(path)
 
 
+#: Where this machine's key lives unless it was told otherwise. Defined here
+#: rather than in the CLI because the code that *signs* needs it too, and two
+#: definitions of where a key lives is one too many.
+DEFAULT_KEY_PATH = Path.home() / ".project-memory" / "client_key.pem"
+
+
+def load_if_present(path: Path | str | None = None):
+    """This machine's signing key, or None if it has never enrolled anywhere.
+
+    Absence is the normal case and not an error: a local-only store never runs
+    `join`, and a machine that federates with a bearer token does not need a key
+    either. Callers treat None as "authenticate some other way".
+
+    Deliberately does **not** create one. `load_or_create` exists for `join`,
+    where a person asked for an identity. A background sweep that minted a
+    keypair as a side effect would be enrolling a client nobody asked for.
+
+    Read from disk each time rather than cached. It is a small file, the callers
+    are about to wait on a network anyway, and caching would mean a key enrolled
+    while the server is running does nothing until somebody restarts it.
+    """
+    path = Path(path) if path is not None else DEFAULT_KEY_PATH
+    if not path.is_file():
+        return None
+    try:
+        return load_private_key(path)
+    except IdentityError:
+        # A corrupt or wrong-type key file is not a reason to stop delivering
+        # work that a bearer token could carry. It is reported by `join`, which
+        # is where somebody can act on it.
+        return None
+
+
 def public_bytes(private_key) -> bytes:
     _, serialization = _ed25519()
     return private_key.public_key().public_bytes(

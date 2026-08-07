@@ -127,10 +127,20 @@ class RemoteClient:
         path = self._endpoint()
         headers = {"Content-Type": "application/json",
                    "Accept": "application/json, text/event-stream"}
-        if self.private_key is not None:
-            headers.update(identity.sign_request(self.private_key, "POST", path, body))
-        elif self.remote.token:
+        # A token configured for *this* remote wins, and the CLI is why: `remote
+        # --token` is documented as "if this machine has no enrolled key there",
+        # so setting one is the operator saying which credential works on that
+        # server. Signing anyway would break every existing token setup the
+        # moment this machine enrolled a key with some unrelated server - the
+        # remote would reject a fingerprint it has never seen.
+        #
+        # Where no token is configured, sign. That is the `join` path, and it is
+        # the better posture: nothing reusable crosses the wire, which matters
+        # because this deployment has no TLS.
+        if self.remote.token:
             headers["Authorization"] = "Bearer " + self.remote.token
+        elif self.private_key is not None:
+            headers.update(identity.sign_request(self.private_key, "POST", path, body))
         request = urllib.request.Request(self.remote.url + path, data=body, headers=headers)
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode())

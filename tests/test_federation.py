@@ -15,7 +15,7 @@ import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from project_memory_mcp import federation
+from project_memory_mcp import clients, federation, identity
 from project_memory_mcp.federation import Remote, choose_remote, fuse
 from project_memory_mcp.http_server import _Handler, _Sessions, _StoreRegistry
 from project_memory_mcp.server import McpServer
@@ -546,6 +546,171 @@ class ToolSurfaceTests(TierCase):
         thread.join(timeout=10)
         self.assertEqual([True], seen,
                          "the project lock was held while waiting on a remote")
+
+
+class TokenFreeFederationTests(TierCase):
+    """Federating with a key and no bearer token at all.
+
+    `private_key` was a parameter on RemoteClient, deliver_outbox and
+    recall_across, and **nothing ever passed it**. The only place a key was
+    loaded was `join`, which wrote it to disk, printed "the private key never
+    left this machine... which is how identity works across servers", and was
+    the last thing to read it. Inbound verification was complete and tested; the
+    other half of the handshake was unreachable.
+
+    So this asserts the property that was missing rather than that a header is
+    present: a promotion delivered to a server where the only credential is an
+    enrolled key.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+
+        remote_db = root / "remote.db"
+        seed = SqliteMemoryStore(remote_db, "demo")
+        seed.add_label("area:x", "x")
+        seed.close()
+
+        self.registry = _StoreRegistry(remote_db)
+        self.addCleanup(self.registry.close)
+        # The server has a shared token, and this machine will never be told it.
+        handler = type("H", (_Handler,), {"registry": self.registry, "token": "not-shared-with-us",
+                                          "sessions": _Sessions(), "ui_enabled": False})
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.addCleanup(self.httpd.server_close)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.shutdown)
+        self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+
+        self.key_path = root / "client_key.pem"
+        self.key = identity.load_or_create(self.key_path)
+
+        self.store = SqliteMemoryStore(root / "local.db", "demo")
+        self.addCleanup(self.store.close)
+        self.store.add_label("area:x", "x")
+        # No token on the remote. Today that is an unusable configuration.
+        federation.add_remote(self.store.connection, "team", self.url, "Shared knowledge")
+
+    def enroll_our_key(self):
+        code = clients.create_code(self.registry.control(), name="laptop")["code"]
+        public = identity.encode_public(identity.public_bytes(self.key))
+        return clients.redeem_code(self.registry.control(), code, "laptop", public)
+
+    def queue_a_promotion(self):
+        self.store.create_memory(memory("cache-race", CACHE), visibility="public")
+        self.earn("cache-race")
+        federation.promote(self.store, "cache-race", "team")
+
+    def test_a_promotion_is_delivered_with_a_key_and_no_token(self):
+        self.enroll_our_key()
+        self.queue_a_promotion()
+
+        result = federation.deliver_outbox(self.store, private_key=self.key)
+
+        self.assertEqual(["cache-race"], result["sent"])
+        landed = SqliteMemoryStore(self.registry.database, "demo", create=False)
+        self.addCleanup(landed.close)
+        self.assertEqual(CACHE, landed.get_memory("cache-race")["description"])
+
+    def test_the_delivery_is_attributed_to_the_key_that_signed_it(self):
+        # The point of signing over a shared secret: the far side knows who,
+        # not merely that somebody knew the password.
+        enrolled = self.enroll_our_key()
+        self.queue_a_promotion()
+        federation.deliver_outbox(self.store, private_key=self.key)
+
+        landed = SqliteMemoryStore(self.registry.database, "demo", create=False)
+        self.addCleanup(landed.close)
+        row = landed.connection.execute(
+            "SELECT author_client, author_key FROM memories WHERE slug='cache-race'").fetchone()
+        self.assertEqual(enrolled["client_id"], row["author_client"])
+        self.assertEqual(enrolled["fingerprint"], row["author_key"])
+
+    def test_without_the_key_the_same_delivery_is_refused(self):
+        # The counterweight. A server that accepted this unsigned would make the
+        # test above pass for the wrong reason.
+        self.enroll_our_key()
+        self.queue_a_promotion()
+
+        result = federation.deliver_outbox(self.store, private_key=None)
+
+        self.assertEqual([], result["sent"])
+        self.assertEqual(1, self.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM outbox").fetchone()["n"])
+
+    def test_an_unenrolled_key_is_refused(self):
+        # Holding *a* key is not authorisation; the server has to know it.
+        self.queue_a_promotion()
+        self.assertEqual([], federation.deliver_outbox(self.store, private_key=self.key)["sent"])
+
+    def test_a_configured_token_still_wins_over_a_key(self):
+        # `remote --token` is documented as "if this machine has no enrolled key
+        # there", so setting one says which credential works on that server.
+        # Signing anyway would break every existing token setup the moment this
+        # machine enrolled a key with some unrelated server.
+        federation.add_remote(self.store.connection, "team", self.url, "Shared",
+                              token="not-shared-with-us")
+        self.queue_a_promotion()  # key deliberately never enrolled
+
+        self.assertEqual(["cache-race"],
+                         federation.deliver_outbox(self.store, private_key=self.key)["sent"])
+
+    def test_the_outbox_job_signs_with_this_machine_s_key(self):
+        # Through the job, not through deliver_outbox. Asserting the fix one
+        # level below the wiring is how the original defect survived: the
+        # `private_key` argument worked perfectly and nothing passed it. A
+        # mutant reverting the job's call survived until this test existed.
+        import threading as _threading
+
+        from project_memory_mcp.computer import make_job
+
+        self.enroll_our_key()
+        self.queue_a_promotion()
+
+        job = make_job("outbox", "demo", key_path=self.key_path)
+        result = job.run(self.store, _threading.Lock())
+
+        self.assertEqual(["cache-race"], result["sent"])
+
+    def test_federated_recall_signs_with_this_machine_s_key(self):
+        # And the same for the read path, over the real tool dispatch.
+        self.enroll_our_key()
+        remote_store = SqliteMemoryStore(self.registry.database, "demo", create=False)
+        self.addCleanup(remote_store.close)
+        remote_store.create_memory(memory("their-note", PACKAGING), visibility="public")
+
+        server = McpServer(self.store, key_path=self.key_path)
+        answer = json.loads(server._call_tool(
+            "recall", {"query": "packaging editor open", "include_remotes": True}
+        )["content"][0]["text"])
+
+        self.assertEqual({}, answer["sources_unreachable"],
+                         "the remote refused a request this machine should have signed")
+        self.assertIn("team", answer["sources_answered"])
+
+    def test_without_a_key_that_same_recall_gets_only_a_local_answer(self):
+        # The counterweight: a remote that answered unauthenticated would make
+        # the test above pass without any signing at all.
+        self.enroll_our_key()
+        server = McpServer(self.store, key_path=Path(self.tmp.name) / "no-key.pem")
+        answer = json.loads(server._call_tool(
+            "recall", {"query": "packaging editor open", "include_remotes": True}
+        )["content"][0]["text"])
+
+        self.assertIn("team", answer["sources_unreachable"])
+        self.assertEqual(["local"], answer["sources_answered"])
+
+    def test_a_machine_that_never_enrolled_has_no_key_and_that_is_fine(self):
+        self.assertIsNone(identity.load_if_present(Path(self.tmp.name) / "nothing-here.pem"))
+
+    def test_loading_a_key_never_creates_one(self):
+        # A background sweep that minted a keypair would be enrolling a client
+        # nobody asked for. `join` creates; nothing else does.
+        missing = Path(self.tmp.name) / "should-not-appear.pem"
+        identity.load_if_present(missing)
+        self.assertFalse(missing.exists())
 
 
 class BorrowedStaysBorrowedTests(unittest.TestCase):

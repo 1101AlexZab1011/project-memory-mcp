@@ -150,6 +150,32 @@ MUTANTS = [
      "                rows.append((self.project, uuid, body[\"id\"], body.get(\"status\", \"active\"),\n"
      "                             body.get(\"description\", \"\"), stamp, json.dumps(body), None))"),
 
+    # ---------------------------------------------------------------- outbound
+    # Inbound signature verification was complete and tested for a long time
+    # while the outbound half was a parameter nobody passed. These guard the
+    # wiring, not the crypto.
+    ("delivery stops signing and only ever sends a token", "computer.py",
+     "    return deliver_outbox(store, private_key=identity.load_if_present(key_path),\n"
+     "                          db_lock=guard)",
+     "    return deliver_outbox(store, db_lock=guard)"),
+
+    ("federated recall stops signing", "server.py",
+     "                        private_key=identity.load_if_present(self.key_path), **options)",
+     "                        **options)"),
+
+    ("a configured token stops taking precedence over a key", "federation.py",
+     "        if self.remote.token:\n"
+     "            headers[\"Authorization\"] = \"Bearer \" + self.remote.token\n"
+     "        elif self.private_key is not None:",
+     "        if False:\n"
+     "            headers[\"Authorization\"] = \"Bearer \" + self.remote.token\n"
+     "        elif self.private_key is not None:"),
+
+    ("loading a key mints one when none exists", "identity.py",
+     "    if not path.is_file():\n        return None\n    try:\n        return load_private_key(path)",
+     "    if not path.is_file():\n        generate_private_key(path)\n    try:\n"
+     "        return load_private_key(path)"),
+
     # ------------------------------------------------------------------- cache
     # Borrowed copies live in their own table so that "this machine does not own
     # them" is structural rather than a filter every query has to remember.
