@@ -33,7 +33,7 @@ from . import clients
 from . import federation
 from . import ui
 from .server import TOOLS, McpServer
-from .sqlite_store import SqliteMemoryStore, StoreError
+from .sqlite_store import SqliteMemoryStore, StoreError, ensure_schema
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
 SESSION_TTL_SECONDS = 12 * 3600
@@ -656,12 +656,17 @@ class _Borrowed:
 
 def run_http_server(database: Path | str, bind: str, port: int, token: str,
                     ui_enabled: bool = True, compute_interval: int = 3600) -> int:
+    # Before anything else, and regardless of whether this database holds a
+    # project yet. Authentication reads server-wide tables, so a server with no
+    # projects would otherwise answer its first request with a missing-table
+    # 500 where it meant 401 - the schema script only ever ran as a side effect
+    # of opening a store.
+    ensure_schema(database)
+
     registry = _StoreRegistry(database)
     handler = type("Handler", (_Handler,), {
         "registry": registry, "token": token, "sessions": _Sessions(), "ui_enabled": ui_enabled})
     httpd = ThreadingHTTPServer((bind, port), handler)
-    import sqlite3
-
     connection = sqlite3.connect(str(Path(database)))
     try:
         projects = SqliteMemoryStore.list_projects(connection)

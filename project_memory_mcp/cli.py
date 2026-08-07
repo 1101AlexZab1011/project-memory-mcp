@@ -306,14 +306,17 @@ def cmd_enroll(args: argparse.Namespace) -> int:
     import sqlite3
 
     from . import clients
-    from .sqlite_store import SqliteMemoryStore
+    from .sqlite_store import ensure_schema
     from .validation import StoreError
 
     database = Path(args.database)
     if not database.is_file():
         print(f"error: no database at {database}", file=sys.stderr)
         return 1
-    SqliteMemoryStore(database, "bootstrap", create=True).close()  # ensures the tables exist
+    # The tables, without a project. This used to open a store called
+    # "bootstrap" for the side effect, which left a project of that name in
+    # every listing forever after.
+    ensure_schema(database)
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
     try:

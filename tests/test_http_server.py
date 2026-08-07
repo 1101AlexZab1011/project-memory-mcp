@@ -178,3 +178,57 @@ class HttpServerTests(unittest.TestCase):
             [], bad,
             f"{len(bad)} of 20 concurrent requests did not return 200: {bad}. A non-200 here "
             f"means the store was touched from two threads at once.")
+
+
+class EmptyDatabaseTests(unittest.TestCase):
+    """A server with no projects yet must still be able to say 'no'.
+
+    `clients` and `enrollment_codes` are server-wide, but the schema script only
+    ever ran as a side effect of opening a project store. A database with no
+    projects therefore had no `clients` table, and the first request died on
+    `OperationalError: no such table` inside `authenticate` - which `_identify`
+    does not catch, so a bad token got a 500 where it meant a 401.
+
+    Reachable by design, not by accident: `serve` starts fine on an empty
+    database and prints "(none - create one with `init` first)".
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "empty.db"
+
+        from project_memory_mcp.sqlite_store import ensure_schema
+
+        ensure_schema(self.db)  # what run_http_server now does before serving
+        registry = _StoreRegistry(self.db)
+        self.addCleanup(registry.close)
+        handler = type("H", (_Handler,), {"registry": registry, "token": TOKEN})
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.addCleanup(self.httpd.server_close)
+        self.base = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.shutdown)
+
+    def post(self, token):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
+        request = urllib.request.Request(
+            self.base + "/mcp?project=demo", data=body,
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
+    def test_a_bad_token_is_refused_rather_than_crashing(self):
+        self.assertEqual(401, self.post("wrong"), "an empty database answered with a server error")
+
+    def test_a_good_token_still_gets_the_unknown_project_answer(self):
+        # Not 500 either: the project genuinely does not exist, and saying so is
+        # the whole reason `create=False` is passed when serving.
+        self.assertEqual(404, self.post(TOKEN))
+
+
+if __name__ == "__main__":
+    unittest.main()

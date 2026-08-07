@@ -150,6 +150,20 @@ MUTANTS = [
      "                rows.append((self.project, uuid, body[\"id\"], body.get(\"status\", \"active\"),\n"
      "                             body.get(\"description\", \"\"), stamp, json.dumps(body), None))"),
 
+    # ------------------------------------------------------------------- setup
+    # `ensure_schema` exists so the server-wide tables can be created without
+    # inventing a project. If it stops creating them, a server on an empty
+    # database answers 500 where it means 401; if something goes back to opening
+    # a store for the side effect, a phantom project appears in every listing.
+    ("preparing a database no longer creates its tables", "sqlite_store.py",
+     "        _prepare(connection)\n        _ensure_replica_id(connection)",
+     "        pass"),
+
+    ("enrolling a client invents a project again", "cli.py",
+     "    ensure_schema(database)\n    connection = sqlite3.connect(database)",
+     "    SqliteMemoryStore(database, \"bootstrap\", create=True).close()\n"
+     "    connection = sqlite3.connect(database)"),
+
     # ------------------------------------------------------------------ outbox
     ("a deleted memory leaves its promotion queued", "sqlite_store.py",
      "\"memories_fts\", \"outbox\"):",

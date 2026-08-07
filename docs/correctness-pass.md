@@ -369,6 +369,44 @@ enough — deleting somebody's project row automatically is not this command's b
 
 **Done when** minting a code against a fresh database leaves `projects` empty.
 
+### Outcome ✔
+
+```text
+before enroll: ['real-project']
+after  enroll: ['real-project']
+```
+
+**The step was two bugs, not one, and the second was worse.** Looking for a way to create the tables
+without a project turned up the reason there wasn't one: the schema script only ever ran as a side
+effect of opening a store. So a database with *no projects at all* had no `clients` table, and
+`authenticate` died on `OperationalError: no such table: clients` — which `_identify` does not catch,
+so a bad token got a **500 where it meant 401**. Reachable by design rather than by accident: `serve`
+starts happily on an empty database and prints "(none - create one with `init` first)".
+
+Both are the same gap — no way to say "make this database ready" without also saying which project.
+`ensure_schema()` is that way. `cmd_enroll` calls it instead of opening a phantom store, and
+`run_http_server` calls it before serving. `SqliteMemoryStore.__init__` shares the same `_prepare`,
+so there is one description of what a prepared database is rather than two that can drift.
+
+Empty database now:
+
+```text
+bad token   -> 401  (was 500)
+good token  -> 404 Unknown project: demo   (which is what create=False is for)
+```
+
+Two mutants, both caught: preparing a database that creates no tables, and enrolling that goes back
+to opening a "bootstrap" store.
+
+**358 → 362 tests.**
+
+**Note for whoever deploys this.** Existing databases still contain the `bootstrap` row — this stops
+it being created, it does not clean up after the versions that did. Deleting somebody's project row
+as a side effect of an upgrade is not an improvement over an empty project sitting in a list, so it
+is a manual `DELETE FROM projects WHERE id='bootstrap'` on any database that has one, and only after
+confirming it holds no memories. There is no release-notes file to put this in, which is why it is
+here.
+
 ## Step 6 — Finish the remote cache, or drop it
 
 **The problem is larger than it first looks.** `cache_remote_results` claims the cache is the

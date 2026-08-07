@@ -297,6 +297,46 @@ def _ensure_replica_id(connection: sqlite3.Connection) -> str:
     return replica
 
 
+def _prepare(connection: sqlite3.Connection) -> None:
+    """Bring a connection's database up to the current schema. No project involved."""
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA foreign_keys=ON")
+    _upgrade(connection)
+    connection.executescript(SCHEMA)
+    connection.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
+        (str(SCHEMA_VERSION),),
+    )
+
+
+def ensure_schema(database: Path | str) -> None:
+    """Create the tables a server needs, without creating a project.
+
+    `clients`, `enrollment_codes` and `meta` are server-wide: authentication has
+    to work before any project is named, and enrolling a machine does not
+    involve one at all. But the only way to run the schema script used to be to
+    open a store, and opening a store inserts a row in `projects`.
+
+    So minting an enrollment code opened a store called "bootstrap" purely for
+    the side effect, and left a project of that name behind - in the UI's
+    dropdown, in the scheduler's sweep list, offered to every client. And a
+    server with no projects at all never ran the script, so `authenticate` hit a
+    missing `clients` table and answered 500 where it meant 401.
+
+    Both were the same gap: no way to say "make the database ready" without also
+    saying which project. This is that way.
+    """
+    path = Path(database)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    try:
+        _prepare(connection)
+        _ensure_replica_id(connection)
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _upgrade(connection: sqlite3.Connection) -> None:
     """Bring an older database up to the current schema, in place.
 
@@ -487,14 +527,7 @@ class SqliteMemoryStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path, check_same_thread=check_same_thread)
         self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA foreign_keys=ON")
-        _upgrade(self.connection)
-        self.connection.executescript(SCHEMA)
-        self.connection.execute(
-            "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
-        )
+        _prepare(self.connection)
         self.replica_id = _ensure_replica_id(self.connection)
         #: Who the current caller is, set by the transport for the duration of
         #: one request. None means a local write with no authenticated client.

@@ -133,6 +133,59 @@ class RemovedCommandTests(CliCase):
                          f"the banner sends people to `{named}`, which argparse does not accept")
 
 
+class ServerWideSetupTests(CliCase):
+    """Server-wide tables exist without a project having to be invented.
+
+    `clients`, `enrollment_codes` and `meta` are not scoped to a project -
+    authentication has to work before one is named. But the schema script only
+    ever ran as a side effect of opening a store, and opening a store inserts a
+    row in `projects`. So minting an enrollment code opened one called
+    "bootstrap" for the side effect and left it behind: in the UI's dropdown, in
+    the scheduler's sweep list, offered to every client.
+    """
+
+    def enroll(self, **overrides):
+        import argparse
+        import contextlib
+        import io
+
+        from project_memory_mcp.cli import cmd_enroll
+
+        args = argparse.Namespace(database=str(self.db), name="laptop", role="contributor",
+                                  project=None, list=False, revoke=None)
+        vars(args).update(overrides)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = cmd_enroll(args)
+        return code, out.getvalue()
+
+    def test_minting_a_code_does_not_invent_a_project(self):
+        main(["init", "--database", str(self.db), "--project", "real-project"])
+
+        code, output = self.enroll()
+
+        self.assertEqual(0, code)
+        self.assertIn("enrollment code:", output)
+        self.assertEqual(["real-project"],
+                         SqliteMemoryStore.list_projects(self.open_store("real-project").connection),
+                         "enrolling a client created a project of its own")
+
+    def test_the_tables_can_be_created_without_naming_a_project(self):
+        import sqlite3
+
+        from project_memory_mcp.sqlite_store import ensure_schema
+
+        ensure_schema(self.db)
+
+        connection = sqlite3.connect(self.db)
+        self.addCleanup(connection.close)
+        self.assertEqual([], SqliteMemoryStore.list_projects(connection))
+        for table in ("clients", "enrollment_codes", "meta"):
+            self.assertIsNotNone(
+                connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,)).fetchone(), f"{table} was not created")
+
+
 class DestructiveConfirmationTests(CliCase):
     """`audit --apply` must not act without `--yes`.
 
