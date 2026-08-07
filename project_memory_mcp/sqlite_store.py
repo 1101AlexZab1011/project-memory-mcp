@@ -825,6 +825,22 @@ class SqliteMemoryStore:
         if statuses is not None:
             sql += f" AND status IN ({','.join('?' * len(statuses))})"
             params.extend(sorted(statuses))
+        # Narrow on the label index before reading any bodies. Without this a
+        # query that matches little or nothing reads and JSON-parses the whole
+        # project to find out - measured at 14ms for 3000 memories, and linear.
+        # A query that matches plenty was never the slow case: SQLite streams
+        # rows and the loop below stops at `limit`.
+        #
+        # `narrowing_labels` and not `used_labels`: a query containing NOT can
+        # be satisfied by a memory carrying none of the labels it mentions, so
+        # only the expression itself knows when the mentioned set is sound.
+        narrowing = expression.narrowing_labels
+        if narrowing:
+            marks = ",".join("?" * len(narrowing))
+            sql += (f" AND uuid IN (SELECT memory_id FROM labels WHERE project_id=? "
+                    f"AND label IN ({marks}))")
+            params.append(self.project)
+            params.extend(sorted(narrowing))
         sql += " ORDER BY slug"
 
         matches: list[dict[str, Any]] = []

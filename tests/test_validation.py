@@ -172,5 +172,84 @@ class DocumentRuleTests(unittest.TestCase):
         self.assertTrue(self.check(make_memory("a", ["NotALabel"])))
 
 
+class LabelPrefilterTests(unittest.TestCase):
+    """The index prefilter must never change which memories match.
+
+    `search_memories` used to read and JSON-parse every memory in the project to
+    apply a label filter in Python. It now narrows on the label index first -
+    but only when the expression allows it, and getting that wrong loses real
+    matches silently, which is far worse than the scan it replaces.
+
+    So this is differential: every query is answered twice, once through the
+    store and once by brute force over every memory, and the two must agree.
+    The `NOT` cases are the ones that matter. A memory satisfying `NOT area:x`
+    may carry none of the labels the query mentions, so narrowing to the
+    mentioned set would drop it - which is why `used_labels` is not a sound
+    prefilter and `narrowing_labels` exists.
+    """
+
+    LABELS = ("area:x", "area:y", "area:z", "kind:bug")
+
+    QUERIES = (
+        None, "", "area:x", "area:y", "kind:bug",
+        "area:x AND area:y", "area:x OR area:y", "area:x AND kind:bug",
+        "NOT area:x", "NOT kind:bug", "area:x AND NOT kind:bug",
+        "NOT area:x AND NOT area:y", "(area:x OR area:y) AND NOT kind:bug",
+        "(area:x OR area:y) AND kind:bug", "NOT (area:x OR area:y)",
+        {"all": ["area:x"]}, {"any": ["area:x", "area:y"]},
+        {"not": ["kind:bug"]}, {"all": ["area:x"], "not": ["kind:bug"]},
+        {"all": ["area:x", "area:y"]}, {"any": ["area:z"], "not": ["area:x"]},
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = SqliteMemoryStore(Path(self.tmp.name) / "memory.db", "demo")
+        self.addCleanup(self.store.close)
+        for label in self.LABELS:
+            self.store.add_label(label, "description for " + label)
+        # Every non-empty combination of the four labels, so each query above
+        # has memories on both sides of it.
+        import itertools
+
+        self.bodies = []
+        for size in range(1, len(self.LABELS) + 1):
+            for combo in itertools.combinations(self.LABELS, size):
+                slug = "note-" + "-".join(l.split(":")[1] for l in combo)
+                body = make_memory(slug, list(combo))
+                self.store.create_memory(body)
+                self.bodies.append(body)
+
+    def brute_force(self, query):
+        expression = validation.LabelExpression(query, set(self.LABELS))
+        return sorted(b["id"] for b in self.bodies if expression.matches(b["labels"]))
+
+    def test_the_prefilter_agrees_with_a_full_scan_on_every_query(self):
+        for query in self.QUERIES:
+            with self.subTest(query=query):
+                found = sorted(m["id"] for m in
+                               self.store.search_memories(label_query=query)["memories"])
+                self.assertEqual(self.brute_force(query), found)
+
+    def test_a_negated_query_narrows_nothing(self):
+        # Stated on its own so the reason survives: this is the case that makes
+        # the mentioned-label set unsound, and a prefilter applied here would
+        # drop every memory that carries no mentioned label at all.
+        expression = validation.LabelExpression("NOT area:x", set(self.LABELS))
+        self.assertIsNone(expression.narrowing_labels)
+        self.assertEqual({"area:x"}, expression.used_labels)
+
+    def test_a_positive_query_narrows_to_what_it_mentions(self):
+        expression = validation.LabelExpression("area:x OR area:y", set(self.LABELS))
+        self.assertEqual({"area:x", "area:y"}, expression.narrowing_labels)
+
+    def test_a_dict_query_narrows_on_all_before_any(self):
+        # `all` is the stronger claim - every match carries all of them - so it
+        # is the better set to fetch on when both are present.
+        expression = validation.LabelExpression(
+            {"all": ["area:x"], "any": ["area:y", "area:z"]}, set(self.LABELS))
+        self.assertEqual({"area:x"}, expression.narrowing_labels)
+
+
 if __name__ == "__main__":
     unittest.main()

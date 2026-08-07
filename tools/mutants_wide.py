@@ -150,6 +150,25 @@ MUTANTS = [
      "                rows.append((self.project, uuid, body[\"id\"], body.get(\"status\", \"active\"),\n"
      "                             body.get(\"description\", \"\"), stamp, json.dumps(body), None))"),
 
+    # -------------------------------------------------------------- prefilter
+    # Narrowing on the label index is only sound when the expression cannot be
+    # satisfied by a memory carrying none of the labels it mentions. Get that
+    # wrong and matches vanish silently, which is far worse than the scan it
+    # replaces. No mutant here for deleting the prefilter outright: that costs
+    # speed and nothing else, and speed is not what these assert.
+    ("the prefilter trusts every label a query mentions", "sqlite_store.py",
+     "        narrowing = expression.narrowing_labels",
+     "        narrowing = expression.used_labels"),
+
+    ("a negated query narrows anyway", "validation.py",
+     "            if not parser.saw_negation:\n"
+     "                self._narrowing = set(self.used_labels)",
+     "            self._narrowing = set(self.used_labels)"),
+
+    ("a dict query of only exclusions narrows on them", "validation.py",
+     "            self._narrowing = set(all_labels) or set(any_labels) or None",
+     "            self._narrowing = set(all_labels) or set(any_labels) or set(not_labels) or None"),
+
     # --------------------------------------------------------------- reporting
     ("a failing backup goes back to being silent", "backup.py",
      "            print(f\"project-memory-mcp: BACKUP FAILED to {self.destination}: {exc}\",\n"

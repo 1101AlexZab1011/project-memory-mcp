@@ -790,6 +790,50 @@ were blamed for what `_synchronize_relationships` was doing.
 **This is last on purpose.** It is a performance fix on a path that is not the hot one; `recall` is.
 Do it when the correctness work is done.
 
+### Outcome ✔ — done in half, and the measurement is why
+
+Measured first, at 3000 memories, and the numbers deflated the premise:
+
+| | before | after |
+|---|---|---|
+| no filter, limit 20 | 2.7ms | 3.0ms |
+| label matching 1/12 of the store | 3.7ms | 3.2ms |
+| **label matching nothing** | **14.1ms** | **4.5ms** |
+| **label + text, both narrow** | **14.6ms** | **3.9ms** |
+| text only, matching nothing | 16.0ms | 15.5ms |
+| negated label query | 2.6ms | 2.8ms |
+
+**Two of the three cases I expected to be slow never were.** SQLite streams rows and the loop stops
+at `limit`, so a query matching plenty already cost nothing. The scan only hurts when the filter
+matches *little or nothing* — which is exactly where it has to read everything to find out.
+
+The label half is fixed, soundly and with no behaviour change. `LabelExpression` gained
+`narrowing_labels`: the set of which every match must carry at least one, or None when no such set
+exists. `all` beats `any` for the dict form; a monotone string expression yields the labels it
+mentions; **anything containing `NOT` yields None**, because `NOT area:x` is satisfied by a memory
+carrying none of the mentioned labels and narrowing would drop it silently. That is why this is a
+property of the expression rather than callers reaching for `used_labels`.
+
+**The text half is deliberately not done.** Narrowing it needs FTS token semantics in place of
+substring matching — an agent-facing behaviour change — and the measurement says it buys 15ms at
+3000 memories on a tool whose own description tells agents to prefer `recall`. Not worth a semantic
+change. It is linear, so ~150ms at 30k and ~1.5s at the 300k the architecture doc contemplates; if
+the store ever gets there, that is the moment to spend the semantics, with numbers to justify it.
+
+Correctness is checked differentially rather than by example: 21 queries, each answered once through
+the store and once by brute force over every memory, and required to agree. The `NOT` cases are the
+point. Three mutants, all caught, including the one that matters — a prefilter using `used_labels`
+instead of `narrowing_labels`. No mutant for deleting the prefilter outright: that costs speed and
+nothing else, and speed is not what these assert.
+
+**406 → 410 tests.**
+
+**One unexplained failure.** Across six full runs of this step, one failed, and the name scrolled
+past before I captured it; five runs since are clean, as were four more targeted ones. Step 4 saw
+exactly one unreproducible failure too. That is twice now, both unidentified, which is worth writing
+down even though neither is diagnosed — it is the only thing in this pass I know about and cannot
+name.
+
 ## Not doing
 
 - ~~**No second table for cached remote memories.** One schema, one set of query paths. If step 6

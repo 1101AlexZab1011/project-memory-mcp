@@ -188,13 +188,44 @@ class LabelExpression:
     def matches(self, labels: list[str]) -> bool:
         return self._predicate(set(labels))
 
+    @property
+    def narrowing_labels(self) -> set[str] | None:
+        """Labels of which every match must carry at least one, or None.
+
+        A sound index prefilter: a caller may fetch only the memories carrying
+        one of these and lose no match. None means no such set is known and the
+        rows have to be read.
+
+        Where it comes from, and where it does not:
+
+        - **dict form.** `all` is strongest - every match carries all of them,
+          so certainly one. Failing that, `any` - every match carries one of
+          those by definition. A query of only `not` narrows nothing: what it
+          selects is the absence of a label, and absence is not indexed.
+        - **string form.** With no `NOT` anywhere the expression is monotone,
+          built from AND and OR over positive atoms, and a monotone formula
+          cannot be true with every atom false. So the labels it mentions are a
+          sound set.
+        - **string form with a NOT.** Nothing. `NOT area:x` is satisfied by a
+          memory carrying no mentioned label at all, so narrowing to the
+          mentioned ones would silently drop real matches. This is the case that
+          makes `used_labels` unsafe as a prefilter on its own, and the reason
+          this property exists rather than callers reaching for that.
+        """
+        return self._narrowing
+
     def _compile(self, query: Any) -> Callable[[set[str]], bool]:
+        #: Set by each branch below. None means "no sound narrowing" and is the
+        #: safe default, so a branch that forgets to set it loses speed rather
+        #: than correctness.
+        self._narrowing: set[str] | None = None
         if query in (None, "", {}, []):
             return lambda _labels: True
         if isinstance(query, dict):
             all_labels = self._normalize_label_list(query.get("all") or query.get("and") or [])
             any_labels = self._normalize_label_list(query.get("any") or query.get("or") or [])
             not_labels = self._normalize_label_list(query.get("not") or [])
+            self._narrowing = set(all_labels) or set(any_labels) or None
             return lambda labels: (
                 all(label in labels for label in all_labels)
                 and (not any_labels or any(label in labels for label in any_labels))
@@ -207,6 +238,8 @@ class LabelExpression:
             parser = _LabelParser(tokens, self._record_label)
             expr = parser.parse_expression()
             parser.expect_end()
+            if not parser.saw_negation:
+                self._narrowing = set(self.used_labels)
             return expr
         raise StoreError("label_query must be an object, string, null, or omitted.")
 
@@ -253,6 +286,10 @@ class _LabelParser:
         self.tokens = tokens
         self.record_label = record_label
         self.pos = 0
+        #: Whether a NOT appeared anywhere. One is enough to make the mentioned
+        #: labels unusable as an index prefilter - see
+        #: LabelExpression.narrowing_labels.
+        self.saw_negation = False
 
     def parse_expression(self) -> Callable[[set[str]], bool]:
         return self.parse_or()
@@ -276,6 +313,7 @@ class _LabelParser:
     def parse_unary(self) -> Callable[[set[str]], bool]:
         if self._peek() == "NOT":
             self.pos += 1
+            self.saw_negation = True
             inner = self.parse_unary()
             return lambda labels: not inner(labels)
         return self.parse_primary()
